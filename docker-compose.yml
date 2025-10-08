@@ -7,5 +7,11 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    volumes:
+      - psm-app:/var/psm/app
     environment:
       - RUST_LOG=info
+      - PSM_APP_PATH=/var/psm/app
+
+volumes:
+  psm-app:
