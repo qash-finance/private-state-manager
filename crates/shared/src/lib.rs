@@ -2,6 +2,8 @@ use miden_objects::account::Account;
 use miden_objects::utils::serde::{Deserializable, Serializable};
 use base64::Engine;
 
+pub mod auth;
+
 pub trait ToJson {
   fn to_json(&self) -> serde_json::Value;
 }
