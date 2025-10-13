@@ -209,7 +209,7 @@ test_grpc() {
     fi
 }
 
-# Test HTTP endpoints (when implemented)
+# Test HTTP endpoints
 test_http() {
     print_header "Testing HTTP Endpoints"
 
@@ -226,15 +226,86 @@ test_http() {
             \"cosigner_pubkeys\": []
         }")
 
-    # Note: HTTP endpoints are not fully implemented yet
-    # This is a placeholder for when they are
-    print_info "HTTP endpoints are TODO - skipping for now"
+    SUCCESS=$(echo "$HTTP_CONFIGURE_RESPONSE" | jq -r '.success')
+    if [ "$SUCCESS" == "true" ]; then
+        print_success "Account configured via HTTP: $ACCOUNT_ID_HTTP"
+    else
+        MESSAGE=$(echo "$HTTP_CONFIGURE_RESPONSE" | jq -r '.message')
+        print_error "Failed to configure account via HTTP: $MESSAGE"
+    fi
 
-    # TODO: Add more HTTP tests when endpoints are implemented
-    # - Get state
-    # - Push delta
-    # - Get delta
-    # - Get delta head
+    # Test 2: Get account state via HTTP
+    print_info "Test 2: Get account state via HTTP"
+    HTTP_STATE_RESPONSE=$(curl -s "http://$HTTP_HOST/state?account_id=$ACCOUNT_ID_HTTP")
+
+    # Parse and normalize JSON (remove whitespace)
+    STATE_JSON=$(echo "$HTTP_STATE_RESPONSE" | jq -r '.state_json' | jq -c .)
+    if [ "$STATE_JSON" == "{\"balance\":2000}" ]; then
+        print_success "State verified via HTTP: $STATE_JSON"
+    else
+        print_error "State mismatch via HTTP. Expected: {\"balance\":2000}, Got: $STATE_JSON"
+    fi
+
+    # Test 3: Push delta via HTTP
+    print_info "Test 3: Push delta via HTTP"
+    HTTP_DELTA1_RESPONSE=$(curl -s -X POST http://$HTTP_HOST/delta \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"account_id\": \"$ACCOUNT_ID_HTTP\",
+            \"nonce\": 10,
+            \"prev_commitment\": \"\",
+            \"delta_hash\": \"hash_http_10\",
+            \"delta_payload\": {\"operation\": \"http_transfer\", \"amount\": 200},
+            \"ack_sig\": \"sig_http_10\",
+            \"publisher_pubkey\": \"pubkey_http\",
+            \"publisher_sig\": \"pub_sig_http_10\",
+            \"candidate_at\": \"$TIMESTAMP\",
+            \"canonical_at\": null,
+            \"discarded_at\": null
+        }")
+
+    DELTA_HASH=$(echo "$HTTP_DELTA1_RESPONSE" | jq -r '.delta_hash')
+    if [ "$DELTA_HASH" == "hash_http_10" ]; then
+        print_success "Delta pushed via HTTP (nonce: 10)"
+    else
+        print_error "Failed to push delta via HTTP. Response: $HTTP_DELTA1_RESPONSE"
+    fi
+
+    # Test 4: Get specific delta via HTTP
+    print_info "Test 4: Get specific delta via HTTP"
+    HTTP_GET_DELTA=$(curl -s "http://$HTTP_HOST/delta?account_id=$ACCOUNT_ID_HTTP&nonce=10")
+
+    DELTA_HASH=$(echo "$HTTP_GET_DELTA" | jq -r '.delta_hash')
+    if [ "$DELTA_HASH" == "hash_http_10" ]; then
+        print_success "Delta retrieved via HTTP (nonce: 10)"
+    else
+        print_error "Failed to get delta via HTTP. Got: $HTTP_GET_DELTA"
+    fi
+
+    # Test 5: Get latest nonce via HTTP
+    print_info "Test 5: Get latest nonce via HTTP"
+    HTTP_HEAD=$(curl -s "http://$HTTP_HOST/head?account_id=$ACCOUNT_ID_HTTP")
+
+    LATEST_NONCE=$(echo "$HTTP_HEAD" | jq -r '.latest_nonce')
+    if [ "$LATEST_NONCE" == "10" ]; then
+        print_success "Latest nonce via HTTP: $LATEST_NONCE"
+    else
+        print_error "Latest nonce mismatch via HTTP. Expected: 10, Got: $LATEST_NONCE"
+    fi
+
+    # Cleanup HTTP test account
+    print_info "Cleaning up HTTP test account"
+    APP_PATH="${PSM_APP_PATH:-/var/psm/app}"
+    if [ -d "$APP_PATH/$ACCOUNT_ID_HTTP" ]; then
+        rm -rf "$APP_PATH/$ACCOUNT_ID_HTTP"
+    fi
+    METADATA_FILE="$APP_PATH/.metadata/accounts.json"
+    if [ -f "$METADATA_FILE" ] && command -v jq &> /dev/null; then
+        TEMP_FILE=$(mktemp)
+        jq "del(.accounts[\"$ACCOUNT_ID_HTTP\"])" "$METADATA_FILE" > "$TEMP_FILE"
+        mv "$TEMP_FILE" "$METADATA_FILE"
+    fi
+    print_success "HTTP test account cleaned up"
 }
 
 # Test error cases
@@ -347,7 +418,7 @@ main() {
 
     print_header "All Tests Passed! 🎉"
     echo -e "${GREEN}All gRPC endpoints are working correctly${NC}"
-    echo -e "${YELLOW}Note: HTTP endpoints are TODO${NC}"
+    echo -e "${GREEN}All HTTP endpoints are working correctly${NC}"
     echo -e "${YELLOW}Cleanup will run automatically on exit${NC}"
 }
 
