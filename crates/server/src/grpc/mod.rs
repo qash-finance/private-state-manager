@@ -21,20 +21,20 @@ pub struct StateManagerService {
 }
 
 /// Extract publisher authentication data from gRPC metadata
-fn extract_publisher_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(String, String), Status> {
+fn extract_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(String, String), Status> {
     let publisher_pubkey = metadata
-        .get("x-publisher-pubkey")
+        .get("x-pubkey")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-publisher-pubkey metadata"))?
+        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-pubkey metadata"))?
         .to_string();
 
-    let publisher_sig = metadata
-        .get("x-publisher-sig")
+    let signature = metadata
+        .get("x-signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-publisher-sig metadata"))?
+        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-signature metadata"))?
         .to_string();
 
-    Ok((publisher_pubkey, publisher_sig))
+    Ok((pubkey, signature))
 }
 
 #[tonic::async_trait]

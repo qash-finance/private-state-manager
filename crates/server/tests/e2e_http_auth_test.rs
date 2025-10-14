@@ -166,8 +166,8 @@ async fn test_configure_and_push_delta_with_auth() {
         .uri("/push_delta")
         .method("POST")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-publisher-pubkey", pubkey_hex)
-        .header("x-publisher-sig", signature_hex)
+        .header("x-pubkey", pubkey_hex)
+        .header("x-signature", signature_hex)
         .body(Body::from(serde_json::to_string(&delta_body).unwrap()))
         .unwrap();
 
@@ -228,8 +228,8 @@ async fn test_push_delta_unauthorized_cosigner() {
         .uri("/push_delta")
         .method("POST")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-publisher-pubkey", unauthorized_pubkey)
-        .header("x-publisher-sig", unauthorized_sig)
+        .header("x-pubkey", unauthorized_pubkey)
+        .header("x-signature", unauthorized_sig)
         .body(Body::from(serde_json::to_string(&delta_body).unwrap()))
         .unwrap();
 

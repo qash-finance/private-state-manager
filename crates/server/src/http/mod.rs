@@ -56,22 +56,22 @@ pub struct DeltaHeadResponse {
 
 /// Extract publisher authentication data from HTTP headers
 /// Returns (publisher_pubkey, publisher_sig) tuple
-fn extract_publisher_auth(headers: &HeaderMap) -> Result<(String, String), String> {
+fn extract_auth(headers: &HeaderMap) -> Result<(String, String), String> {
     let publisher_pubkey = headers
-        .get("x-publisher-pubkey")
-        .ok_or_else(|| "Missing x-publisher-pubkey header".to_string())?
+        .get("x-pubkey")
+        .ok_or_else(|| "Missing x-pubkey header".to_string())?
         .to_str()
-        .map_err(|_| "Invalid x-publisher-pubkey header".to_string())?
+        .map_err(|_| "Invalid x-pubkey header".to_string())?
         .to_string();
 
-    let publisher_sig = headers
-        .get("x-publisher-sig")
-        .ok_or_else(|| "Missing x-publisher-sig header".to_string())?
+    let signature = headers
+        .get("x-signature")
+        .ok_or_else(|| "Missing x-signature header".to_string())?
         .to_str()
-        .map_err(|_| "Invalid x-publisher-sig header".to_string())?
+        .map_err(|_| "Invalid x-signature header".to_string())?
         .to_string();
 
-    Ok((publisher_pubkey, publisher_sig))
+    Ok((pubkey, signature))
 }
 
 
