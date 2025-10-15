@@ -67,18 +67,48 @@ cargo test --package private-state-manager-server --test e2e_grpc_auth_test -- -
 
 ### Reproducible Builds
 
-The server binary has reproducible builds. The same source code and build environment always produces bit-for-bit identical binaries.
+The server binary has reproducible builds. The same source code and build environment always produces bit-for-bit identical binaries across different machines and platforms.
 
-Test reproducibility:
+#### Pinned Dependencies
+
+All build dependencies are pinned for reproducibility:
+- **Rust**: 1.88.0 (via `rust-toolchain.toml`)
+- **Docker base image**: `rust:1.88@sha256:af306cfa...` (pinned by digest)
+- **Protobuf compiler**: 3.21.12-3 (pinned Debian package version)
+- **Build flags**: Configured in `.cargo/config.toml` for deterministic compilation
+
+#### Verifying Reproducibility
+
+Build and get the hash (run from repository root):
 
 ```bash
-./tests/test-reproducibility.sh
+./crates/server/tests/verify-build-hash.sh
 ```
 
-This builds the server twice in Docker and verifies the binaries are identical. Reproducible builds enable:
-- Binary verification against source code
-- Supply chain security
-- Build integrity validation
+This builds the server in Docker and displays the SHA256 hash. To verify reproducibility, run this script on different machines (Linux, macOS, Windows) from the same git commit and compare the hashes - they should match exactly.
+
+#### Benefits
+
+- **Binary verification**: Users can verify published binaries match source code
+- **Supply chain security**: Detect if binaries have been tampered with
+- **TEE attestation**: Enable cryptographic verification of code running in Trusted Execution Environments
+- **Build integrity**: Ensure builds are not influenced by local environment
+
+#### Updating Pinned Versions
+
+To update Docker image digests:
+
+```bash
+# Get current digest for rust:1.88
+docker pull rust:1.88
+docker inspect rust:1.88 | grep -A 1 "RepoDigests"
+
+# Get current digest for debian:bookworm-slim
+docker pull debian:bookworm-slim
+docker inspect debian:bookworm-slim | grep -A 1 "RepoDigests"
+```
+
+Update the digests in `Dockerfile` to maintain reproducibility.
 
 ## Manual Testing
 
