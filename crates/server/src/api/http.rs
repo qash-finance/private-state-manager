@@ -1,4 +1,4 @@
-use crate::auth::{Auth, Credentials};
+use crate::auth::{Auth, ExtractCredentials};
 use crate::services::{
     self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetStateParams,
     PushDeltaParams,
@@ -68,25 +68,6 @@ pub struct DeltaHeadResponse {
     pub message: Option<String>,
 }
 
-/// Extract authentication credentials from HTTP headers
-fn extract_auth(headers: &HeaderMap) -> Result<Credentials, String> {
-    let pubkey = headers
-        .get("x-pubkey")
-        .ok_or_else(|| "Missing x-pubkey header".to_string())?
-        .to_str()
-        .map_err(|_| "Invalid x-pubkey header".to_string())?
-        .to_string();
-
-    let signature = headers
-        .get("x-signature")
-        .ok_or_else(|| "Missing x-signature header".to_string())?
-        .to_str()
-        .map_err(|_| "Invalid x-signature header".to_string())?
-        .to_string();
-
-    Ok(Credentials::signature(pubkey, signature))
-}
-
 pub async fn configure(
     State(state): State<AppState>,
     Json(payload): Json<ConfigureRequest>,
@@ -117,7 +98,7 @@ pub async fn push_delta(
     Json(payload): Json<DeltaObject>,
 ) -> (StatusCode, Json<DeltaObject>) {
     // Extract authentication data from headers
-    let auth = match extract_auth(&headers) {
+    let auth = match headers.extract_credentials() {
         Ok(auth) => auth,
         Err(e) => {
             return (
@@ -153,7 +134,7 @@ pub async fn get_delta(
     Query(query): Query<DeltaQuery>,
 ) -> (StatusCode, Json<DeltaObject>) {
     // Extract authentication data from headers
-    let auth = match extract_auth(&headers) {
+    let auth = match headers.extract_credentials() {
         Ok(auth) => auth,
         Err(e) => {
             return (
@@ -190,7 +171,7 @@ pub async fn get_delta_head(
     Query(query): Query<StateQuery>,
 ) -> (StatusCode, Json<DeltaHeadResponse>) {
     // Extract authentication data from headers
-    let auth = match extract_auth(&headers) {
+    let auth = match headers.extract_credentials() {
         Ok(auth) => auth,
         Err(e) => {
             return (
@@ -235,7 +216,7 @@ pub async fn get_state(
     Query(query): Query<StateQuery>,
 ) -> (StatusCode, Json<AccountState>) {
     // Extract authentication data from headers
-    let auth = match extract_auth(&headers) {
+    let auth = match headers.extract_credentials() {
         Ok(auth) => auth,
         Err(e) => {
             return (

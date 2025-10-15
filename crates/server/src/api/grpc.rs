@@ -1,4 +1,4 @@
-use crate::auth::{Auth, Credentials};
+use crate::auth::{Auth, ExtractCredentials};
 use crate::services::{
     self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetStateParams,
     PushDeltaParams,
@@ -21,24 +21,6 @@ use state_manager::*;
 
 pub struct StateManagerService {
     pub app_state: AppState,
-}
-
-/// Extract authentication credentials from gRPC metadata
-#[allow(clippy::result_large_err)]
-fn extract_auth(metadata: &tonic::metadata::MetadataMap) -> Result<Credentials, Status> {
-    let pubkey = metadata
-        .get("x-pubkey")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-pubkey metadata"))?
-        .to_string();
-
-    let signature = metadata
-        .get("x-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-signature metadata"))?
-        .to_string();
-
-    Ok(Credentials::signature(pubkey, signature))
 }
 
 #[tonic::async_trait]
@@ -83,7 +65,7 @@ impl StateManager for StateManagerService {
         request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
         // Extract authentication data from metadata
-        let auth = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
@@ -129,7 +111,7 @@ impl StateManager for StateManagerService {
         request: Request<GetDeltaRequest>,
     ) -> Result<Response<GetDeltaResponse>, Status> {
         // Extract authentication data from metadata
-        let auth = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
@@ -159,7 +141,7 @@ impl StateManager for StateManagerService {
         request: Request<GetDeltaHeadRequest>,
     ) -> Result<Response<GetDeltaHeadResponse>, Status> {
         // Extract authentication data from metadata
-        let auth = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
@@ -188,7 +170,7 @@ impl StateManager for StateManagerService {
         request: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
         // Extract authentication data from metadata
-        let auth = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
