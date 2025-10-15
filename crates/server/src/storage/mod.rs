@@ -36,7 +36,6 @@ pub struct AccountMetadata {
     pub account_id: String,
     pub auth: Auth,
     pub storage_type: StorageType,
-    pub cosigner_pubkeys: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }

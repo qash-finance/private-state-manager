@@ -33,7 +33,6 @@ pub async fn push_delta(
     // Verify authentication and authorization
     verify_request_auth(
         &account_metadata.auth,
-        &account_metadata,
         &params.delta.account_id,
         &params.credentials,
     )?;

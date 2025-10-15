@@ -1,7 +1,5 @@
 mod miden_falcon_rpo;
 
-use crate::storage::AccountMetadata;
-
 /// Trait for extracting authentication credentials from request metadata
 /// Implemented by HTTP headers and gRPC metadata
 pub trait ExtractCredentials {
@@ -33,10 +31,12 @@ impl Credentials {
 
 /// Authentication and authorization handler
 /// Defines which signature scheme to use and handles verification
+/// Each variant contains auth-specific authorization data
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum Auth {
     /// Miden Falcon RPO signature scheme
-    MidenFalconRpo,
+    /// Contains list of authorized cosigner public keys
+    MidenFalconRpo { cosigner_pubkeys: Vec<String> },
 }
 
 impl Auth {
@@ -45,26 +45,19 @@ impl Auth {
     /// # Arguments
     /// * `account_id` - The account ID
     /// * `credentials` - The credentials to verify
-    /// * `account_metadata` - The account metadata containing authorization info
-    pub fn verify(
-        &self,
-        account_id: &str,
-        credentials: &Credentials,
-        account_metadata: &AccountMetadata,
-    ) -> Result<(), String> {
+    pub fn verify(&self, account_id: &str, credentials: &Credentials) -> Result<(), String> {
         match self {
-            Auth::MidenFalconRpo => {
+            Auth::MidenFalconRpo { cosigner_pubkeys } => {
                 let (pubkey, signature) = credentials
                     .as_signature()
                     .ok_or_else(|| "MidenFalconRpo requires signature credentials".to_string())?;
 
-                if !account_metadata
-                    .cosigner_pubkeys
-                    .contains(&pubkey.to_string())
-                {
+                // Check authorization - pubkey must be in cosigner list
+                if !cosigner_pubkeys.contains(&pubkey.to_string()) {
                     return Err(format!("Public key '{pubkey}' is not authorized"));
                 }
 
+                // Verify cryptographic signature
                 miden_falcon_rpo::verify_request_signature(account_id, pubkey, signature)
             }
         }
@@ -114,5 +107,23 @@ impl ExtractCredentials for tonic::metadata::MetadataMap {
             .to_string();
 
         Ok(Credentials::signature(pubkey, signature))
+    }
+}
+
+// Conversion from gRPC proto AuthConfig to Auth enum
+impl TryFrom<crate::api::grpc::state_manager::AuthConfig> for Auth {
+    type Error = String;
+
+    fn try_from(
+        auth_config: crate::api::grpc::state_manager::AuthConfig,
+    ) -> Result<Self, Self::Error> {
+        use crate::api::grpc::state_manager::auth_config;
+
+        match auth_config.auth_type {
+            Some(auth_config::AuthType::MidenFalconRpo(miden_auth)) => Ok(Auth::MidenFalconRpo {
+                cosigner_pubkeys: miden_auth.cosigner_pubkeys,
+            }),
+            None => Err("Auth type not specified".to_string()),
+        }
     }
 }

@@ -31,9 +31,13 @@ impl StateManager for StateManagerService {
     ) -> Result<Response<ConfigureResponse>, Status> {
         let req = request.into_inner();
 
-        // Parse auth
-        let auth: Auth = serde_json::from_str(&format!("\"{}\"", req.auth_type))
-            .map_err(|e| Status::invalid_argument(format!("Invalid auth type: {e}")))?;
+        // Parse auth from proto AuthConfig
+        let auth_config = req
+            .auth
+            .ok_or_else(|| Status::invalid_argument("Missing auth configuration"))?;
+
+        let auth = Auth::try_from(auth_config)
+            .map_err(|e| Status::invalid_argument(format!("Invalid auth config: {e}")))?;
 
         // Parse storage_type
         let storage_type: StorageType = serde_json::from_str(&format!("\"{}\"", req.storage_type))
@@ -48,7 +52,6 @@ impl StateManager for StateManagerService {
             auth,
             initial_state,
             storage_type,
-            cosigner_pubkeys: req.cosigner_pubkeys,
         };
 
         // Call service layer

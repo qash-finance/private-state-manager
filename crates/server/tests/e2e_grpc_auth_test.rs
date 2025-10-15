@@ -6,6 +6,15 @@ use server::network::NetworkType;
 use server::state::AppState;
 use server::storage::filesystem::{FilesystemMetadataStore, FilesystemService};
 
+/// Helper to create AuthConfig for Miden Falcon RPO
+fn create_miden_falcon_rpo_auth(cosigner_pubkeys: Vec<String>) -> AuthConfig {
+    AuthConfig {
+        auth_type: Some(auth_config::AuthType::MidenFalconRpo(MidenFalconRpoAuth {
+            cosigner_pubkeys,
+        })),
+    }
+}
+
 use miden_objects::account::{AccountId, AccountIdVersion, AccountStorageMode, AccountType};
 use miden_objects::crypto::dsa::rpo_falcon512::SecretKey;
 use miden_objects::crypto::hash::rpo::Rpo256;
@@ -113,10 +122,9 @@ async fn test_grpc_configure_account() {
 
     let configure_req = ConfigureRequest {
         account_id: account_id_hex,
-        auth_type: "MidenFalconRpo".to_string(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![])),
         initial_state: r#"{"balance": 0}"#.to_string(),
         storage_type: "Filesystem".to_string(),
-        cosigner_pubkeys: vec![],
     };
 
     let request = Request::new(configure_req);
@@ -140,10 +148,9 @@ async fn test_grpc_configure_and_push_delta_with_auth() {
     // Step 1: Configure account with the cosigner public key
     let configure_req = ConfigureRequest {
         account_id: account_id_hex.clone(),
-        auth_type: "MidenFalconRpo".to_string(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![pubkey_hex.clone()])),
         initial_state: r#"{"balance": 0}"#.to_string(),
         storage_type: "Filesystem".to_string(),
-        cosigner_pubkeys: vec![pubkey_hex.clone()],
     };
 
     let configure_response = service.configure(Request::new(configure_req)).await;
@@ -196,10 +203,9 @@ async fn test_grpc_push_delta_unauthorized_cosigner() {
     // Configure account with ONLY the authorized pubkey
     let configure_req = ConfigureRequest {
         account_id: account_id_hex.clone(),
-        auth_type: "MidenFalconRpo".to_string(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![authorized_pubkey])), // Only this key is authorized
         initial_state: r#"{"balance": 0}"#.to_string(),
         storage_type: "Filesystem".to_string(),
-        cosigner_pubkeys: vec![authorized_pubkey], // Only this key is authorized
     };
 
     let configure_response = service.configure(Request::new(configure_req)).await;
@@ -250,10 +256,9 @@ async fn test_grpc_push_delta_missing_auth_metadata() {
     // Configure account
     let configure_req = ConfigureRequest {
         account_id: account_id_hex.clone(),
-        auth_type: "MidenFalconRpo".to_string(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![pubkey_hex])),
         initial_state: r#"{"balance": 0}"#.to_string(),
         storage_type: "Filesystem".to_string(),
-        cosigner_pubkeys: vec![pubkey_hex],
     };
 
     let configure_response = service.configure(Request::new(configure_req)).await;
@@ -306,10 +311,9 @@ async fn test_grpc_get_delta_with_auth() {
     // Configure account
     let configure_req = ConfigureRequest {
         account_id: account_id_hex.clone(),
-        auth_type: "MidenFalconRpo".to_string(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![pubkey_hex.clone()])),
         initial_state: r#"{"balance": 0}"#.to_string(),
         storage_type: "Filesystem".to_string(),
-        cosigner_pubkeys: vec![pubkey_hex.clone()],
     };
 
     service

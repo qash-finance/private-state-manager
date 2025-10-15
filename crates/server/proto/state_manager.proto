@@ -20,13 +20,24 @@ service StateManager {
   rpc GetState(GetStateRequest) returns (GetStateResponse);
 }
 
+// Auth configuration - one of the auth types
+message AuthConfig {
+  oneof auth_type {
+    MidenFalconRpoAuth miden_falcon_rpo = 1;
+  }
+}
+
+// Miden Falcon RPO authentication config
+message MidenFalconRpoAuth {
+  repeated string cosigner_pubkeys = 1;
+}
+
 // Configure request
 message ConfigureRequest {
   string account_id = 1;
-  string auth_type = 2; // Auth type: "MidenFalconRpo", etc.
+  AuthConfig auth = 2;
   string initial_state = 3; // JSON string
   string storage_type = 4;
-  repeated string cosigner_pubkeys = 5;
 }
 
 message ConfigureResponse {

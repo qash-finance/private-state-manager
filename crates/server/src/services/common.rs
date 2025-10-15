@@ -1,5 +1,4 @@
 use crate::auth::{Auth, Credentials};
-use crate::storage::AccountMetadata;
 
 pub type ServiceResult<T> = Result<T, ServiceError>;
 
@@ -19,10 +18,9 @@ impl ServiceError {
 /// Verify credentials and authorization for a request
 pub(crate) fn verify_request_auth(
     auth: &Auth,
-    account_metadata: &AccountMetadata,
     account_id: &str,
     credentials: &Credentials,
 ) -> ServiceResult<()> {
-    auth.verify(account_id, credentials, account_metadata)
+    auth.verify(account_id, credentials)
         .map_err(|e| ServiceError::new(format!("Authentication failed: {e}")))
 }

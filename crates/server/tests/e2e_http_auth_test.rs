@@ -106,12 +106,15 @@ async fn test_configure_account() {
     // Prepare configure request
     let request_body = json!({
         "account_id": account_id_hex,
-        "auth": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": []
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "Filesystem",
-        "cosigner_pubkeys": []
+        "storage_type": "Filesystem"
     });
 
     let request = Request::builder()
@@ -137,12 +140,15 @@ async fn test_configure_and_push_delta_with_auth() {
     // Step 1: Configure account with the cosigner public key
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [pubkey_hex.clone()]
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "Filesystem",
-        "cosigner_pubkeys": [pubkey_hex.clone()]
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()
@@ -207,12 +213,15 @@ async fn test_push_delta_unauthorized_cosigner() {
     // Configure account with ONLY the authorized pubkey
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [authorized_pubkey] // Only this key is authorized
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "Filesystem",
-        "cosigner_pubkeys": [authorized_pubkey] // Only this key is authorized
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()
@@ -271,12 +280,15 @@ async fn test_push_delta_missing_auth_headers() {
     // Configure account
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [pubkey_hex]
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "Filesystem",
-        "cosigner_pubkeys": [pubkey_hex]
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()

@@ -10,7 +10,6 @@ pub struct ConfigureAccountParams {
     pub auth: Auth,
     pub initial_state: serde_json::Value,
     pub storage_type: StorageType,
-    pub cosigner_pubkeys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +63,6 @@ pub async fn configure_account(
         account_id: params.account_id.clone(),
         auth: params.auth,
         storage_type: params.storage_type,
-        cosigner_pubkeys: params.cosigner_pubkeys,
         created_at: account_state.created_at.clone(),
         updated_at: account_state.updated_at.clone(),
     };

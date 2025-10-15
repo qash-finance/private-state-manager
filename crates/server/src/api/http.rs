@@ -19,8 +19,6 @@ pub struct ConfigureRequest {
     pub auth: Auth,
     pub initial_state: serde_json::Value,
     pub storage_type: StorageType,
-    #[serde(default)]
-    pub cosigner_pubkeys: Vec<String>,
 }
 
 impl From<ConfigureRequest> for ConfigureAccountParams {
@@ -30,7 +28,6 @@ impl From<ConfigureRequest> for ConfigureAccountParams {
             auth: req.auth,
             initial_state: req.initial_state,
             storage_type: req.storage_type,
-            cosigner_pubkeys: req.cosigner_pubkeys,
         }
     }
 }

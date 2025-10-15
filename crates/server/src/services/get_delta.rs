@@ -29,7 +29,6 @@ pub async fn get_delta(state: &AppState, params: GetDeltaParams) -> ServiceResul
     // Verify authentication and authorization
     verify_request_auth(
         &account_metadata.auth,
-        &account_metadata,
         &params.account_id,
         &params.credentials,
     )?;
