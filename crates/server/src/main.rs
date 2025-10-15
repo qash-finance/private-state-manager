@@ -1,6 +1,40 @@
 pub use private_state_manager_shared::{FromJson, ToJson};
 
+use server::builder::ServerBuilder;
+use server::network::NetworkType;
+use server::storage::StorageRegistry;
+use server::storage::filesystem::FilesystemMetadataStore;
+use std::env;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 #[tokio::main]
 async fn main() {
-    server::run().await;
+    let storage_path: PathBuf = env::var("PSM_STORAGE_PATH")
+        .unwrap_or_else(|_| "/var/psm/storage".to_string())
+        .into();
+
+    let metadata_path: PathBuf = env::var("PSM_METADATA_PATH")
+        .unwrap_or_else(|_| "/var/psm/metadata".to_string())
+        .into();
+
+    // Create storage registry with filesystem backend
+    let storage_registry = StorageRegistry::with_filesystem(storage_path)
+        .await
+        .expect("Failed to initialize storage registry");
+
+    let metadata = FilesystemMetadataStore::new(metadata_path)
+        .await
+        .expect("Failed to initialize metadata store");
+
+    ServerBuilder::new()
+        .network(NetworkType::Miden)
+        .storage(storage_registry)
+        .metadata(Arc::new(metadata))
+        .http(true, 3000)
+        .grpc(true, 50051)
+        .build()
+        .expect("Failed to build server")
+        .run()
+        .await;
 }

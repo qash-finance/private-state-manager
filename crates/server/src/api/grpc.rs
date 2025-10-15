@@ -1,7 +1,10 @@
-use crate::auth::AuthType;
-use crate::services;
+use crate::auth::{Auth, ExtractCredentials};
+use crate::services::{
+    self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetStateParams,
+    PushDeltaParams,
+};
 use crate::state::AppState;
-use crate::storage::DeltaObject;
+use crate::storage::{DeltaObject, StorageType};
 use tonic::{Request, Response, Status};
 
 // Include the generated protobuf code
@@ -20,23 +23,6 @@ pub struct StateManagerService {
     pub app_state: AppState,
 }
 
-/// Extract authentication data from gRPC metadata
-fn extract_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(String, String), Status> {
-    let pubkey = metadata
-        .get("x-pubkey")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-pubkey metadata"))?
-        .to_string();
-
-    let signature = metadata
-        .get("x-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Status::invalid_argument("Missing or invalid x-signature metadata"))?
-        .to_string();
-
-    Ok((pubkey, signature))
-}
-
 #[tonic::async_trait]
 impl StateManager for StateManagerService {
     async fn configure(
@@ -45,28 +31,34 @@ impl StateManager for StateManagerService {
     ) -> Result<Response<ConfigureResponse>, Status> {
         let req = request.into_inner();
 
-        // Parse auth_type
-        let auth_type: AuthType = serde_json::from_str(&format!("\"{}\"", req.auth_type))
-            .map_err(|e| Status::invalid_argument(format!("Invalid auth_type: {}", e)))?;
+        // Parse auth from proto AuthConfig
+        let auth_config = req
+            .auth
+            .ok_or_else(|| Status::invalid_argument("Missing auth configuration"))?;
+
+        let auth = Auth::try_from(auth_config)
+            .map_err(|e| Status::invalid_argument(format!("Invalid auth config: {e}")))?;
+
+        // Parse storage_type
+        let storage_type: StorageType = serde_json::from_str(&format!("\"{}\"", req.storage_type))
+            .map_err(|e| Status::invalid_argument(format!("Invalid storage type: {e}")))?;
 
         // Parse initial_state JSON
         let initial_state: serde_json::Value = serde_json::from_str(&req.initial_state)
-            .map_err(|e| Status::invalid_argument(format!("Invalid initial_state JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid initial_state JSON: {e}")))?;
+
+        let params = ConfigureAccountParams {
+            account_id: req.account_id.clone(),
+            auth,
+            initial_state,
+            storage_type,
+        };
 
         // Call service layer
-        match services::configure_account(
-            &self.app_state,
-            req.account_id.clone(),
-            auth_type,
-            initial_state,
-            req.storage_type,
-            req.cosigner_pubkeys,
-        )
-        .await
-        {
-            Ok(_) => Ok(Response::new(ConfigureResponse {
+        match services::configure_account(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(ConfigureResponse {
                 success: true,
-                message: format!("Account '{}' configured successfully", req.account_id),
+                message: format!("Account '{}' configured successfully", response.account_id),
             })),
             Err(e) => Ok(Response::new(ConfigureResponse {
                 success: false,
@@ -80,13 +72,13 @@ impl StateManager for StateManagerService {
         request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
         // Extract authentication data from metadata
-        let (pubkey, signature) = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
         // Parse delta_payload JSON
         let delta_payload: serde_json::Value = serde_json::from_str(&req.delta_payload)
-            .map_err(|e| Status::invalid_argument(format!("Invalid delta_payload JSON: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid delta_payload JSON: {e}")))?;
 
         // Convert proto request to internal DeltaObject
         let delta = DeltaObject {
@@ -101,12 +93,17 @@ impl StateManager for StateManagerService {
             discarded_at: req.discarded_at,
         };
 
+        let params = PushDeltaParams {
+            delta,
+            credentials: auth,
+        };
+
         // Call service layer
-        match services::push_delta(&self.app_state, delta, pubkey, signature).await {
-            Ok(delta) => Ok(Response::new(PushDeltaResponse {
+        match services::push_delta(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(PushDeltaResponse {
                 success: true,
                 message: "Delta pushed successfully".to_string(),
-                delta: Some(delta_to_proto(&delta)),
+                delta: Some(delta_to_proto(&response.delta)),
             })),
             Err(e) => Ok(Response::new(PushDeltaResponse {
                 success: false,
@@ -121,16 +118,22 @@ impl StateManager for StateManagerService {
         request: Request<GetDeltaRequest>,
     ) -> Result<Response<GetDeltaResponse>, Status> {
         // Extract authentication data from metadata
-        let (pubkey, signature) = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
+        let params = GetDeltaParams {
+            account_id: req.account_id,
+            nonce: req.nonce,
+            credentials: auth,
+        };
+
         // Call service layer
-        match services::get_delta(&self.app_state, &req.account_id, req.nonce, pubkey, signature).await {
-            Ok(delta) => Ok(Response::new(GetDeltaResponse {
+        match services::get_delta(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(GetDeltaResponse {
                 success: true,
                 message: "Delta retrieved successfully".to_string(),
-                delta: Some(delta_to_proto(&delta)),
+                delta: Some(delta_to_proto(&response.delta)),
             })),
             Err(e) => Ok(Response::new(GetDeltaResponse {
                 success: false,
@@ -145,20 +148,21 @@ impl StateManager for StateManagerService {
         request: Request<GetDeltaHeadRequest>,
     ) -> Result<Response<GetDeltaHeadResponse>, Status> {
         // Extract authentication data from metadata
-        let (pubkey, signature) = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
+        let params = GetDeltaHeadParams {
+            account_id: req.account_id,
+            credentials: auth,
+        };
+
         // Call service layer
-        match services::get_latest_nonce(&self.app_state, &req.account_id, pubkey, signature).await {
-            Ok(latest_nonce) => Ok(Response::new(GetDeltaHeadResponse {
+        match services::get_delta_head(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(GetDeltaHeadResponse {
                 success: true,
-                message: if latest_nonce.is_some() {
-                    "Latest nonce retrieved successfully".to_string()
-                } else {
-                    "No deltas found for account".to_string()
-                },
-                latest_nonce,
+                message: "Latest delta retrieved successfully".to_string(),
+                latest_nonce: Some(response.delta.nonce),
             })),
             Err(e) => Ok(Response::new(GetDeltaHeadResponse {
                 success: false,
@@ -173,16 +177,21 @@ impl StateManager for StateManagerService {
         request: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
         // Extract authentication data from metadata
-        let (pubkey, signature) = extract_auth(request.metadata())?;
+        let auth = request.metadata().extract_credentials()?;
 
         let req = request.into_inner();
 
+        let params = GetStateParams {
+            account_id: req.account_id,
+            credentials: auth,
+        };
+
         // Call service layer
-        match services::get_state(&self.app_state, &req.account_id, pubkey, signature).await {
-            Ok(state) => Ok(Response::new(GetStateResponse {
+        match services::get_state(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(GetStateResponse {
                 success: true,
                 message: "State retrieved successfully".to_string(),
-                state: Some(state_to_proto(&state)),
+                state: Some(state_to_proto(&response.state)),
             })),
             Err(e) => Ok(Response::new(GetStateResponse {
                 success: false,

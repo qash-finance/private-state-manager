@@ -3,20 +3,21 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use serde_json::json;
-use tower::{Service, ServiceExt}; // For making service calls
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tower::{Service, ServiceExt}; // For making service calls
 
+use server::api::http;
+use server::network::NetworkType;
 use server::state::AppState;
-use server::http;
-use server::storage::filesystem::{FilesystemConfig, FilesystemService};
-use server::metadata::file_store::FileMetadataStore;
+use server::storage::filesystem::{FilesystemMetadataStore, FilesystemService};
+use server::storage::{StorageBackend, StorageRegistry, StorageType};
+use std::collections::HashMap;
 
-use miden_objects::account::{AccountId, AccountIdVersion, AccountType, AccountStorageMode};
+use miden_objects::account::{AccountId, AccountIdVersion, AccountStorageMode, AccountType};
 use miden_objects::crypto::dsa::rpo_falcon512::SecretKey;
 use miden_objects::crypto::hash::rpo::Rpo256;
-use miden_objects::{Felt, FieldElement, Word};
 use miden_objects::utils::Serializable;
+use miden_objects::{Felt, FieldElement, Word};
 
 /// Helper to create a test account ID
 fn create_test_account_id() -> (AccountId, String) {
@@ -48,7 +49,7 @@ fn generate_falcon_signature(account_id_hex: &str) -> (String, String, String) {
     ];
 
     let digest = Rpo256::hash_elements(&message_elements);
-    let message: Word = digest.into();
+    let message: Word = digest;
 
     // Sign the message
     let signature = secret_key.sign(message);
@@ -56,7 +57,7 @@ fn generate_falcon_signature(account_id_hex: &str) -> (String, String, String) {
     // Convert to hex strings
     let pubkey_word: Word = public_key.into();
     let pubkey_hex = format!("0x{}", hex::encode(pubkey_word.to_bytes()));
-    let signature_hex = format!("0x{}", hex::encode(&signature.to_bytes()));
+    let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
     (account_id_hex.to_string(), pubkey_hex, signature_hex)
 }
@@ -64,16 +65,30 @@ fn generate_falcon_signature(account_id_hex: &str) -> (String, String, String) {
 /// Helper to create test app state
 async fn create_test_app_state() -> AppState {
     // Create temporary directory for test storage
-    let test_dir = std::env::temp_dir().join(format!("psm_test_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&test_dir).expect("Failed to create test directory");
+    let storage_dir =
+        std::env::temp_dir().join(format!("psm_test_storage_{}", uuid::Uuid::new_v4()));
+    let metadata_dir =
+        std::env::temp_dir().join(format!("psm_test_metadata_{}", uuid::Uuid::new_v4()));
 
-    let config = FilesystemConfig { app_path: test_dir.clone() };
-    let storage = FilesystemService::new(config).await.expect("Failed to create storage");
-    let metadata = FileMetadataStore::new(test_dir).await.expect("Failed to create metadata");
+    std::fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
+    std::fs::create_dir_all(&metadata_dir).expect("Failed to create metadata directory");
+
+    let storage = FilesystemService::new(storage_dir)
+        .await
+        .expect("Failed to create storage");
+    let metadata = FilesystemMetadataStore::new(metadata_dir)
+        .await
+        .expect("Failed to create metadata");
+
+    // Create storage registry
+    let mut storage_backends: HashMap<StorageType, Arc<dyn StorageBackend>> = HashMap::new();
+    storage_backends.insert(StorageType::Filesystem, Arc::new(storage));
+    let storage_registry = StorageRegistry::new(storage_backends);
 
     AppState {
-        storage: Arc::new(storage),
-        metadata: Arc::new(Mutex::new(metadata)),
+        storage: storage_registry,
+        metadata: Arc::new(metadata),
+        network_type: NetworkType::Miden,
     }
 }
 
@@ -98,12 +113,15 @@ async fn test_configure_account() {
     // Prepare configure request
     let request_body = json!({
         "account_id": account_id_hex,
-        "auth_type": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": []
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "filesystem",
-        "cosigner_pubkeys": []
+        "storage_type": "Filesystem"
     });
 
     let request = Request::builder()
@@ -129,12 +147,15 @@ async fn test_configure_and_push_delta_with_auth() {
     // Step 1: Configure account with the cosigner public key
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth_type": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [pubkey_hex.clone()]
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "filesystem",
-        "cosigner_pubkeys": [pubkey_hex.clone()]
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()
@@ -147,7 +168,11 @@ async fn test_configure_and_push_delta_with_auth() {
     let mut app_clone = app.clone();
     let configure_response = app_clone.call(configure_request).await.unwrap();
 
-    assert_eq!(configure_response.status(), StatusCode::OK, "Configure should succeed");
+    assert_eq!(
+        configure_response.status(),
+        StatusCode::OK,
+        "Configure should succeed"
+    );
 
     // Step 2: Push a delta with authentication headers
     let delta_body = json!({
@@ -174,7 +199,11 @@ async fn test_configure_and_push_delta_with_auth() {
     let mut app_clone = app.clone();
     let push_response = app_clone.call(push_request).await.unwrap();
 
-    assert_eq!(push_response.status(), StatusCode::OK, "Push delta should succeed with valid auth");
+    assert_eq!(
+        push_response.status(),
+        StatusCode::OK,
+        "Push delta should succeed with valid auth"
+    );
 }
 
 #[tokio::test]
@@ -191,12 +220,15 @@ async fn test_push_delta_unauthorized_cosigner() {
     // Configure account with ONLY the authorized pubkey
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth_type": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [authorized_pubkey] // Only this key is authorized
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "filesystem",
-        "cosigner_pubkeys": [authorized_pubkey] // Only this key is authorized
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()
@@ -237,7 +269,11 @@ async fn test_push_delta_unauthorized_cosigner() {
     let push_response = app_clone.call(push_request).await.unwrap();
 
     // Should fail because the public key is not in cosigner_pubkeys list
-    assert_eq!(push_response.status(), StatusCode::BAD_REQUEST, "Should reject unauthorized cosigner");
+    assert_eq!(
+        push_response.status(),
+        StatusCode::BAD_REQUEST,
+        "Should reject unauthorized cosigner"
+    );
 }
 
 #[tokio::test]
@@ -251,12 +287,15 @@ async fn test_push_delta_missing_auth_headers() {
     // Configure account
     let configure_body = json!({
         "account_id": account_id_hex,
-        "auth_type": "MidenFalconRpo",
+        "auth": {
+            "MidenFalconRpo": {
+                "cosigner_pubkeys": [pubkey_hex]
+            }
+        },
         "initial_state": {
             "balance": 0
         },
-        "storage_type": "filesystem",
-        "cosigner_pubkeys": [pubkey_hex]
+        "storage_type": "Filesystem"
     });
 
     let configure_request = Request::builder()
@@ -295,5 +334,9 @@ async fn test_push_delta_missing_auth_headers() {
     let push_response = app.oneshot(push_request).await.unwrap();
 
     // Should fail with BAD_REQUEST because auth headers are missing
-    assert_eq!(push_response.status(), StatusCode::BAD_REQUEST, "Should require auth headers");
+    assert_eq!(
+        push_response.status(),
+        StatusCode::BAD_REQUEST,
+        "Should require auth headers"
+    );
 }
