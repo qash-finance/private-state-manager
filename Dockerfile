@@ -1,8 +1,5 @@
 # Build stage
 # Note: This builds for the host architecture by default.
-# For reproducible builds across machines, specify --platform flag when building:
-#   docker build --platform linux/amd64 ...  (for x86_64)
-#   docker build --platform linux/arm64 ...  (for ARM64)
 FROM rust:1.88@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 as builder
 
 # Install protobuf compiler (pinned to specific version)
