@@ -82,10 +82,24 @@ All build dependencies are pinned for reproducibility:
 Build and get the hash (run from repository root):
 
 ```bash
+# Build for linux/amd64 (default)
 ./crates/server/tests/verify-build-hash.sh
+
+# Or build for linux/arm64
+PLATFORM=linux/arm64 ./crates/server/tests/verify-build-hash.sh
 ```
 
-This builds the server in Docker and displays the SHA256 hash. To verify reproducibility, run this script on different machines (Linux, macOS, Windows) from the same git commit and compare the hashes - they should match exactly.
+**Important**: Binaries are architecture-specific. To verify reproducibility across machines:
+1. Choose a target platform (e.g., `linux/amd64`)
+2. Build using the **same platform** on all machines
+3. Compare the SHA256 hashes - they should match exactly
+
+Example:
+```bash
+# Machine 1 (macOS ARM):   PLATFORM=linux/amd64 ./crates/server/tests/verify-build-hash.sh
+# Machine 2 (Linux x86_64): PLATFORM=linux/amd64 ./crates/server/tests/verify-build-hash.sh
+# → Both should produce the same hash
+```
 
 #### Benefits
 
