@@ -1,7 +1,20 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Auth;
+
 pub mod filesystem;
+
+/// Metadata for a single account
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AccountMetadata {
+    pub account_id: String,
+    pub auth: Auth,
+    pub storage_type: String,
+    pub cosigner_pubkeys: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
 
 /// Account state object
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -44,4 +57,17 @@ pub trait StorageBackend: Send + Sync {
 
     /// List all deltas for an account
     async fn list_deltas(&self, account_id: &str) -> Result<Vec<String>, String>;
+}
+
+/// Metadata store trait for managing account metadata
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    /// Get metadata for a specific account
+    async fn get(&self, account_id: &str) -> Result<Option<AccountMetadata>, String>;
+
+    /// Store or update metadata for an account
+    async fn set(&self, metadata: AccountMetadata) -> Result<(), String>;
+
+    /// List all account IDs
+    async fn list(&self) -> Result<Vec<String>, String>;
 }

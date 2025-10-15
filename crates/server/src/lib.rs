@@ -6,7 +6,6 @@ use tonic::transport::Server;
 pub mod api;
 pub mod auth;
 pub mod config;
-pub mod metadata;
 pub mod services;
 pub mod state;
 pub mod storage;
@@ -70,7 +69,6 @@ pub async fn run() {
     let storage = initialize_storage()
         .await
         .expect("Failed to initialize storage");
-
     let app_state = AppState { storage, metadata };
 
     let grpc_app_state = AppState {

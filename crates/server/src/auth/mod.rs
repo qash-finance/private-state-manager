@@ -1,6 +1,6 @@
 mod miden_falcon_rpo;
 
-use crate::metadata::AccountMetadata;
+use crate::storage::AccountMetadata;
 
 /// Authentication credentials enum - extensible for different auth methods
 #[derive(Debug, Clone)]

@@ -1,11 +1,9 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{Request, metadata::MetadataValue};
 
 use server::api::grpc::{StateManagerService, state_manager::*};
-use server::metadata::file_store::FileMetadataStore;
 use server::state::AppState;
-use server::storage::filesystem::{FilesystemConfig, FilesystemService};
+use server::storage::filesystem::{FilesystemConfig, FilesystemMetadataStore, FilesystemService};
 
 use miden_objects::account::{AccountId, AccountIdVersion, AccountStorageMode, AccountType};
 use miden_objects::crypto::dsa::rpo_falcon512::SecretKey;
@@ -65,16 +63,16 @@ async fn create_test_app_state() -> AppState {
     let config = FilesystemConfig {
         app_path: test_dir.clone(),
     };
-    let storage = FilesystemService::new(config)
+    let storage = FilesystemService::new(config.clone())
         .await
         .expect("Failed to create storage");
-    let metadata = FileMetadataStore::new(test_dir)
+    let metadata = FilesystemMetadataStore::new(config.app_path)
         .await
         .expect("Failed to create metadata");
 
     AppState {
         storage: Arc::new(storage),
-        metadata: Arc::new(Mutex::new(metadata)),
+        metadata: Arc::new(metadata),
     }
 }
 

@@ -1,7 +1,6 @@
 use crate::auth::{Auth, Credentials};
-use crate::metadata::AccountMetadata;
 use crate::state::AppState;
-use crate::storage::{AccountState, DeltaObject};
+use crate::storage::{AccountMetadata, AccountState, DeltaObject};
 
 pub type ServiceResult<T> = Result<T, ServiceError>;
 
@@ -94,9 +93,9 @@ pub async fn configure_account(
     params: ConfigureAccountParams,
 ) -> ServiceResult<ConfigureAccountResult> {
     // Check if account already exists
-    let mut metadata = state.metadata.lock().await;
-    let existing = metadata
-        .get_account(&params.account_id)
+    let existing = state
+        .metadata
+        .get(&params.account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check existing account: {e}")))?;
 
@@ -134,8 +133,9 @@ pub async fn configure_account(
         updated_at: account_state.updated_at.clone(),
     };
 
-    metadata
-        .set_account(metadata_entry)
+    state
+        .metadata
+        .set(metadata_entry)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to store metadata: {e}")))?;
 
@@ -150,15 +150,14 @@ pub async fn push_delta(
     params: PushDeltaParams,
 ) -> ServiceResult<PushDeltaResult> {
     // Verify account exists
-    let metadata = state.metadata.lock().await;
-    let account_metadata = metadata
-        .get_account(&params.delta.account_id)
+    let account_metadata = state
+        .metadata
+        .get(&params.delta.account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| {
             ServiceError::new(format!("Account '{}' not found", params.delta.account_id))
         })?;
-    drop(metadata);
 
     // Verify authentication and authorization
     verify_request_auth(
@@ -187,13 +186,12 @@ pub async fn push_delta(
 /// Get a specific delta
 pub async fn get_delta(state: &AppState, params: GetDeltaParams) -> ServiceResult<GetDeltaResult> {
     // Verify account exists
-    let metadata = state.metadata.lock().await;
-    let account_metadata = metadata
-        .get_account(&params.account_id)
+    let account_metadata = state
+        .metadata
+        .get(&params.account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| ServiceError::new(format!("Account '{}' not found", params.account_id)))?;
-    drop(metadata);
 
     // Verify authentication and authorization
     verify_request_auth(
@@ -219,13 +217,12 @@ pub async fn get_delta_head(
     params: GetDeltaHeadParams,
 ) -> ServiceResult<GetDeltaHeadResult> {
     // Verify account exists
-    let metadata = state.metadata.lock().await;
-    let account_metadata = metadata
-        .get_account(&params.account_id)
+    let account_metadata = state
+        .metadata
+        .get(&params.account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| ServiceError::new(format!("Account '{}' not found", params.account_id)))?;
-    drop(metadata);
 
     // Verify authentication and authorization
     verify_request_auth(
@@ -278,13 +275,12 @@ pub async fn get_latest_nonce(
     credentials: Credentials,
 ) -> ServiceResult<Option<u64>> {
     // Verify account exists
-    let metadata = state.metadata.lock().await;
-    let account_metadata = metadata
-        .get_account(account_id)
+    let account_metadata = state
+        .metadata
+        .get(account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| ServiceError::new(format!("Account '{account_id}' not found")))?;
-    drop(metadata);
 
     // Verify authentication and authorization
     verify_request_auth(
@@ -320,13 +316,12 @@ pub async fn get_latest_nonce(
 /// Get account state
 pub async fn get_state(state: &AppState, params: GetStateParams) -> ServiceResult<GetStateResult> {
     // Verify account exists
-    let metadata = state.metadata.lock().await;
-    let account_metadata = metadata
-        .get_account(&params.account_id)
+    let account_metadata = state
+        .metadata
+        .get(&params.account_id)
         .await
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| ServiceError::new(format!("Account '{}' not found", &params.account_id)))?;
-    drop(metadata);
 
     // Verify authentication and authorization
     verify_request_auth(
