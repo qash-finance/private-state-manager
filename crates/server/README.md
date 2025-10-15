@@ -12,6 +12,7 @@ Runs both HTTP REST and gRPC simultaneously:
 
 ### Environment Variables
 
+- `PSM_ENV` - Environment (default: `dev`)
 - `PSM_STORAGE_PATH` - Storage backend path (default: `/var/psm/storage`)
 - `PSM_METADATA_PATH` - Metadata store path (default: `/var/psm/metadata`)
 
