@@ -25,13 +25,6 @@ impl MidenNetworkClient {
     ///
     /// # Returns
     /// * `Ok(commitment)` - The on-chain commitment hash (after full validation)
-    /// * `Err(String)` - Account doesn't exist, network error, invalid JSON format, or commitment mismatch
-    ///
-    /// # Behavior
-    /// 1. Verifies account exists on-chain by fetching commitment
-    /// 2. Constructs account from state_json (must have proper format with "data" field)
-    /// 3. Validates local commitment matches on-chain commitment exactly
-    /// 4. Returns error if any step fails
     pub async fn verify_intial_state(
         &mut self,
         account_id_hex: &str,
