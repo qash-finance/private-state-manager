@@ -1,5 +1,5 @@
 use miden_objects::account::AccountId;
-use server::network::NetworkType;
+use server::network::{NetworkClient, NetworkType};
 use server::network::miden::MidenNetworkClient;
 
 /// Integration test for fetching account commitment from Miden testnet
@@ -15,7 +15,7 @@ async fn test_fetch_account_commitment_from_testnet() {
         .await
         .expect("Failed to create Miden network client");
 
-    let result = client.get_account_commitment(account_id.to_hex()).await;
+    let result = client.verify_on_chain_state(&account_id.to_hex()).await;
 
     assert!(
         result.is_ok(),

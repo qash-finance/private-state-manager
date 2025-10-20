@@ -1,7 +1,6 @@
 mod utils;
 
-use server::jobs::canonicalize_deltas::process_canonicalizations_now;
-use server::services::{configure_account, push_delta};
+use server::services::{configure_account, process_canonicalizations_now, push_delta};
 use server::services::{ConfigureAccountParams, PushDeltaParams};
 use server::storage::{DeltaObject, StorageType};
 use server::auth::{Auth, Credentials};

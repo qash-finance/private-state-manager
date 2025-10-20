@@ -1,3 +1,4 @@
+mod canonicalize;
 mod configure_account;
 mod get_delta;
 mod get_delta_head;
@@ -37,3 +38,6 @@ pub use get_delta_head::{GetDeltaHeadParams, GetDeltaHeadResult, get_delta_head}
 
 // Re-export get_state
 pub use get_state::{GetStateParams, GetStateResult, get_state};
+
+// Re-export canonicalize
+pub use canonicalize::{process_canonicalizations_now, start_canonicalization_worker};

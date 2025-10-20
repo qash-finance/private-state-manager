@@ -309,9 +309,7 @@ impl ServerHandle {
                     "Starting canonicalization worker (delay: {}s, check interval: {}s)...",
                     config.delay_seconds, config.check_interval_seconds
                 );
-                crate::jobs::canonicalize_deltas::start_canonicalization_worker(
-                    self.app_state.clone(),
-                );
+                crate::services::start_canonicalization_worker(self.app_state.clone());
             }
             CanonicalizationMode::Optimistic => {
                 println!(
