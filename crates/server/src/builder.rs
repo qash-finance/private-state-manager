@@ -6,12 +6,20 @@
 //! - Authentication methods (MidenFalconRpo, EthereumECDSA, etc.)
 //! - API protocols (HTTP, gRPC)
 
-use crate::canonicalization::CanonicalizationMode;
-use crate::network::{miden::MidenNetworkClient, NetworkType};
-use crate::state::AppState;
-use crate::storage::{MetadataStore, StorageRegistry};
+use axum::{Router, routing::get, routing::post};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tonic::transport::Server;
+
+use crate::api::grpc::StateManagerService;
+use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
+use crate::api::http::{
+    configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
+};
+use crate::canonicalization::CanonicalizationMode;
+use crate::network::{NetworkType, miden::MidenNetworkClient};
+use crate::state::AppState;
+use crate::storage::{MetadataStore, StorageRegistry};
 
 /// Builder for configuring and creating a server instance
 pub struct ServerBuilder {
@@ -287,15 +295,6 @@ impl ServerHandle {
     /// # }
     /// ```
     pub async fn run(self) {
-        use axum::{Router, routing::get, routing::post};
-        use tonic::transport::Server;
-
-        use crate::api::grpc::StateManagerService;
-        use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
-        use crate::api::http::{
-            configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
-        };
-
         async fn root() -> &'static str {
             "Hello, World!"
         }

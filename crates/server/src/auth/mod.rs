@@ -1,3 +1,5 @@
+use crate::api::grpc::state_manager::auth_config;
+
 mod miden_falcon_rpo;
 
 /// Trait for extracting authentication credentials from request metadata
@@ -117,8 +119,6 @@ impl TryFrom<crate::api::grpc::state_manager::AuthConfig> for Auth {
     fn try_from(
         auth_config: crate::api::grpc::state_manager::AuthConfig,
     ) -> Result<Self, Self::Error> {
-        use crate::api::grpc::state_manager::auth_config;
-
         match auth_config.auth_type {
             Some(auth_config::AuthType::MidenFalconRpo(miden_auth)) => Ok(Auth::MidenFalconRpo {
                 cosigner_pubkeys: miden_auth.cosigner_pubkeys,

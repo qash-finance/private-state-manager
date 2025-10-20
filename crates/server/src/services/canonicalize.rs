@@ -197,7 +197,13 @@ async fn verify_and_canonicalize_delta(
     if on_chain_commitment == delta.new_commitment {
         canonicalize_delta(state, storage_backend, delta).await
     } else {
-        discard_delta(storage_backend, delta, &delta.new_commitment, &on_chain_commitment).await
+        discard_delta(
+            storage_backend,
+            delta,
+            &delta.new_commitment,
+            &on_chain_commitment,
+        )
+        .await
     }
 }
 
@@ -266,8 +272,7 @@ async fn discard_delta(
         .map_err(|e| format!("Failed to update delta as discarded: {e}"))?;
 
     Err(format!(
-        "On-chain commitment mismatch: expected {}, got {}. Delta discarded.",
-        expected_commitment, actual_commitment
+        "On-chain commitment mismatch: expected {expected_commitment}, got {actual_commitment}. Delta discarded."
     ))
 }
 

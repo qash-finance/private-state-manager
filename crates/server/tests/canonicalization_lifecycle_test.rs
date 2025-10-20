@@ -1,9 +1,9 @@
 mod utils;
 
-use server::services::{configure_account, process_canonicalizations_now, push_delta};
-use server::services::{ConfigureAccountParams, PushDeltaParams};
-use server::storage::{DeltaObject, StorageType};
 use server::auth::{Auth, Credentials};
+use server::services::{ConfigureAccountParams, PushDeltaParams};
+use server::services::{configure_account, process_canonicalizations_now, push_delta};
+use server::storage::{DeltaObject, StorageType};
 use utils::test_helpers::*;
 
 /// Test canonicalization lifecycle - delta is discarded when on-chain doesn't match
@@ -35,7 +35,7 @@ async fn test_canonicalization_discards_mismatched_delta() {
             account_id: delta_1["account_id"].as_str().unwrap().to_string(),
             nonce: delta_1["nonce"].as_u64().unwrap(),
             prev_commitment: delta_1["prev_commitment"].as_str().unwrap().to_string(),
-            new_commitment: String::new(),  // Will be calculated by service
+            new_commitment: String::new(), // Will be calculated by service
             delta_payload: delta_1["delta_payload"].clone(),
             ack_sig: None,
             candidate_at: None,
@@ -72,8 +72,14 @@ async fn test_canonicalization_discards_mismatched_delta() {
     assert_eq!(deltas.len(), 1, "Should have 1 delta");
     let delta = &deltas[0];
     assert!(delta.candidate_at.is_some(), "Delta should be candidate");
-    assert!(delta.canonical_at.is_none(), "Delta should not be canonical yet");
-    assert!(delta.discarded_at.is_none(), "Delta should not be discarded");
+    assert!(
+        delta.canonical_at.is_none(),
+        "Delta should not be canonical yet"
+    );
+    assert!(
+        delta.discarded_at.is_none(),
+        "Delta should not be discarded"
+    );
 
     // Step 4: Trigger canonicalization (bypassing time delay)
     // This will check on-chain and find that the commitment doesn't match
@@ -88,9 +94,18 @@ async fn test_canonicalization_discards_mismatched_delta() {
 
     assert_eq!(deltas_after.len(), 1, "Should still have 1 delta");
     let delta_after = &deltas_after[0];
-    assert!(delta_after.candidate_at.is_some(), "Delta should still have candidate_at");
-    assert!(delta_after.canonical_at.is_none(), "Delta should NOT be canonical");
-    assert!(delta_after.discarded_at.is_some(), "Delta should be discarded");
+    assert!(
+        delta_after.candidate_at.is_some(),
+        "Delta should still have candidate_at"
+    );
+    assert!(
+        delta_after.canonical_at.is_none(),
+        "Delta should NOT be canonical"
+    );
+    assert!(
+        delta_after.discarded_at.is_some(),
+        "Delta should be discarded"
+    );
 
     // Step 6: Verify account state is NOT updated (still at initial commitment)
     let final_state = storage_backend
@@ -146,7 +161,7 @@ async fn test_failed_canonicalization_discards_delta() {
             account_id: delta_1["account_id"].as_str().unwrap().to_string(),
             nonce: delta_1["nonce"].as_u64().unwrap(),
             prev_commitment: delta_1["prev_commitment"].as_str().unwrap().to_string(),
-            new_commitment: String::new(),  // Will be calculated by service
+            new_commitment: String::new(), // Will be calculated by service
             delta_payload: delta_1["delta_payload"].clone(),
             ack_sig: None,
             candidate_at: None,
@@ -199,7 +214,7 @@ async fn test_only_pending_candidates_are_processed() {
             account_id: delta_1["account_id"].as_str().unwrap().to_string(),
             nonce: delta_1["nonce"].as_u64().unwrap(),
             prev_commitment: delta_1["prev_commitment"].as_str().unwrap().to_string(),
-            new_commitment: String::new(),  // Will be calculated by service
+            new_commitment: String::new(), // Will be calculated by service
             delta_payload: delta_1["delta_payload"].clone(),
             ack_sig: None,
             candidate_at: None,
@@ -230,7 +245,10 @@ async fn test_only_pending_candidates_are_processed() {
         .expect("Should pull deltas");
 
     assert_eq!(deltas_after_first.len(), 1);
-    assert!(deltas_after_first[0].discarded_at.is_some(), "Delta should be discarded");
+    assert!(
+        deltas_after_first[0].discarded_at.is_some(),
+        "Delta should be discarded"
+    );
     let first_discarded_at = deltas_after_first[0].discarded_at.clone();
 
     // Second canonicalization - should not reprocess the discarded delta

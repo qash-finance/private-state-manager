@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::auth::Auth;
+use crate::storage::filesystem::FilesystemService;
 
 pub mod filesystem;
 
@@ -128,8 +129,6 @@ impl StorageRegistry {
     /// Uses `/var/psm/storage` as the default storage path.
     /// For custom paths or multiple backends, use `new()` instead.
     pub async fn with_filesystem(storage_path: std::path::PathBuf) -> Result<Self, String> {
-        use crate::storage::filesystem::FilesystemService;
-
         let fs_storage = FilesystemService::new(storage_path).await?;
 
         let mut backends = HashMap::new();

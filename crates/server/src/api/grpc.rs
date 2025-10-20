@@ -84,7 +84,7 @@ impl StateManager for StateManagerService {
             account_id: req.account_id,
             nonce: req.nonce,
             prev_commitment: req.prev_commitment,
-            new_commitment: String::new(),  // Will be calculated in service layer
+            new_commitment: String::new(), // Will be calculated in service layer
             delta_payload,
             ack_sig: None,
             candidate_at: None,

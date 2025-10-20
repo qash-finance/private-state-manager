@@ -50,7 +50,9 @@ impl NetworkClient for MidenNetworkClient {
             .client
             .get_account_commitment(&account_id)
             .await
-            .map_err(|e| format!("Failed to verify account '{account_id}' on Miden network: {e}"))?;
+            .map_err(|e| {
+                format!("Failed to verify account '{account_id}' on Miden network: {e}")
+            })?;
 
         let account = Self::construct_account_from_json(&account_id, state_json)?;
 
@@ -257,5 +259,4 @@ mod tests {
                 .contains("Invalid Miden account ID format")
         );
     }
-
 }
