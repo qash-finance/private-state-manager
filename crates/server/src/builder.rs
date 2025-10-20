@@ -262,7 +262,9 @@ impl ServerHandle {
 
         use crate::api::grpc::StateManagerService;
         use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
-        use crate::api::http::{configure, get_delta, get_delta_head, get_state, push_delta};
+        use crate::api::http::{
+            configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
+        };
 
         async fn root() -> &'static str {
             "Hello, World!"
@@ -280,6 +282,7 @@ impl ServerHandle {
                     .route("/", get(root))
                     .route("/delta", post(push_delta))
                     .route("/delta", get(get_delta))
+                    .route("/delta/since", get(get_delta_since))
                     .route("/head", get(get_delta_head))
                     .route("/configure", post(configure))
                     .route("/state", get(get_state))

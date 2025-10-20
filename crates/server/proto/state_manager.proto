@@ -10,8 +10,11 @@ service StateManager {
   // Submit a delta
   rpc PushDelta(PushDeltaRequest) returns (PushDeltaResponse);
 
-  // Get a specific delta
+  // Get a specific delta by nonce
   rpc GetDelta(GetDeltaRequest) returns (GetDeltaResponse);
+
+  // Get merged delta since a given nonce
+  rpc GetDeltaSince(GetDeltaSinceRequest) returns (GetDeltaSinceResponse);
 
   // Get the latest delta (head)
   rpc GetDeltaHead(GetDeltaHeadRequest) returns (GetDeltaHeadResponse);
@@ -70,6 +73,18 @@ message GetDeltaResponse {
   bool success = 1;
   string message = 2;
   DeltaObject delta = 3;
+}
+
+// Get delta since request
+message GetDeltaSinceRequest {
+  string account_id = 1;
+  uint64 from_nonce = 2;
+}
+
+message GetDeltaSinceResponse {
+  bool success = 1;
+  string message = 2;
+  DeltaObject merged_delta = 3;
 }
 
 // Get delta head request

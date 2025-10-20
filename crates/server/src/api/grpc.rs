@@ -143,6 +143,36 @@ impl StateManager for StateManagerService {
         }
     }
 
+    async fn get_delta_since(
+        &self,
+        request: Request<GetDeltaSinceRequest>,
+    ) -> Result<Response<GetDeltaSinceResponse>, Status> {
+        // Extract authentication data from metadata
+        let auth = request.metadata().extract_credentials()?;
+
+        let req = request.into_inner();
+
+        let params = services::GetDeltaSinceParams {
+            account_id: req.account_id,
+            from_nonce: req.from_nonce,
+            credentials: auth,
+        };
+
+        // Call service layer
+        match services::get_delta_since(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(GetDeltaSinceResponse {
+                success: true,
+                message: "Merged delta retrieved successfully".to_string(),
+                merged_delta: Some(delta_to_proto(&response.merged_delta)),
+            })),
+            Err(e) => Ok(Response::new(GetDeltaSinceResponse {
+                success: false,
+                message: e.message,
+                merged_delta: None,
+            })),
+        }
+    }
+
     async fn get_delta_head(
         &self,
         request: Request<GetDeltaHeadRequest>,

@@ -1,7 +1,7 @@
 use crate::network::NetworkType;
 use miden_objects::account::{Account, AccountDelta, AccountId};
 use miden_rpc_client::MidenRpcClient;
-use private_state_manager_shared::FromJson;
+use private_state_manager_shared::{FromJson, ToJson};
 
 /// Miden network client for fetching on-chain account data
 pub struct MidenNetworkClient {
@@ -71,6 +71,39 @@ impl MidenNetworkClient {
     pub fn verify_delta(&self, delta_payload: &serde_json::Value) -> Result<(), String> {
         AccountDelta::from_json(delta_payload)?;
         Ok(())
+    }
+
+    /// Merge multiple delta payloads into a single AccountDelta.
+    pub fn merge_deltas(
+        &self,
+        delta_payloads: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        if delta_payloads.is_empty() {
+            return Err("Cannot merge empty delta list".to_string());
+        }
+
+        // Deserialize all deltas
+        let mut deltas: Vec<AccountDelta> = delta_payloads
+            .iter()
+            .map(AccountDelta::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if deltas.is_empty() {
+            return Err("No valid deltas to merge".to_string());
+        }
+
+        // Take the first delta as the base
+        let mut merged = deltas.remove(0);
+
+        // Merge remaining deltas in order
+        for delta in deltas {
+            merged
+                .merge(delta)
+                .map_err(|e| format!("Failed to merge deltas: {e}"))?;
+        }
+
+        // Convert back to JSON
+        Ok(merged.to_json())
     }
 
     /// Construct an Account object from JSON state representation

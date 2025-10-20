@@ -1,7 +1,7 @@
 use crate::auth::{Auth, ExtractCredentials};
 use crate::services::{
-    self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetStateParams,
-    PushDeltaParams,
+    self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetDeltaSinceParams,
+    GetStateParams, PushDeltaParams,
 };
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, StorageType};
@@ -152,6 +152,43 @@ pub async fn get_delta(
 
     match services::get_delta(&state, params).await {
         Ok(response) => (StatusCode::OK, Json(response.delta)),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(DeltaObject {
+                account_id: e.message,
+                ..Default::default()
+            }),
+        ),
+    }
+}
+
+pub async fn get_delta_since(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DeltaQuery>,
+) -> (StatusCode, Json<DeltaObject>) {
+    // Extract authentication data from headers
+    let auth = match headers.extract_credentials() {
+        Ok(auth) => auth,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(DeltaObject {
+                    account_id: e,
+                    ..Default::default()
+                }),
+            );
+        }
+    };
+
+    let params = GetDeltaSinceParams {
+        account_id: query.account_id,
+        from_nonce: query.nonce,
+        credentials: auth,
+    };
+
+    match services::get_delta_since(&state, params).await {
+        Ok(response) => (StatusCode::OK, Json(response.merged_delta)),
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(DeltaObject {

@@ -2,8 +2,12 @@ mod utils;
 use utils::test_helpers::*;
 
 use server::api::grpc::state_manager::state_manager_server::StateManager;
-use server::api::grpc::state_manager::{ConfigureRequest, GetDeltaRequest, PushDeltaRequest};
-use utils::test_helpers::{create_test_delta_payload, load_fixture_account_grpc as load_fixture_account};
+use server::api::grpc::state_manager::{
+    ConfigureRequest, GetDeltaRequest, GetDeltaSinceRequest, PushDeltaRequest,
+};
+use utils::test_helpers::{
+    create_test_delta_payload, load_fixture_account_grpc as load_fixture_account,
+};
 
 #[tokio::test]
 async fn test_grpc_configure_and_push_delta_with_auth() {
@@ -174,7 +178,7 @@ async fn test_grpc_get_delta_with_auth() {
         .await
         .unwrap();
 
-    // Push a delta
+    // Push a delta (nonce 1)
     let delta_payload = create_test_delta_payload(&account_id_hex);
     let push_req = PushDeltaRequest {
         account_id: account_id_hex.clone(),
@@ -187,15 +191,11 @@ async fn test_grpc_get_delta_with_auth() {
     };
 
     service
-        .push_delta(create_request_with_auth(
-            push_req,
-            &pubkey_hex,
-            &signature_hex,
-        ))
+        .push_delta(create_request_with_auth(push_req, &pubkey_hex, &signature_hex))
         .await
         .unwrap();
 
-    // Get delta with auth
+    // Get specific delta by nonce
     let get_req = GetDeltaRequest {
         account_id: account_id_hex,
         nonce: 1,
@@ -211,9 +211,107 @@ async fn test_grpc_get_delta_with_auth() {
     let get_response = get_response.unwrap().into_inner();
     assert!(get_response.success, "Get response should be successful");
     assert!(get_response.delta.is_some(), "Should return delta");
+
+    let delta = get_response.delta.unwrap();
+    assert_eq!(delta.nonce, 1, "Delta should have nonce 1");
+}
+
+#[tokio::test]
+async fn test_grpc_get_delta_since_with_auth() {
+    let state = create_test_app_state().await;
+    let service = create_grpc_service(state);
+
+    let (_account_id, account_id_hex, initial_state) = load_fixture_account();
+    let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+
+    // Configure account
+    let configure_req = ConfigureRequest {
+        account_id: account_id_hex.clone(),
+        auth: Some(create_miden_falcon_rpo_auth(vec![pubkey_hex.clone()])),
+        initial_state,
+        storage_type: "Filesystem".to_string(),
+    };
+
+    service
+        .configure(Request::new(configure_req))
+        .await
+        .unwrap();
+
+    // Push first delta (nonce 1)
+    let delta_payload_1 = create_test_delta_payload(&account_id_hex);
+    let push_req_1 = PushDeltaRequest {
+        account_id: account_id_hex.clone(),
+        nonce: 1,
+        prev_commitment: "0x0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        new_commitment: "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .to_string(),
+        delta_payload: delta_payload_1.to_string(),
+    };
+
+    service
+        .push_delta(create_request_with_auth(
+            push_req_1,
+            &pubkey_hex,
+            &signature_hex,
+        ))
+        .await
+        .unwrap();
+
+    // Push second delta (nonce 2)
+    let delta_payload_2 = create_test_delta_payload(&account_id_hex);
+    let push_req_2 = PushDeltaRequest {
+        account_id: account_id_hex.clone(),
+        nonce: 2,
+        prev_commitment: "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .to_string(),
+        new_commitment: "0x2222222222222222222222222222222222222222222222222222222222222222"
+            .to_string(),
+        delta_payload: delta_payload_2.to_string(),
+    };
+
+    service
+        .push_delta(create_request_with_auth(
+            push_req_2,
+            &pubkey_hex,
+            &signature_hex,
+        ))
+        .await
+        .unwrap();
+
+    // Get all deltas after nonce 0 (should return merged delta from nonce 1 and 2)
+    let get_req = GetDeltaSinceRequest {
+        account_id: account_id_hex,
+        from_nonce: 0,
+    };
+
+    let request = create_request_with_auth(get_req, &pubkey_hex, &signature_hex);
+    let get_response = service.get_delta_since(request).await;
+
+    assert!(
+        get_response.is_ok(),
+        "Get delta since should succeed with valid auth"
+    );
+    let get_response = get_response.unwrap().into_inner();
+    assert!(get_response.success, "Get response should be successful");
+    assert!(
+        get_response.merged_delta.is_some(),
+        "Should return merged delta"
+    );
+
+    let merged_delta = get_response.merged_delta.unwrap();
     assert_eq!(
-        get_response.delta.unwrap().nonce,
-        1,
-        "Should return correct delta"
+        merged_delta.nonce, 2,
+        "Merged delta should have the latest nonce"
+    );
+    assert_eq!(
+        merged_delta.prev_commitment,
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "Merged delta should have first delta's prev_commitment"
+    );
+    assert_eq!(
+        merged_delta.new_commitment,
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
+        "Merged delta should have last delta's new_commitment"
     );
 }

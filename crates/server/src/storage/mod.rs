@@ -81,6 +81,13 @@ pub trait StorageBackend: Send + Sync {
     /// Pull a specific delta
     async fn pull_delta(&self, account_id: &str, nonce: u64) -> Result<DeltaObject, String>;
 
+    /// Pull all deltas after a given nonce
+    async fn pull_deltas_after(
+        &self,
+        account_id: &str,
+        from_nonce: u64,
+    ) -> Result<Vec<DeltaObject>, String>;
+
     /// List all deltas for an account
     async fn list_deltas(&self, account_id: &str) -> Result<Vec<String>, String>;
 

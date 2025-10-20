@@ -125,6 +125,32 @@ impl StorageBackend for FilesystemService {
         Ok(delta)
     }
 
+    async fn pull_deltas_after(
+        &self,
+        account_id: &str,
+        from_nonce: u64,
+    ) -> Result<Vec<DeltaObject>, String> {
+        let deltas_filenames = self.list_deltas(account_id).await?;
+
+        let mut deltas = Vec::new();
+        for filename in deltas_filenames {
+            if let Some(nonce_str) = filename.strip_suffix(".json") {
+                if let Ok(nonce) = nonce_str.parse::<u64>() {
+                    // Only include deltas with nonce > from_nonce
+                    if nonce > from_nonce {
+                        let delta = self.pull_delta(account_id, nonce).await?;
+                        deltas.push(delta);
+                    }
+                }
+            }
+        }
+
+        // Sort by nonce to ensure correct merge order
+        deltas.sort_by_key(|d| d.nonce);
+
+        Ok(deltas)
+    }
+
     async fn list_deltas(&self, account_id: &str) -> Result<Vec<String>, String> {
         let deltas_dir = self.app_path.join(account_id).join("deltas");
 
