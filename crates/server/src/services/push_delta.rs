@@ -3,7 +3,7 @@ use crate::canonicalization::CanonicalizationMode;
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject};
 
-use super::common::{ServiceError, ServiceResult, verify_request_auth};
+use super::{ServiceError, ServiceResult};
 
 #[derive(Debug, Clone)]
 pub struct PushDeltaParams {
@@ -31,12 +31,10 @@ pub async fn push_delta(
             ServiceError::new(format!("Account '{}' not found", params.delta.account_id))
         })?;
 
-    // Verify authentication and authorization
-    verify_request_auth(
-        &account_metadata.auth,
-        &params.delta.account_id,
-        &params.credentials,
-    )?;
+    account_metadata
+        .auth
+        .verify(&params.delta.account_id, &params.credentials)
+        .map_err(|e| ServiceError::new(format!("Authentication failed: {e}")))?;
 
     // Get the storage backend for this account
     let storage_backend = state

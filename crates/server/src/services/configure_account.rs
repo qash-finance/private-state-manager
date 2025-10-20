@@ -2,7 +2,7 @@ use crate::auth::Auth;
 use crate::state::AppState;
 use crate::storage::{AccountMetadata, AccountState, StorageType};
 
-use super::common::{ServiceError, ServiceResult};
+use super::{ServiceError, ServiceResult};
 
 #[derive(Debug, Clone)]
 pub struct ConfigureAccountParams {

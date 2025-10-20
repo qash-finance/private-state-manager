@@ -2,7 +2,7 @@ use crate::auth::Credentials;
 use crate::state::AppState;
 use crate::storage::DeltaObject;
 
-use super::common::{ServiceError, ServiceResult, verify_request_auth};
+use super::{ServiceError, ServiceResult};
 
 #[derive(Debug, Clone)]
 pub struct GetDeltaSinceParams {
@@ -27,11 +27,10 @@ pub async fn get_delta_since(
         .map_err(|e| ServiceError::new(format!("Failed to check account: {e}")))?
         .ok_or_else(|| ServiceError::new(format!("Account '{}' not found", params.account_id)))?;
 
-    verify_request_auth(
-        &account_metadata.auth,
-        &params.account_id,
-        &params.credentials,
-    )?;
+    account_metadata
+        .auth
+        .verify(&params.account_id, &params.credentials)
+        .map_err(|e| ServiceError::new(format!("Authentication failed: {e}")))?;
 
     let storage_backend = state
         .storage
