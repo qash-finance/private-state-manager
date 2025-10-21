@@ -72,22 +72,7 @@ async fn check_no_pending_candidates(
         "Checking existing deltas"
     );
 
-    for delta in &all_deltas {
-        tracing::trace!(
-            account_id = %account_id,
-            nonce = delta.nonce,
-            status = ?delta.status,
-            "Delta status"
-        );
-    }
-
     let has_pending_candidate = all_deltas.iter().any(|d| d.status.is_candidate());
-
-    tracing::debug!(
-        account_id = %account_id,
-        has_pending_candidate = has_pending_candidate,
-        "Checked for pending candidates"
-    );
 
     if has_pending_candidate {
         return Err(PsmError::ConflictPendingDelta);

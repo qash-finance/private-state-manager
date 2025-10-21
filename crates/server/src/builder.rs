@@ -256,6 +256,9 @@ impl ServerBuilder {
     /// # }
     /// ```
     pub async fn build(self) -> Result<ServerHandle, String> {
+        if let Some(ref config) = self.logging_config {
+            config.init();
+        }
         let network_type = self
             .network_type
             .ok_or("Network type not set. Use .network(NetworkType::Miden)")?;
@@ -281,7 +284,6 @@ impl ServerBuilder {
 
         Ok(ServerHandle {
             app_state,
-            logging_config: self.logging_config,
             http_enabled: self.http_enabled,
             http_port: self.http_port,
             grpc_enabled: self.grpc_enabled,
@@ -301,7 +303,6 @@ impl Default for ServerBuilder {
 /// Provides methods to run the server with the configured settings.
 pub struct ServerHandle {
     app_state: AppState,
-    logging_config: Option<LoggingConfig>,
     http_enabled: bool,
     http_port: u16,
     grpc_enabled: bool,
@@ -331,10 +332,6 @@ impl ServerHandle {
     /// # }
     /// ```
     pub async fn run(self) {
-        if let Some(config) = self.logging_config {
-            config.init();
-        }
-
         async fn root() -> &'static str {
             "Hello, World!"
         }

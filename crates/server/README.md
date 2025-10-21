@@ -15,6 +15,7 @@ Runs both HTTP REST and gRPC simultaneously:
 - `PSM_ENV` - Environment (default: `dev`)
 - `PSM_STORAGE_PATH` - Storage backend path (default: `/var/psm/storage`)
 - `PSM_METADATA_PATH` - Metadata store path (default: `/var/psm/metadata`)
+- `RUST_LOG` - Logging level (default: `info`)
 
 ### Account Configuration
 
@@ -22,6 +23,33 @@ Each account has:
 - `account_id` - Network-specific identifier
 - `auth` - Auth type with authorization data (e.g., cosigner public keys)
 - `storage_type` - Which backend stores this account's data
+
+### Logging
+
+The server uses structured logging via the `tracing` crate. Configure logging programmatically:
+
+```rust
+use server::builder::ServerBuilder;
+use server::logging::LoggingConfig;
+use tracing::Level;
+
+ServerBuilder::new()
+    .with_logging(LoggingConfig::new(Level::DEBUG))
+    // ... other configuration
+```
+
+Or use the `RUST_LOG` environment variable to override:
+
+```bash
+# Debug level for entire server
+RUST_LOG=debug cargo run --package private-state-manager-server
+
+# Trace only canonicalization jobs
+RUST_LOG=server::jobs::canonicalization=trace cargo run
+
+# Multiple modules
+RUST_LOG=server::jobs=debug,server::services=info cargo run
+```
 
 ### API Endpoints
 
@@ -53,16 +81,10 @@ Run all tests:
 cargo test
 ```
 
-Run HTTP E2E tests:
+Run specific e2e tests:
 
 ```bash
 cargo test --package private-state-manager-server --test e2e_http_auth_test -- --test-threads=1
-```
-
-Run gRPC E2E tests:
-
-```bash
-cargo test --package private-state-manager-server --test e2e_grpc_auth_test -- --test-threads=1
 ```
 
 ### Reproducible Builds
@@ -109,132 +131,6 @@ Update the digests in `Dockerfile` to maintain reproducibility. Then verify that
 
 ```bash
 ./crates/server/tests/verify-build-hash.sh
-```
-
-## Manual Testing
-
-### HTTP with curl
-
-#### Configure an account
-
-```bash
-curl -X POST http://localhost:3000/configure \
-  -H "Content-Type: application/json" \
-  -d '{
-    "account_id": "0x1234567890abcdef1234567890abcd",
-    "auth": {
-      "MidenFalconRpo": {
-        "cosigner_pubkeys": ["0xpubkey1", "0xpubkey2"]
-      }
-    },
-    "initial_state": {},
-    "storage_type": "Filesystem"
-  }'
-```
-
-#### 2. Push a delta
-
-```bash
-curl -X POST http://localhost:3000/delta \
-  -H "Content-Type: application/json" \
-  -H "x-pubkey: 0xpubkey1" \
-  -H "x-signature: 0xsignature_hex" \
-  -d '{
-    "account_id": "0x1234567890abcdef1234567890abcd",
-    "nonce": 1,
-    "prev_commitment": "prev_commit_hash",
-    "delta_hash": "delta_hash_123",
-    "delta_payload": {
-      "operation": "transfer",
-      "amount": 100
-    },
-    "ack_sig": "ack_signature",
-    "candidate_at": "2025-10-15T12:00:00Z",
-    "canonical_at": null,
-    "discarded_at": null
-  }'
-```
-
-#### 3. Get a specific delta
-
-```bash
-curl "http://localhost:3000/delta?account_id=0x1234567890abcdef1234567890abcd&nonce=1"
-```
-
-#### 4. Get the latest delta (head)
-
-```bash
-curl "http://localhost:3000/head?account_id=0x1234567890abcdef1234567890abcd"
-```
-
-#### 5. Get account state
-
-```bash
-curl "http://localhost:3000/state?account_id=0x1234567890abcdef1234567890abcd"
-```
-
-### Testing with grpcurl
-
-Install grpcurl:
-```bash
-brew install grpcurl
-```
-
-#### 1. List available services
-```bash
-grpcurl -plaintext localhost:50051 list
-```
-
-#### 2. Configure an account
-```bash
-grpcurl -plaintext -d '{
-  "account_id": "0x1234567890abcdef1234567890abcd",
-  "auth": {
-    "miden_falcon_rpo": {
-      "cosigner_pubkeys": ["0xpubkey1", "0xpubkey2"]
-    }
-  },
-  "initial_state": "{}",
-  "storage_type": "Filesystem"
-}' localhost:50051 state_manager.StateManager/Configure
-```
-
-#### 3. Push a delta
-```bash
-grpcurl -plaintext \
-  -H "x-pubkey: 0xpubkey1" \
-  -H "x-signature: 0xsignature_hex" \
-  -d '{
-  "account_id": "0x1234567890abcdef1234567890abcd",
-  "nonce": 1,
-  "prev_commitment": "prev_commit_hash",
-  "delta_hash": "delta_hash_123",
-  "delta_payload": "{\"operation\":\"transfer\",\"amount\":100}",
-  "ack_sig": "ack_signature",
-  "candidate_at": "2025-10-15T12:00:00Z"
-}' localhost:50051 state_manager.StateManager/PushDelta
-```
-
-#### 4. Get a specific delta
-```bash
-grpcurl -plaintext -d '{
-  "account_id": "0x1234567890abcdef1234567890abcd",
-  "nonce": 1
-}' localhost:50051 state_manager.StateManager/GetDelta
-```
-
-#### 5. Get the latest delta head
-```bash
-grpcurl -plaintext -d '{
-  "account_id": "0x1234567890abcdef1234567890abcd"
-}' localhost:50051 state_manager.StateManager/GetDeltaHead
-```
-
-#### 6. Get account state
-```bash
-grpcurl -plaintext -d '{
-  "account_id": "0x1234567890abcdef1234567890abcd"
-}' localhost:50051 state_manager.StateManager/GetState
 ```
 
 ### Building gRPC Clients

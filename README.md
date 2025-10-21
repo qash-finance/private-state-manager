@@ -17,9 +17,12 @@ See the [Server README](crates/server/README.md) for detailed API documentation 
 
 #### Environment Variables
 
-- `PSM_APP_PATH` - Base directory for PSM writes (default: `/var/psm/app`)
+- `PSM_STORAGE_PATH` - Storage backend path (default: `/var/psm/storage`)
+- `PSM_METADATA_PATH` - Metadata store path (default: `/var/psm/metadata`)
 - `PSM_ENV` - Environment (default: `dev`)
 - `RUST_LOG` - Logging level (default: `info`)
+  - Supports: `trace`, `debug`, `info`, `warn`, `error`
+  - Module-specific: `RUST_LOG=server::jobs::canonicalization=debug`
 
 ### Running
 
@@ -51,7 +54,10 @@ docker-compose logs -f
 docker-compose down
 ```
 
-The server will be available at `http://localhost:3000`
+The HTTP server will be available at `http://localhost:3000`
+
+The gRPC server will be available at `localhost:50051`
+
 
 ### Local Storage structure
 
