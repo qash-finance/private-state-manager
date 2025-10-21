@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 use std::fmt;
 
@@ -65,26 +65,32 @@ impl PsmError {
 impl fmt::Display for PsmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PsmError::AccountNotFound(id) => write!(f, "Account '{}' not found", id),
-            PsmError::AccountAlreadyExists(id) => write!(f, "Account '{}' already exists", id),
-            PsmError::AuthenticationFailed(msg) => write!(f, "Authentication failed: {}", msg),
-            PsmError::AuthorizationFailed(msg) => write!(f, "Authorization failed: {}", msg),
-            PsmError::StorageError(msg) => write!(f, "Storage error: {}", msg),
-            PsmError::NetworkError(msg) => write!(f, "Network error: {}", msg),
-            PsmError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            PsmError::AccountNotFound(id) => write!(f, "Account '{id}' not found"),
+            PsmError::AccountAlreadyExists(id) => write!(f, "Account '{id}' already exists"),
+            PsmError::AuthenticationFailed(msg) => write!(f, "Authentication failed: {msg}"),
+            PsmError::AuthorizationFailed(msg) => write!(f, "Authorization failed: {msg}"),
+            PsmError::StorageError(msg) => write!(f, "Storage error: {msg}"),
+            PsmError::NetworkError(msg) => write!(f, "Network error: {msg}"),
+            PsmError::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
             PsmError::ConflictPendingDelta => {
-                write!(f, "Cannot push new delta: there is already a non-canonical delta pending")
+                write!(
+                    f,
+                    "Cannot push new delta: there is already a non-canonical delta pending"
+                )
             }
             PsmError::DeltaNotFound { account_id, nonce } => {
-                write!(f, "Delta not found for account '{}' at nonce {}", account_id, nonce)
+                write!(
+                    f,
+                    "Delta not found for account '{account_id}' at nonce {nonce}"
+                )
             }
-            PsmError::StateNotFound(id) => write!(f, "State not found for account '{}'", id),
+            PsmError::StateNotFound(id) => write!(f, "State not found for account '{id}'"),
             PsmError::CommitmentMismatch { expected, actual } => {
-                write!(f, "Commitment mismatch: expected {}, got {}", expected, actual)
+                write!(f, "Commitment mismatch: expected {expected}, got {actual}")
             }
-            PsmError::InvalidAccountId(msg) => write!(f, "Invalid account ID: {}", msg),
-            PsmError::InvalidDelta(msg) => write!(f, "Invalid delta: {}", msg),
-            PsmError::ConfigurationError(msg) => write!(f, "Configuration error: {}", msg),
+            PsmError::InvalidAccountId(msg) => write!(f, "Invalid account ID: {msg}"),
+            PsmError::InvalidDelta(msg) => write!(f, "Invalid delta: {msg}"),
+            PsmError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
         }
     }
 }

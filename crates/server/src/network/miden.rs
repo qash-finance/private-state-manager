@@ -222,8 +222,8 @@ mod tests {
         let expected_commitment =
             "0x1200f7511bf4d0c66c1a146a066fe450877e88e0e9886a2c259eaac57fc6163f";
 
-        println!("Testing with fixture account: {}", account_id_hex);
-        println!("Expected commitment: {}", expected_commitment);
+        println!("Testing with fixture account: {account_id_hex}");
+        println!("Expected commitment: {expected_commitment}");
 
         let result = client.verify_state(account_id_hex, &state_json).await;
 

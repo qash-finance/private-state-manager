@@ -1,8 +1,8 @@
 use crate::auth::Credentials;
 use crate::error::{PsmError, Result};
+use crate::services::resolve_account;
 use crate::state::AppState;
 use crate::storage::DeltaObject;
-use crate::services::resolve_account;
 
 #[derive(Debug, Clone)]
 pub struct GetDeltaHeadParams {
@@ -26,7 +26,8 @@ pub async fn get_delta_head(
         .backend
         .get_delta_head(&account_id)
         .await
-        .map_err(|e| PsmError::StorageError(format!("Failed to fetch head: {e}")))? {
+        .map_err(|e| PsmError::StorageError(format!("Failed to fetch head: {e}")))?
+    {
         let delta = resolved
             .backend
             .pull_delta(&account_id, nonce)
@@ -35,5 +36,8 @@ pub async fn get_delta_head(
         return Ok(GetDeltaHeadResult { delta });
     }
 
-    Err(PsmError::DeltaNotFound { account_id, nonce: 0 })
+    Err(PsmError::DeltaNotFound {
+        account_id,
+        nonce: 0,
+    })
 }

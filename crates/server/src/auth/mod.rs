@@ -1,6 +1,6 @@
 use crate::api::grpc::state_manager::auth_config;
-use axum::{extract::FromRequestParts, http::request::Parts};
 use crate::error::PsmError;
+use axum::{extract::FromRequestParts, http::request::Parts};
 
 mod miden_falcon_rpo;
 

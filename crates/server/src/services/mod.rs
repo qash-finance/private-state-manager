@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use crate::auth::Credentials;
 use crate::error::{PsmError, Result};
 use crate::state::AppState;
 use crate::storage::{AccountMetadata, StorageBackend};
+use std::sync::Arc;
 
 mod canonicalization;
 mod configure_account;
@@ -13,12 +13,12 @@ mod get_state;
 mod push_delta;
 
 pub use canonicalization::{process_canonicalizations_now, start_canonicalization_worker};
-pub use configure_account::{configure_account, ConfigureAccountParams, ConfigureAccountResult};
-pub use get_delta::{get_delta, GetDeltaParams, GetDeltaResult};
-pub use get_delta_head::{get_delta_head, GetDeltaHeadParams, GetDeltaHeadResult};
-pub use get_delta_since::{get_delta_since, GetDeltaSinceParams, GetDeltaSinceResult};
-pub use get_state::{get_state, GetStateParams, GetStateResult};
-pub use push_delta::{push_delta, PushDeltaParams, PushDeltaResult};
+pub use configure_account::{ConfigureAccountParams, ConfigureAccountResult, configure_account};
+pub use get_delta::{GetDeltaParams, GetDeltaResult, get_delta};
+pub use get_delta_head::{GetDeltaHeadParams, GetDeltaHeadResult, get_delta_head};
+pub use get_delta_since::{GetDeltaSinceParams, GetDeltaSinceResult, get_delta_since};
+pub use get_state::{GetStateParams, GetStateResult, get_state};
+pub use push_delta::{PushDeltaParams, PushDeltaResult, push_delta};
 
 #[derive(Clone)]
 pub struct ResolvedAccount {

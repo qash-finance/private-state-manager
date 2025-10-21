@@ -1,11 +1,11 @@
+use miden_lib::account::{auth::AuthRpoFalcon512Multisig, wallets::BasicWallet};
 use miden_objects::{
     Felt, Word,
-    account::{Account, AccountDelta, AccountBuilder},
-    crypto::dsa::rpo_falcon512::PublicKey,
     account::delta::{AccountStorageDelta, AccountVaultDelta},
+    account::{Account, AccountBuilder, AccountDelta},
+    crypto::dsa::rpo_falcon512::PublicKey,
 };
-use miden_lib::account::{auth::AuthRpoFalcon512Multisig, wallets::BasicWallet};
-use private_state_manager_shared::{ToJson, FromJson};
+use private_state_manager_shared::{FromJson, ToJson};
 use std::fs;
 
 #[tokio::test]
@@ -31,8 +31,11 @@ async fn generate_multisig_fixtures() {
     let mut current_commitment = account.commitment();
 
     println!("\nGenerated Multisig Account:");
-    println!("  Account ID: {}", account_id);
-    println!("  Commitment: 0x{}", hex::encode(current_commitment.as_bytes()));
+    println!("  Account ID: {account_id}");
+    println!(
+        "  Commitment: 0x{}",
+        hex::encode(current_commitment.as_bytes())
+    );
     println!("  Threshold: {}/{}", threshold, approvers.len());
     println!("  Approvers:");
     for (i, pub_key) in approvers.iter().enumerate() {
@@ -52,9 +55,10 @@ async fn generate_multisig_fixtures() {
 
     println!("✅ Multisig account fixture saved to account.json");
 
-    let mut commitments = vec![
-        ("initial_commitment".to_string(), format!("0x{}", hex::encode(current_commitment.as_bytes())))
-    ];
+    let mut commitments = vec![(
+        "initial_commitment".to_string(),
+        format!("0x{}", hex::encode(current_commitment.as_bytes())),
+    )];
 
     // Delta 1: Add 4th approver
     let pub_key_4 = PublicKey::new(Word::from([4u32, 0, 0, 0]));
@@ -72,12 +76,17 @@ async fn generate_multisig_fixtures() {
 
     let mut account_state = Account::from_json(&account_json).expect("Failed to deserialize");
     let prev_commitment_1 = current_commitment;
-    account_state.apply_delta(&delta_1).expect("Failed to apply delta 1");
+    account_state
+        .apply_delta(&delta_1)
+        .expect("Failed to apply delta 1");
     current_commitment = account_state.commitment();
 
     println!("\nDelta 1 - Added 4th approver:");
     println!("  New approver: {}", Word::from(pub_key_4));
-    println!("  Commitment: 0x{}", hex::encode(current_commitment.as_bytes()));
+    println!(
+        "  Commitment: 0x{}",
+        hex::encode(current_commitment.as_bytes())
+    );
 
     let delta_1_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
@@ -89,13 +98,16 @@ async fn generate_multisig_fixtures() {
 
     fs::write(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests").join("fixtures").join("delta_1.json"),
+            .join("tests")
+            .join("fixtures")
+            .join("delta_1.json"),
         serde_json::to_string_pretty(&delta_1_fixture).unwrap(),
-    ).expect("Failed to write delta_1.json");
+    )
+    .expect("Failed to write delta_1.json");
 
     commitments.push((
         "commitment_after_delta_1".to_string(),
-        format!("0x{}", hex::encode(current_commitment.as_bytes()))
+        format!("0x{}", hex::encode(current_commitment.as_bytes())),
     ));
 
     // Delta 2: Add 5th approver
@@ -113,12 +125,17 @@ async fn generate_multisig_fixtures() {
     .expect("Failed to create delta 2");
 
     let prev_commitment_2 = current_commitment;
-    account_state.apply_delta(&delta_2).expect("Failed to apply delta 2");
+    account_state
+        .apply_delta(&delta_2)
+        .expect("Failed to apply delta 2");
     current_commitment = account_state.commitment();
 
     println!("\nDelta 2 - Added 5th approver:");
     println!("  New approver: {}", Word::from(pub_key_5));
-    println!("  Commitment: 0x{}", hex::encode(current_commitment.as_bytes()));
+    println!(
+        "  Commitment: 0x{}",
+        hex::encode(current_commitment.as_bytes())
+    );
 
     let delta_2_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
@@ -130,13 +147,16 @@ async fn generate_multisig_fixtures() {
 
     fs::write(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests").join("fixtures").join("delta_2.json"),
+            .join("tests")
+            .join("fixtures")
+            .join("delta_2.json"),
         serde_json::to_string_pretty(&delta_2_fixture).unwrap(),
-    ).expect("Failed to write delta_2.json");
+    )
+    .expect("Failed to write delta_2.json");
 
     commitments.push((
         "commitment_after_delta_2".to_string(),
-        format!("0x{}", hex::encode(current_commitment.as_bytes()))
+        format!("0x{}", hex::encode(current_commitment.as_bytes())),
     ));
 
     // Delta 3: Increase threshold to 3
@@ -152,12 +172,17 @@ async fn generate_multisig_fixtures() {
     .expect("Failed to create delta 3");
 
     let prev_commitment_3 = current_commitment;
-    account_state.apply_delta(&delta_3).expect("Failed to apply delta 3");
+    account_state
+        .apply_delta(&delta_3)
+        .expect("Failed to apply delta 3");
     current_commitment = account_state.commitment();
 
     println!("\nDelta 3 - Increased threshold to 3:");
     println!("  New threshold: 3/5");
-    println!("  Commitment: 0x{}", hex::encode(current_commitment.as_bytes()));
+    println!(
+        "  Commitment: 0x{}",
+        hex::encode(current_commitment.as_bytes())
+    );
 
     let delta_3_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
@@ -169,27 +194,36 @@ async fn generate_multisig_fixtures() {
 
     fs::write(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests").join("fixtures").join("delta_3.json"),
+            .join("tests")
+            .join("fixtures")
+            .join("delta_3.json"),
         serde_json::to_string_pretty(&delta_3_fixture).unwrap(),
-    ).expect("Failed to write delta_3.json");
+    )
+    .expect("Failed to write delta_3.json");
 
     commitments.push((
         "commitment_after_delta_3".to_string(),
-        format!("0x{}", hex::encode(current_commitment.as_bytes()))
+        format!("0x{}", hex::encode(current_commitment.as_bytes())),
     ));
 
     // Save commitments summary
     let mut commitments_map = serde_json::Map::new();
-    commitments_map.insert("account_id".to_string(), serde_json::json!(format!("{}", account_id)));
+    commitments_map.insert(
+        "account_id".to_string(),
+        serde_json::json!(format!("{}", account_id)),
+    );
     for (key, value) in commitments {
         commitments_map.insert(key, serde_json::json!(value));
     }
 
     fs::write(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests").join("fixtures").join("commitments.json"),
+            .join("tests")
+            .join("fixtures")
+            .join("commitments.json"),
         serde_json::to_string_pretty(&commitments_map).unwrap(),
-    ).expect("Failed to write commitments.json");
+    )
+    .expect("Failed to write commitments.json");
 
     println!("\n✅ Saved commitments.json");
     println!("\n✅ All multisig fixtures generated successfully!");

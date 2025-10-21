@@ -14,13 +14,13 @@ pub mod test_helpers {
     use miden_objects::{Felt, FieldElement, Word};
     use private_state_manager_shared::ToJson;
 
+    use async_trait::async_trait;
+    use private_state_manager_shared::FromJson;
     use server::api::grpc::StateManagerService;
     use server::network::{NetworkClient, NetworkType};
     use server::state::AppState;
     use server::storage::filesystem::{FilesystemMetadataStore, FilesystemService};
     use server::storage::{StorageBackend, StorageRegistry, StorageType};
-    use async_trait::async_trait;
-    use private_state_manager_shared::FromJson;
 
     // Re-export types needed by test functions
     pub use server::api::grpc::state_manager::*;
@@ -62,13 +62,14 @@ pub mod test_helpers {
 
             // For tests, compute commitment from state_json instead of querying network
             let account = Account::from_json(state_json)
-                .map_err(|e| format!("Failed to deserialize account: {}", e))?;
+                .map_err(|e| format!("Failed to deserialize account: {e}"))?;
 
             let commitment = account.commitment();
             let commitment_hex = format!("0x{}", hex::encode(commitment.as_bytes()));
 
             // Register this account with its initial commitment for later on-chain queries
-            self.initial_commitments.insert(_account_id.to_string(), commitment_hex.clone());
+            self.initial_commitments
+                .insert(_account_id.to_string(), commitment_hex.clone());
 
             Ok(commitment_hex)
         }
@@ -90,7 +91,8 @@ pub mod test_helpers {
             prev_state_json: &serde_json::Value,
             delta_payload: &serde_json::Value,
         ) -> Result<(), String> {
-            self.miden_client.verify_delta(prev_proof, prev_state_json, delta_payload)
+            self.miden_client
+                .verify_delta(prev_proof, prev_state_json, delta_payload)
         }
 
         fn apply_delta(
@@ -98,7 +100,8 @@ pub mod test_helpers {
             prev_state_json: &serde_json::Value,
             delta_payload: &serde_json::Value,
         ) -> Result<(serde_json::Value, String), String> {
-            self.miden_client.apply_delta(prev_state_json, delta_payload)
+            self.miden_client
+                .apply_delta(prev_state_json, delta_payload)
         }
 
         fn merge_deltas(
@@ -254,7 +257,7 @@ pub mod test_helpers {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
-            .join(format!("delta_{}.json", delta_num));
+            .join(format!("delta_{delta_num}.json"));
 
         let fixture_contents =
             std::fs::read_to_string(&fixture_path).expect("Failed to read delta fixture");

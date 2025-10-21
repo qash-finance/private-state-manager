@@ -5,12 +5,7 @@ use crate::services::{
 };
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, StorageType};
-use axum::{
-    Json,
-    extract::Query,
-    extract::State,
-    http::StatusCode,
-};
+use axum::{Json, extract::Query, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

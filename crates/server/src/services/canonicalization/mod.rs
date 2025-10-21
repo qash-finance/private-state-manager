@@ -17,7 +17,6 @@ struct CandidateDelta {
 #[derive(Debug, Clone)]
 struct VerifiedDelta {
     delta: DeltaObject,
-    on_chain_commitment: String,
 }
 
 #[derive(Debug, Clone)]
@@ -37,10 +36,7 @@ impl CandidateDelta {
 
     fn verify(self, on_chain_commitment: String) -> VerificationResult {
         if self.delta.new_commitment == on_chain_commitment {
-            VerificationResult::Matched(VerifiedDelta {
-                delta: self.delta,
-                on_chain_commitment,
-            })
+            VerificationResult::Matched(VerifiedDelta { delta: self.delta })
         } else {
             VerificationResult::Mismatched {
                 expected_commitment: self.delta.new_commitment.clone(),

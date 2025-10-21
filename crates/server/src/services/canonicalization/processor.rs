@@ -1,11 +1,11 @@
+use crate::auth::Auth;
 use crate::error::{PsmError, Result};
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, DeltaStatus, StorageBackend};
-use crate::auth::Auth;
-use std::sync::Arc;
+use miden_objects::account::Account;
 use miden_objects::{Word, utils::Serializable};
 use private_state_manager_shared::FromJson;
-use miden_objects::account::Account;
+use std::sync::Arc;
 
 use super::{CandidateDelta, VerificationResult};
 
@@ -19,10 +19,7 @@ pub async fn process_candidates(
         let nonce = delta.nonce;
         let candidate = CandidateDelta::new(delta);
         if let Err(e) = process_candidate(state, storage_backend, candidate).await {
-            eprintln!(
-                "Failed to canonicalize delta {} for account {}: {}",
-                nonce, account_id, e
-            );
+            eprintln!("Failed to canonicalize delta {nonce} for account {account_id}: {e}");
         }
     }
     Ok(())
@@ -64,9 +61,11 @@ async fn fetch_on_chain_commitment(state: &AppState, account_id: &str) -> Result
         .map_err(PsmError::NetworkError)
 }
 
-fn extract_cosigner_pubkeys_from_storage(state_json: &serde_json::Value) -> Result<Option<Vec<String>>> {
+fn extract_cosigner_pubkeys_from_storage(
+    state_json: &serde_json::Value,
+) -> Result<Option<Vec<String>>> {
     let account = Account::from_json(state_json)
-        .map_err(|e| PsmError::InvalidDelta(format!("Failed to deserialize account: {}", e)))?;
+        .map_err(|e| PsmError::InvalidDelta(format!("Failed to deserialize account: {e}")))?;
 
     // Check if slot 1 contains a map by checking if the slot type is a map
     // If we can't get any item at index 0, slot 1 is not a map or is empty
@@ -141,12 +140,13 @@ async fn canonicalize_verified_delta(
 
     // Extract public keys from storage slot 1 and sync with metadata
     // Only proceed if slot 1 contains a valid map with public keys
-    if let Some(storage_pubkeys) = extract_cosigner_pubkeys_from_storage(&updated_state.state_json)? {
+    if let Some(storage_pubkeys) = extract_cosigner_pubkeys_from_storage(&updated_state.state_json)?
+    {
         let current_metadata = state
             .metadata
             .get(&delta.account_id)
             .await
-            .map_err(|e| PsmError::StorageError(format!("Failed to get metadata: {}", e)))?
+            .map_err(|e| PsmError::StorageError(format!("Failed to get metadata: {e}")))?
             .ok_or_else(|| PsmError::AccountNotFound(delta.account_id.clone()))?;
 
         let metadata_pubkeys = match &current_metadata.auth {
@@ -170,7 +170,7 @@ async fn canonicalize_verified_delta(
                 .metadata
                 .set(updated_metadata)
                 .await
-                .map_err(|e| PsmError::StorageError(format!("Failed to update metadata: {}", e)))?;
+                .map_err(|e| PsmError::StorageError(format!("Failed to update metadata: {e}")))?;
 
             println!("  ✓ Metadata cosigner public keys synced with storage");
         }

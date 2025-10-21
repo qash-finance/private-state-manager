@@ -1,9 +1,9 @@
 use crate::auth::Credentials;
 use crate::canonicalization::CanonicalizationMode;
 use crate::error::{PsmError, Result};
+use crate::services::resolve_account;
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, DeltaStatus, StorageBackend};
-use crate::services::resolve_account;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -17,10 +17,7 @@ pub struct PushDeltaResult {
     pub delta: DeltaObject,
 }
 
-pub async fn push_delta(
-    state: &AppState,
-    params: PushDeltaParams,
-) -> Result<PushDeltaResult> {
+pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<PushDeltaResult> {
     let resolved = resolve_account(state, &params.delta.account_id, &params.credentials).await?;
 
     check_no_pending_candidates(&resolved.backend, &params.delta.account_id).await?;

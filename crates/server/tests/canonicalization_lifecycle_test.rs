@@ -46,7 +46,7 @@ async fn test_canonicalization_discards_mismatched_delta() {
         },
     };
 
-    let push_result = push_delta(&state, push_params)
+    let _push_result = push_delta(&state, push_params)
         .await
         .expect("Push delta should succeed");
 
