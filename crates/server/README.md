@@ -8,6 +8,14 @@ Runs both HTTP REST and gRPC simultaneously:
 - HTTP: port 3000
 - gRPC: port 50051
 
+```rust
+use server::builder::ServerBuilder;
+
+let builder = ServerBuilder::new()
+    .http(true, 3000)
+    .grpc(true, 50051);
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -23,6 +31,36 @@ Each account has:
 - `account_id` - Network-specific identifier
 - `auth` - Auth type with authorization data (e.g., cosigner public keys)
 - `storage_type` - Which backend stores this account's data
+
+```rust
+use server::builder::ServerBuilder;
+
+
+let auth = Auth::new(AuthType::MidenFalconRpo, "cosigner_public_key");
+let storage_registry = StorageRegistry::with_filesystem(PathBuf::from("/var/psm/storage")).await?;
+
+let builder = ServerBuilder::new()
+    .network(NetworkType::MidenTestnet)
+    .storage(StorageRegistry::with_filesystem(PathBuf::from("/var/psm/storage")).await?);
+```
+
+Also the server supports configuring the networks, storage types, and metadata store.
+
+```rust
+use server::builder::ServerBuilder;
+use server::network::NetworkType;
+use server::storage::StorageRegistry;
+use server::storage::filesystem::FilesystemMetadataStore;
+
+let metadata = FilesystemMetadataStore::new(PathBuf::from("/var/psm/metadata")).await?;
+
+let storage_registry = StorageRegistry::with_filesystem(PathBuf::from("/var/psm/storage")).await?;
+
+let builder = ServerBuilder::new()
+    .network(NetworkType::MidenTestnet)
+    .metadata(Arc::new(metadata))
+    .storage(storage_registry);
+```
 
 ### Logging
 
@@ -60,6 +98,7 @@ RUST_LOG=server::jobs=debug,server::services=info cargo run
 - **GET** `/delta?account_id=<id>&nonce=<n>` - Retrieve a specific delta by account ID and nonce
 - **GET** `/head?account_id=<id>` - Get the latest delta (highest nonce) for an account
 - **GET** `/state?account_id=<id>` - Retrieve the current state of an account
+- **GET** `/delta/since?account_id=<id>&nonce=<n>` - Retrieve the delta since a given nonce
 
 #### gRPC API (Port 50051)
 
@@ -69,6 +108,7 @@ All methods are available through the `state_manager.StateManager` service:
 - `GetDelta(GetDeltaRequest) -> GetDeltaResponse`
 - `GetDeltaHead(GetDeltaHeadRequest) -> GetDeltaHeadResponse`
 - `GetState(GetStateRequest) -> GetStateResponse`
+- `GetDeltaSince(GetDeltaSinceRequest) -> GetDeltaSinceResponse`
 
 See `proto/state_manager.proto` for the complete protocol buffer definitions.
 

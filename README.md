@@ -57,17 +57,3 @@ docker-compose down
 The HTTP server will be available at `http://localhost:3000`
 
 The gRPC server will be available at `localhost:50051`
-
-
-### Local Storage structure
-
-```
-/var/psm/
-├── app/                           # Write directory (PSM only)
-│   ├── .metadata/
-│   │   └── accounts.json         # Account metadata (storage type, cosigner pubkeys, timestamps)
-│   └── {account_id}/
-│       ├── state.json            # Current account state
-│       └── deltas/
-│           └── {nonce}.json      # Individual deltas
-```
