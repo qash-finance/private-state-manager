@@ -2,7 +2,7 @@ use crate::auth::Auth;
 use crate::network::{NetworkClient, NetworkType};
 use async_trait::async_trait;
 use miden_objects::account::{Account, AccountDelta, AccountId};
-use miden_objects::{utils::Serializable, Word};
+use miden_objects::{Word, utils::Serializable};
 use miden_rpc_client::MidenRpcClient;
 use private_state_manager_shared::{FromJson, ToJson};
 
@@ -149,10 +149,7 @@ impl NetworkClient for MidenNetworkClient {
         Ok(())
     }
 
-    async fn is_canonical(
-        &mut self,
-        delta: &crate::storage::DeltaObject,
-    ) -> Result<bool, String> {
+    async fn is_canonical(&mut self, delta: &crate::storage::DeltaObject) -> Result<bool, String> {
         let on_chain_commitment = self.verify_on_chain_state(&delta.account_id).await?;
         Ok(delta.new_commitment == on_chain_commitment)
     }

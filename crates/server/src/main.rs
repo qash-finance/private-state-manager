@@ -2,6 +2,7 @@ pub use private_state_manager_shared::{FromJson, ToJson};
 
 use server::builder::ServerBuilder;
 use server::canonicalization::{CanonicalizationConfig, CanonicalizationMode};
+use server::logging::LoggingConfig;
 use server::network::NetworkType;
 use server::storage::StorageRegistry;
 use server::storage::filesystem::FilesystemMetadataStore;
@@ -32,6 +33,7 @@ async fn main() {
     let canonicalization_mode = CanonicalizationMode::Enabled(CanonicalizationConfig::default());
 
     ServerBuilder::new()
+        .with_logging(LoggingConfig::default())
         .network(NetworkType::MidenTestnet)
         .with_canonicalization(canonicalization_mode)
         .storage(storage_registry)

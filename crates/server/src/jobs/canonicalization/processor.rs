@@ -61,7 +61,11 @@ impl Processor for DeltasProcessor {
 
         for account_id in account_ids {
             if let Err(e) = self.process_account(&account_id).await {
-                eprintln!("Failed to process canonicalizations for account {account_id}: {e}");
+                tracing::error!(
+                    account_id = %account_id,
+                    error = %e,
+                    "Failed to process canonicalizations for account"
+                );
             }
         }
 
@@ -93,7 +97,12 @@ impl Processor for DeltasProcessor {
         for delta in candidates {
             let nonce = delta.nonce;
             if let Err(e) = self.process_candidate(delta).await {
-                eprintln!("Failed to canonicalize delta {nonce} for account {account_id}: {e}");
+                tracing::error!(
+                    account_id = %account_id,
+                    nonce = nonce,
+                    error = %e,
+                    "Failed to canonicalize delta"
+                );
             }
         }
 
@@ -119,9 +128,10 @@ impl DeltasProcessor {
     }
 
     async fn canonicalize_verified_delta(&self, delta: DeltaObject) -> Result<()> {
-        println!(
-            "✓ Canonicalizing delta {} for account {} (commitment matches on-chain)",
-            delta.nonce, delta.account_id
+        tracing::info!(
+            account_id = %delta.account_id,
+            nonce = delta.nonce,
+            "Canonicalizing delta (commitment matches on-chain)"
         );
 
         let account_metadata = self
@@ -174,12 +184,18 @@ impl DeltasProcessor {
         };
 
         if let Some(new_auth) = new_auth {
-            println!("  Syncing cosigner public keys from on-chain storage");
+            tracing::debug!(
+                account_id = %delta.account_id,
+                "Syncing cosigner public keys from on-chain storage"
+            );
 
             auth::update_credentials(&*self.state.metadata, &delta.account_id, new_auth, &now)
                 .await?;
 
-            println!("  ✓ Metadata cosigner public keys synced with storage");
+            tracing::debug!(
+                account_id = %delta.account_id,
+                "Metadata cosigner public keys synced with storage"
+            );
         }
 
         let mut canonical_delta = delta.clone();
@@ -188,15 +204,18 @@ impl DeltasProcessor {
         storage_backend
             .submit_delta(&canonical_delta)
             .await
-            .map_err(|e| PsmError::StorageError(format!("Failed to update delta as canonical: {e}")))?;
+            .map_err(|e| {
+                PsmError::StorageError(format!("Failed to update delta as canonical: {e}"))
+            })?;
 
         Ok(())
     }
 
     async fn discard_mismatched_delta(&self, delta: DeltaObject) -> Result<()> {
-        println!(
-            "✗ Discarding delta {} for account {} (commitment mismatch with on-chain state)",
-            delta.nonce, delta.account_id
+        tracing::warn!(
+            account_id = %delta.account_id,
+            nonce = delta.nonce,
+            "Discarding delta (commitment mismatch with on-chain state)"
         );
 
         let account_metadata = self
@@ -221,7 +240,9 @@ impl DeltasProcessor {
         storage_backend
             .submit_delta(&discarded_delta)
             .await
-            .map_err(|e| PsmError::StorageError(format!("Failed to update delta as discarded: {e}")))?;
+            .map_err(|e| {
+                PsmError::StorageError(format!("Failed to update delta as discarded: {e}"))
+            })?;
 
         Ok(())
     }
@@ -260,7 +281,11 @@ impl Processor for TestDeltasProcessor {
 
         for account_id in account_ids {
             if let Err(e) = self.process_account(&account_id).await {
-                eprintln!("Failed to process canonicalizations for account {account_id}: {e}");
+                tracing::error!(
+                    account_id = %account_id,
+                    error = %e,
+                    "Failed to process canonicalizations for account"
+                );
             }
         }
 
@@ -292,7 +317,12 @@ impl Processor for TestDeltasProcessor {
         for delta in candidates {
             let nonce = delta.nonce;
             if let Err(e) = self.process_candidate(delta).await {
-                eprintln!("Failed to canonicalize delta {nonce} for account {account_id}: {e}");
+                tracing::error!(
+                    account_id = %account_id,
+                    nonce = nonce,
+                    error = %e,
+                    "Failed to canonicalize delta"
+                );
             }
         }
 
@@ -318,9 +348,10 @@ impl TestDeltasProcessor {
     }
 
     async fn canonicalize_verified_delta(&self, delta: DeltaObject) -> Result<()> {
-        println!(
-            "✓ Canonicalizing delta {} for account {} (commitment matches on-chain)",
-            delta.nonce, delta.account_id
+        tracing::info!(
+            account_id = %delta.account_id,
+            nonce = delta.nonce,
+            "Canonicalizing delta (commitment matches on-chain)"
         );
 
         let account_metadata = self
@@ -373,12 +404,18 @@ impl TestDeltasProcessor {
         };
 
         if let Some(new_auth) = new_auth {
-            println!("  Syncing cosigner public keys from on-chain storage");
+            tracing::debug!(
+                account_id = %delta.account_id,
+                "Syncing cosigner public keys from on-chain storage"
+            );
 
             auth::update_credentials(&*self.state.metadata, &delta.account_id, new_auth, &now)
                 .await?;
 
-            println!("  ✓ Metadata cosigner public keys synced with storage");
+            tracing::debug!(
+                account_id = %delta.account_id,
+                "Metadata cosigner public keys synced with storage"
+            );
         }
 
         let mut canonical_delta = delta.clone();
@@ -387,15 +424,18 @@ impl TestDeltasProcessor {
         storage_backend
             .submit_delta(&canonical_delta)
             .await
-            .map_err(|e| PsmError::StorageError(format!("Failed to update delta as canonical: {e}")))?;
+            .map_err(|e| {
+                PsmError::StorageError(format!("Failed to update delta as canonical: {e}"))
+            })?;
 
         Ok(())
     }
 
     async fn discard_mismatched_delta(&self, delta: DeltaObject) -> Result<()> {
-        println!(
-            "✗ Discarding delta {} for account {} (commitment mismatch with on-chain state)",
-            delta.nonce, delta.account_id
+        tracing::warn!(
+            account_id = %delta.account_id,
+            nonce = delta.nonce,
+            "Discarding delta (commitment mismatch with on-chain state)"
         );
 
         let account_metadata = self
@@ -420,7 +460,9 @@ impl TestDeltasProcessor {
         storage_backend
             .submit_delta(&discarded_delta)
             .await
-            .map_err(|e| PsmError::StorageError(format!("Failed to update delta as discarded: {e}")))?;
+            .map_err(|e| {
+                PsmError::StorageError(format!("Failed to update delta as discarded: {e}"))
+            })?;
 
         Ok(())
     }

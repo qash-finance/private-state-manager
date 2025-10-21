@@ -6,6 +6,7 @@ pub mod builder;
 pub mod canonicalization;
 pub mod error;
 pub mod jobs;
+pub mod logging;
 pub mod network;
 pub mod services;
 pub mod state;

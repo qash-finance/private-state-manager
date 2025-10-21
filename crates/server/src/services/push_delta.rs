@@ -66,14 +66,28 @@ async fn check_no_pending_candidates(
         .await
         .map_err(|e| PsmError::StorageError(format!("Failed to check deltas: {e}")))?;
 
-    eprintln!("DEBUG: Checking {} existing deltas", all_deltas.len());
+    tracing::debug!(
+        account_id = %account_id,
+        delta_count = all_deltas.len(),
+        "Checking existing deltas"
+    );
+
     for delta in &all_deltas {
-        eprintln!("  Delta {}: status={:?}", delta.nonce, delta.status);
+        tracing::trace!(
+            account_id = %account_id,
+            nonce = delta.nonce,
+            status = ?delta.status,
+            "Delta status"
+        );
     }
 
     let has_pending_candidate = all_deltas.iter().any(|d| d.status.is_candidate());
 
-    eprintln!("DEBUG: has_pending_candidate = {has_pending_candidate}");
+    tracing::debug!(
+        account_id = %account_id,
+        has_pending_candidate = has_pending_candidate,
+        "Checked for pending candidates"
+    );
 
     if has_pending_candidate {
         return Err(PsmError::ConflictPendingDelta);

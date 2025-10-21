@@ -22,6 +22,8 @@ tokio = { version = "1.47.1", features = ["full"] }
 tonic = "0.13"
 tonic-reflection = "0.13"
 prost = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 miden-objects = { version = "0.11.4", features = ["testing"] }
 miden-rpc-client = { path = "../miden-rpc-client" }
 miden-lib = "0.11.4"

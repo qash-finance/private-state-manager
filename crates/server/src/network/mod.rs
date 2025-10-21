@@ -1,7 +1,7 @@
 pub mod miden;
 
 use async_trait::async_trait;
-
+use crate::storage::DeltaObject;
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
     /// Verify state matches on-chain
@@ -39,10 +39,7 @@ pub trait NetworkClient: Send + Sync {
     fn validate_account_id(&self, account_id: &str) -> Result<(), String>;
 
     /// Check if delta is canonical per on-chain state
-    async fn is_canonical(
-        &mut self,
-        delta: &crate::storage::DeltaObject,
-    ) -> Result<bool, String>;
+    async fn is_canonical(&mut self, delta: &DeltaObject) -> Result<bool, String>;
 
     /// Determine if account auth should be updated given the state
     async fn should_update_auth(

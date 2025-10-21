@@ -17,6 +17,7 @@ use crate::api::http::{
     configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
 };
 use crate::canonicalization::CanonicalizationMode;
+use crate::logging::LoggingConfig;
 use crate::network::{NetworkType, miden::MidenNetworkClient};
 use crate::state::AppState;
 use crate::storage::{MetadataStore, StorageRegistry};
@@ -27,6 +28,7 @@ pub struct ServerBuilder {
     storage: Option<StorageRegistry>,
     metadata: Option<Arc<dyn MetadataStore>>,
     canonicalization_mode: CanonicalizationMode,
+    logging_config: Option<LoggingConfig>,
     http_enabled: bool,
     http_port: u16,
     grpc_enabled: bool,
@@ -41,6 +43,7 @@ impl ServerBuilder {
             storage: None,
             metadata: None,
             canonicalization_mode: CanonicalizationMode::default(),
+            logging_config: None,
             http_enabled: true,
             http_port: 3000,
             grpc_enabled: true,
@@ -146,6 +149,37 @@ impl ServerBuilder {
         self
     }
 
+    /// Configure logging
+    ///
+    /// # Arguments
+    /// * `config` - The logging configuration to use
+    ///
+    /// # Example
+    /// ```no_run
+    /// use server::builder::ServerBuilder;
+    /// use server::logging::LoggingConfig;
+    /// use tracing::Level;
+    ///
+    /// // Default logging (info level with env filter)
+    /// let builder = ServerBuilder::new()
+    ///     .with_logging(LoggingConfig::default());
+    ///
+    /// // Custom log level
+    /// let builder = ServerBuilder::new()
+    ///     .with_logging(LoggingConfig::new(Level::DEBUG));
+    ///
+    /// // Disable env filter override
+    /// let builder = ServerBuilder::new()
+    ///     .with_logging(
+    ///         LoggingConfig::new(Level::INFO)
+    ///             .with_env_filter(false)
+    ///     );
+    /// ```
+    pub fn with_logging(mut self, config: LoggingConfig) -> Self {
+        self.logging_config = Some(config);
+        self
+    }
+
     /// Configure HTTP server
     ///
     /// # Arguments
@@ -247,6 +281,7 @@ impl ServerBuilder {
 
         Ok(ServerHandle {
             app_state,
+            logging_config: self.logging_config,
             http_enabled: self.http_enabled,
             http_port: self.http_port,
             grpc_enabled: self.grpc_enabled,
@@ -266,6 +301,7 @@ impl Default for ServerBuilder {
 /// Provides methods to run the server with the configured settings.
 pub struct ServerHandle {
     app_state: AppState,
+    logging_config: Option<LoggingConfig>,
     http_enabled: bool,
     http_port: u16,
     grpc_enabled: bool,
@@ -295,6 +331,10 @@ impl ServerHandle {
     /// # }
     /// ```
     pub async fn run(self) {
+        if let Some(config) = self.logging_config {
+            config.init();
+        }
+
         async fn root() -> &'static str {
             "Hello, World!"
         }
@@ -304,14 +344,15 @@ impl ServerHandle {
         // Start background jobs based on canonicalization mode
         match &self.app_state.canonicalization_mode {
             CanonicalizationMode::Enabled(config) => {
-                println!(
-                    "Starting canonicalization worker (delay: {}s, check interval: {}s)...",
-                    config.delay_seconds, config.check_interval_seconds
+                tracing::info!(
+                    delay_seconds = config.delay_seconds,
+                    check_interval_seconds = config.check_interval_seconds,
+                    "Starting canonicalization worker"
                 );
                 crate::services::start_canonicalization_worker(self.app_state.clone());
             }
             CanonicalizationMode::Optimistic => {
-                println!(
+                tracing::info!(
                     "Running in optimistic mode - deltas accepted without on-chain verification"
                 );
             }
@@ -338,9 +379,9 @@ impl ServerHandle {
                     .await
                     .expect("Failed to bind HTTP server");
 
-                println!(
-                    "HTTP server listening on {}",
-                    listener.local_addr().unwrap()
+                tracing::info!(
+                    address = %listener.local_addr().unwrap(),
+                    "HTTP server listening"
                 );
 
                 axum::serve(listener, app)
@@ -371,7 +412,7 @@ impl ServerHandle {
                     .build_v1()
                     .expect("Failed to build reflection service");
 
-                println!("gRPC server listening on {addr}");
+                tracing::info!(address = %addr, "gRPC server listening");
 
                 Server::builder()
                     .add_service(StateManagerServer::new(service))
@@ -385,7 +426,7 @@ impl ServerHandle {
         }
 
         if tasks.is_empty() {
-            eprintln!("Warning: No servers enabled!");
+            tracing::warn!("No servers enabled");
             return;
         }
 

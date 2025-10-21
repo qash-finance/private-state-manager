@@ -15,8 +15,8 @@ async fn run_worker(state: AppState) {
     let config = match &state.canonicalization_mode {
         CanonicalizationMode::Enabled(config) => config.clone(),
         CanonicalizationMode::Optimistic => {
-            eprintln!(
-                "Warning: Canonicalization worker started in Optimistic mode - this should not happen"
+            tracing::warn!(
+                "Canonicalization worker started in Optimistic mode - this should not happen"
             );
             return;
         }
@@ -29,7 +29,7 @@ async fn run_worker(state: AppState) {
         interval_timer.tick().await;
 
         if let Err(e) = processor.process_all_accounts().await {
-            eprintln!("Canonicalization worker error: {e}");
+            tracing::error!(error = %e, "Canonicalization worker error");
         }
     }
 }
