@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 mod configure_account;
 mod get_delta;
-mod get_delta_head;
 mod get_delta_since;
 mod get_state;
 mod push_delta;
@@ -16,7 +15,6 @@ pub use crate::jobs::canonicalization::{
 };
 pub use configure_account::{ConfigureAccountParams, ConfigureAccountResult, configure_account};
 pub use get_delta::{GetDeltaParams, GetDeltaResult, get_delta};
-pub use get_delta_head::{GetDeltaHeadParams, GetDeltaHeadResult, get_delta_head};
 pub use get_delta_since::{GetDeltaSinceParams, GetDeltaSinceResult, get_delta_since};
 pub use get_state::{GetStateParams, GetStateResult, get_state};
 pub use push_delta::{PushDeltaParams, PushDeltaResult, push_delta};

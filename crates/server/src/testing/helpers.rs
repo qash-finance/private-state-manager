@@ -187,7 +187,6 @@ pub fn create_router(state: AppState) -> axum::Router {
         .route("/configure", axum::routing::post(http::configure))
         .route("/push_delta", axum::routing::post(http::push_delta))
         .route("/get_delta", axum::routing::get(http::get_delta))
-        .route("/get_delta_head", axum::routing::get(http::get_delta_head))
         .route("/get_state", axum::routing::get(http::get_state))
         .with_state(state)
 }

@@ -1,7 +1,6 @@
 use crate::auth::{Auth, ExtractCredentials};
 use crate::services::{
-    self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetStateParams,
-    PushDeltaParams,
+    self, ConfigureAccountParams, GetDeltaParams, GetStateParams, PushDeltaParams,
 };
 use crate::state::AppState;
 use crate::storage::{DeltaObject, StorageType};
@@ -168,35 +167,6 @@ impl StateManager for StateManagerService {
                 success: false,
                 message: e.to_string(),
                 merged_delta: None,
-            })),
-        }
-    }
-
-    async fn get_delta_head(
-        &self,
-        request: Request<GetDeltaHeadRequest>,
-    ) -> Result<Response<GetDeltaHeadResponse>, Status> {
-        // Extract authentication data from metadata
-        let auth = request.metadata().extract_credentials()?;
-
-        let req = request.into_inner();
-
-        let params = GetDeltaHeadParams {
-            account_id: req.account_id,
-            credentials: auth,
-        };
-
-        // Call service layer
-        match services::get_delta_head(&self.app_state, params).await {
-            Ok(response) => Ok(Response::new(GetDeltaHeadResponse {
-                success: true,
-                message: "Latest delta retrieved successfully".to_string(),
-                latest_nonce: Some(response.delta.nonce),
-            })),
-            Err(e) => Ok(Response::new(GetDeltaHeadResponse {
-                success: false,
-                message: e.to_string(),
-                latest_nonce: None,
             })),
         }
     }

@@ -13,9 +13,7 @@ use tonic::transport::Server;
 
 use crate::api::grpc::StateManagerService;
 use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
-use crate::api::http::{
-    configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
-};
+use crate::api::http::{configure, get_delta, get_delta_since, get_state, push_delta};
 use crate::canonicalization::CanonicalizationConfig;
 use crate::ack::Acknowledger;
 use crate::clock::SystemClock;
@@ -135,14 +133,14 @@ impl ServerBuilder {
     /// use server::builder::ServerBuilder;
     /// use server::ack::Acknowledger;
     /// use std::path::PathBuf;
+    /// use server::ack::MidenFalconRpoSigner;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let ack = Acknowledger::filesystem_miden_falcon_rpo(
-    ///     PathBuf::from("/var/psm/keystore")
-    /// )?;
+    /// # let signer = MidenFalconRpoSigner::new(PathBuf::from("/var/psm/keystore"))?;
+    /// # let ack = Acknowledger::FilesystemMidenFalconRpo(signer);
     ///
-    /// let builder = ServerBuilder::new()
-    ///     .ack(ack);
+    /// # let builder = ServerBuilder::new()
+    /// #     .ack(ack);
     /// # Ok(())
     /// # }
     /// ```
@@ -154,14 +152,14 @@ impl ServerBuilder {
     /// Configure canonicalization mode
     ///
     /// # Arguments
-    /// * `mode` - The canonicalization mode to use
+    /// * `config` - The canonicalization config to use (None for optimistic mode)
     ///
     /// # Example
     /// ```no_run
     /// use server::builder::ServerBuilder;
-    /// use server::canonicalization::{CanonicalizationMode, CanonicalizationConfig};
+    /// use server::canonicalization::CanonicalizationConfig;
     ///
-    /// // Enabled mode with custom timing
+    /// // Candidate mode with custom timing
     /// let config = CanonicalizationConfig::new(
     ///     10 * 60,  // 10 minute delay
     ///     30,       // 30 second check interval
@@ -403,7 +401,6 @@ impl ServerHandle {
                     .route("/delta", post(push_delta))
                     .route("/delta", get(get_delta))
                     .route("/delta/since", get(get_delta_since))
-                    .route("/head", get(get_delta_head))
                     .route("/configure", post(configure))
                     .route("/state", get(get_state))
                     .with_state(state);

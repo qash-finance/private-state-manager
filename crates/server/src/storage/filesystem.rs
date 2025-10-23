@@ -181,26 +181,6 @@ impl StorageBackend for FilesystemService {
 
         Ok(deltas)
     }
-
-    async fn get_delta_head(&self, account_id: &str) -> Result<Option<u64>, String> {
-        let deltas = self.list_deltas(account_id).await?;
-
-        if deltas.is_empty() {
-            return Ok(None);
-        }
-
-        // Parse nonces from filenames and find the maximum
-        let mut max_nonce: Option<u64> = None;
-        for filename in &deltas {
-            if let Some(nonce_str) = filename.strip_suffix(".json") {
-                if let Ok(nonce) = nonce_str.parse::<u64>() {
-                    max_nonce = Some(max_nonce.map_or(nonce, |current| current.max(nonce)));
-                }
-            }
-        }
-
-        Ok(max_nonce)
-    }
 }
 
 impl FilesystemMetadataStore {

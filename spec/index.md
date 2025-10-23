@@ -42,6 +42,7 @@ Example:
 {
     "account_id": "1234567890",
     "prev_commitment": "0x1234567890",
+    "nonce": 10,
     "ops": [
       { 
         "type": "transfer",
@@ -60,6 +61,10 @@ Is the unique identifier of an account holding a state, the private state manage
 
 Is the commitment of the state, it's a hash, nonce, or any other identifier that serves as the unique identifier of the current state of the account. It's used to cerifify that the state is not forked or corrupted. Each new delta includes a prev_commitment field that references the commitment of the base state in which the delta is applied.
 
+### Nonce
+
+In most networks, the nonce is an incremental counter that serves as a protection mechanism against replay attacks, in this system, we also use the nonce to identify and index deltas.
+
 ## Basic principles
 
 - Both State and Deltas are represented as generic JSON objects and completely agnostic of the underlying data model.
@@ -75,11 +80,34 @@ Is the commitment of the state, it's a hash, nonce, or any other identifier that
 
 ## Components
 
+### API
+
+The API exposes a simple interface for operating states and deltas with HTTP and gRPC protocols supported. The behaviour of the system will be the same regardless of the protocol used, this ensures consistency across different clients.
+
+```rust
+trait API {
+  // Configure a new account passing an initial state and authentication credentials.
+  fn configure(&self, params: ConfigureAccountParams) -> Result<ConfigureAccountResult>;
+
+  // Push a new delta to the account, the server responds with the acknowledgement.
+  fn push_delta(&self, params: PushDeltaParams) -> Result<PushDeltaResult>;
+
+  // Get a specific delta by nonce.
+  fn get_delta(&self, params: GetDeltaParams) -> Result<GetDeltaResult>;
+
+  // Get  merged delta since a given nonce
+  fn get_delta_since(&self, params: GetDeltaSinceParams) -> Result<GetDeltaSinceResult>;
+
+  // Get the current state of the account
+  fn get_state(&self, params: GetStateParams) -> Result<GetStateResult>;
+}
+```
+
 ### Ack
 
-Ack acts as the component that generates proofs of stored deltas, ideally clients integrating Private State Manager will require this ack proof in order to perform some network operation, like submitting a transaction.
+Ack acts as the component that generates proofs of stored deltas, as a security measure, clients integrating Private State Manager will require this ack proof in order to perform some network operation, like submitting a transaction.
 
-Ack can be implemented in different ways, but the most practical implementation is to use asymetric cryptography, like Falcon or ECDSA, in the future we might include support to other primitives, like ZK proofs.
+Ack can be implemented in different ways, but the most practical implementation is to use asymetric cryptography, in the future we might include support to other primitives, like ZK proofs.
 
 ```rust
 pub trait Ack {

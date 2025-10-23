@@ -166,7 +166,6 @@ pub struct MockStorageBackend {
     pub pull_deltas_after_responses:
         Arc<StdMutex<Vec<StdResult<Vec<crate::storage::DeltaObject>, String>>>>,
     pub list_deltas_responses: Arc<StdMutex<Vec<StdResult<Vec<String>, String>>>>,
-    pub get_delta_head_responses: Arc<StdMutex<Vec<StdResult<Option<u64>, String>>>>,
 }
 
 impl MockStorageBackend {
@@ -207,11 +206,6 @@ impl MockStorageBackend {
 
     pub fn with_list_deltas(self, response: StdResult<Vec<String>, String>) -> Self {
         self.list_deltas_responses.lock().unwrap().push(response);
-        self
-    }
-
-    pub fn with_get_delta_head(self, response: StdResult<Option<u64>, String>) -> Self {
-        self.get_delta_head_responses.lock().unwrap().push(response);
         self
     }
 
@@ -282,14 +276,6 @@ impl StorageBackend for MockStorageBackend {
             .unwrap()
             .pop()
             .unwrap_or_else(|| Ok(vec![]))
-    }
-
-    async fn get_delta_head(&self, _account_id: &str) -> StdResult<Option<u64>, String> {
-        self.get_delta_head_responses
-            .lock()
-            .unwrap()
-            .pop()
-            .unwrap_or(Ok(None))
     }
 }
 

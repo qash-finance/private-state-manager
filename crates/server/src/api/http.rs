@@ -1,7 +1,7 @@
 use crate::auth::{Auth, AuthHeader};
 use crate::services::{
-    self, ConfigureAccountParams, GetDeltaHeadParams, GetDeltaParams, GetDeltaSinceParams,
-    GetStateParams, PushDeltaParams,
+    self, ConfigureAccountParams, GetDeltaParams, GetDeltaSinceParams, GetStateParams,
+    PushDeltaParams,
 };
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, StorageType};
@@ -49,15 +49,6 @@ pub struct ConfigureResponse {
 pub struct ErrorResponse {
     pub success: bool,
     pub error: String,
-}
-
-#[derive(Serialize)]
-pub struct DeltaHeadResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_nonce: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 pub async fn configure(
@@ -147,36 +138,6 @@ pub async fn get_delta_since(
             Json(DeltaObject {
                 account_id: e.to_string(),
                 ..Default::default()
-            }),
-        ),
-    }
-}
-
-pub async fn get_delta_head(
-    State(state): State<AppState>,
-    AuthHeader(credentials): AuthHeader,
-    Query(query): Query<StateQuery>,
-) -> (StatusCode, Json<DeltaHeadResponse>) {
-    let params = GetDeltaHeadParams {
-        account_id: query.account_id,
-        credentials,
-    };
-
-    match services::get_delta_head(&state, params).await {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(DeltaHeadResponse {
-                success: true,
-                latest_nonce: Some(response.delta.nonce),
-                message: Some("Latest delta retrieved successfully".to_string()),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(DeltaHeadResponse {
-                success: false,
-                latest_nonce: None,
-                message: Some(e.to_string()),
             }),
         ),
     }
