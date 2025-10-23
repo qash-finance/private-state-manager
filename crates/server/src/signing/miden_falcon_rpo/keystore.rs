@@ -4,9 +4,9 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use miden_objects::Word;
 use miden_objects::crypto::dsa::rpo_falcon512::{SecretKey, Signature};
 use miden_objects::utils::{Deserializable, Serializable};
-use miden_objects::Word;
 use rand::{Rng, SeedableRng};
 
 use crate::error::MidenFalconRpoError;
@@ -22,9 +22,7 @@ pub struct FilesystemKeyStore<R: Rng + Send + Sync> {
 impl<R: Rng + Send + Sync> FilesystemKeyStore<R> {
     pub fn with_rng(keys_directory: PathBuf, rng: R) -> Result<Self> {
         fs::create_dir_all(&keys_directory).map_err(|e| {
-            MidenFalconRpoError::StorageError(format!(
-                "Failed to create keys directory: {e}"
-            ))
+            MidenFalconRpoError::StorageError(format!("Failed to create keys directory: {e}"))
         })?;
 
         Ok(Self {
@@ -61,9 +59,7 @@ impl<R: Rng + Send + Sync> FilesystemKeyStore<R> {
         })?;
 
         writer.flush().map_err(|e| {
-            MidenFalconRpoError::StorageError(format!(
-                "Failed to flush key file {filename}: {e}"
-            ))
+            MidenFalconRpoError::StorageError(format!("Failed to flush key file {filename}: {e}"))
         })?;
 
         Ok(())

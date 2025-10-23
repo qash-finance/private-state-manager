@@ -300,9 +300,9 @@ impl ServerBuilder {
             .await
             .map_err(|e| format!("Failed to create network client: {e}"))?;
 
-        let signing = Signer::miden_falcon_rpo(
-            crate::signing::KeystoreConfig::Filesystem(keystore_path)
-        ).map_err(|e| format!("Failed to initialize server signing: {e}"))?;
+        let signing =
+            Signer::miden_falcon_rpo(crate::signing::KeystoreConfig::Filesystem(keystore_path))
+                .map_err(|e| format!("Failed to initialize server signing: {e}"))?;
 
         tracing::info!(
             server_pubkey = ?signing.server_pubkey(),

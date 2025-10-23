@@ -34,19 +34,37 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
     let new_commitment =
         calculate_new_commitment(state, &current_state, &params.delta.delta_payload).await?;
 
+    let commitment_digest = commitment_to_digest(&new_commitment)?;
+    let signature = state
+        .signing
+        .sign_with_server_key(commitment_digest)
+        .map_err(|e| PsmError::SigningError(format!("Failed to sign commitment: {e}")))?;
+
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    let mut result_delta = params.delta.clone();
+    result_delta.new_commitment = new_commitment.clone();
+    result_delta.ack_sig = Some(sig_hex.clone());
+
     let now = state.clock.now_rfc3339();
 
     match &state.canonicalization_mode {
         CanonicalizationMode::Enabled(_) => {
-            save_as_candidate(&resolved.backend, &params.delta, &new_commitment, &now).await?;
+            save_as_candidate(&resolved.backend, &result_delta, &now).await?;
         }
         CanonicalizationMode::Optimistic => {
+            let (new_state_json, _) = {
+                let client = state.network_client.lock().await;
+                client
+                    .apply_delta(&current_state.state_json, &result_delta.delta_payload)
+                    .map_err(PsmError::InvalidDelta)?
+            };
+
             save_as_canonical(
-                state,
                 &resolved.backend,
-                &params.delta,
+                &result_delta,
                 &current_state,
-                &new_commitment,
+                &new_state_json,
                 &now,
             )
             .await?;
@@ -54,7 +72,7 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
     }
 
     Ok(PushDeltaResult {
-        delta: params.delta,
+        delta: result_delta,
     })
 }
 
@@ -117,11 +135,9 @@ async fn calculate_new_commitment(
 async fn save_as_candidate(
     storage_backend: &Arc<dyn StorageBackend>,
     delta: &DeltaObject,
-    new_commitment: &str,
     timestamp: &str,
 ) -> Result<()> {
     let mut candidate_delta = delta.clone();
-    candidate_delta.new_commitment = new_commitment.to_string();
     candidate_delta.status = DeltaStatus::candidate(timestamp.to_string());
 
     storage_backend
@@ -131,36 +147,19 @@ async fn save_as_candidate(
 }
 
 async fn save_as_canonical(
-    state: &AppState,
     storage_backend: &Arc<dyn StorageBackend>,
     delta: &DeltaObject,
     current_state: &AccountState,
-    new_commitment: &str,
+    new_state_json: &serde_json::Value,
     timestamp: &str,
 ) -> Result<()> {
     let mut canonical_delta = delta.clone();
-    canonical_delta.new_commitment = new_commitment.to_string();
     canonical_delta.status = DeltaStatus::canonical(timestamp.to_string());
-
-    let commitment_digest = commitment_to_digest(new_commitment)?;
-    let signature = state
-        .signing
-        .sign_with_server_key(commitment_digest)
-        .map_err(|e| PsmError::SigningError(format!("Failed to sign commitment: {e}")))?;
-
-    canonical_delta.ack_sig = Some(hex::encode(signature.to_bytes()));
-
-    let (new_state_json, _) = {
-        let client = state.network_client.lock().await;
-        client
-            .apply_delta(&current_state.state_json, &canonical_delta.delta_payload)
-            .map_err(PsmError::InvalidDelta)?
-    };
 
     let new_state = AccountState {
         account_id: canonical_delta.account_id.clone(),
-        commitment: new_commitment.to_string(),
-        state_json: new_state_json,
+        commitment: canonical_delta.new_commitment.clone(),
+        state_json: new_state_json.clone(),
         created_at: current_state.created_at.clone(),
         updated_at: timestamp.to_string(),
     };

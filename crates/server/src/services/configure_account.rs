@@ -98,11 +98,13 @@ mod tests {
             Arc::new(storage_backend) as Arc<dyn StorageBackend>,
         );
 
-        let keystore_dir = std::env::temp_dir().join(format!("test_keystore_{}", uuid::Uuid::new_v4()));
+        let keystore_dir =
+            std::env::temp_dir().join(format!("test_keystore_{}", uuid::Uuid::new_v4()));
 
         let signing = crate::signing::Signer::miden_falcon_rpo(
-            crate::signing::KeystoreConfig::Filesystem(keystore_dir)
-        ).expect("Failed to create signing");
+            crate::signing::KeystoreConfig::Filesystem(keystore_dir),
+        )
+        .expect("Failed to create signing");
 
         AppState {
             storage: StorageRegistry::new(backends),

@@ -139,8 +139,9 @@ pub async fn create_test_app_state() -> AppState {
     let mock_client = IntegrationMockNetworkClient::new(miden_client);
 
     let signing = crate::signing::Signer::miden_falcon_rpo(
-        crate::signing::KeystoreConfig::Filesystem(keystore_dir)
-    ).expect("Failed to create signing");
+        crate::signing::KeystoreConfig::Filesystem(keystore_dir),
+    )
+    .expect("Failed to create signing");
 
     AppState {
         storage: storage_registry,

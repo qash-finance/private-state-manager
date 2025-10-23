@@ -1,8 +1,8 @@
 pub mod miden_falcon_rpo;
 
 use crate::error::PsmError;
-use miden_objects::crypto::dsa::rpo_falcon512::{SecretKey, Signature};
 use miden_objects::Word;
+use miden_objects::crypto::dsa::rpo_falcon512::{PublicKey, SecretKey, Signature};
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, PsmError>;
@@ -22,9 +22,9 @@ impl Signer {
     /// Create a new Miden Falcon RPO signer with filesystem keystore
     pub fn miden_falcon_rpo(keystore: KeystoreConfig) -> Result<Self> {
         match keystore {
-            KeystoreConfig::Filesystem(path) => {
-                Ok(Signer::MidenFalconRpo(miden_falcon_rpo::MidenFalconRpoSigner::new(path)?))
-            }
+            KeystoreConfig::Filesystem(path) => Ok(Signer::MidenFalconRpo(
+                miden_falcon_rpo::MidenFalconRpoSigner::new(path)?,
+            )),
         }
     }
 
@@ -36,7 +36,7 @@ impl Signer {
     }
 
     /// Get the server's public key
-    pub fn server_pubkey(&self) -> Word {
+    pub fn server_pubkey(&self) -> PublicKey {
         match self {
             Signer::MidenFalconRpo(signer) => signer.server_pubkey(),
         }

@@ -1,18 +1,12 @@
 // Integration tests
 #[cfg(test)]
-mod e2e_http_auth;
+mod auth_http;
 
 #[cfg(test)]
-mod e2e_grpc_auth;
-
-#[cfg(test)]
-mod canonicalization_lifecycle;
+mod auth_grpc;
 
 #[cfg(test)]
 mod miden_rpc_integration;
-
-#[cfg(test)]
-mod generate_fixtures;
 
 #[cfg(test)]
 mod keystore;

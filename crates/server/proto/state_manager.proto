@@ -60,6 +60,7 @@ message PushDeltaResponse {
   bool success = 1;
   string message = 2;
   DeltaObject delta = 3;
+  optional string ack_sig = 4;
 }
 
 // Get delta request

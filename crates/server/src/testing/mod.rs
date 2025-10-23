@@ -1,5 +1,6 @@
-// All testing modules - only compiled when running tests
+pub mod e2e;
 pub mod fixtures;
+pub mod generate_fixtures;
 pub mod helpers;
 pub mod integration;
 pub mod mocks;

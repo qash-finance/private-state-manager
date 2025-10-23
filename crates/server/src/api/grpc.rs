@@ -101,11 +101,13 @@ impl StateManager for StateManagerService {
                 success: true,
                 message: "Delta pushed successfully".to_string(),
                 delta: Some(delta_to_proto(&response.delta)),
+                ack_sig: response.delta.ack_sig,
             })),
             Err(e) => Ok(Response::new(PushDeltaResponse {
                 success: false,
                 message: e.to_string(),
                 delta: None,
+                ack_sig: None,
             })),
         }
     }
