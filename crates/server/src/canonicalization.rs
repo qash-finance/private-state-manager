@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 /// Configuration for delta canonicalization behavior
+/// When Some: deltas are saved as candidates and later verified/canonicalized
+/// When None: deltas are immediately saved as canonical (optimistic mode)
 #[derive(Clone, Debug)]
 pub struct CanonicalizationConfig {
     /// Time to wait before checking on-chain commitment (in seconds)
@@ -36,22 +38,5 @@ impl CanonicalizationConfig {
     /// Get check interval as Duration
     pub fn check_interval(&self) -> Duration {
         Duration::from_secs(self.check_interval_seconds)
-    }
-}
-
-/// Mode for handling delta submissions
-#[derive(Clone, Debug)]
-pub enum CanonicalizationMode {
-    /// Run canonicalization worker with on-chain verification
-    Enabled(CanonicalizationConfig),
-
-    /// Optimistically accept deltas as valid without on-chain verification
-    /// State updates happen immediately on push
-    Optimistic,
-}
-
-impl Default for CanonicalizationMode {
-    fn default() -> Self {
-        Self::Enabled(CanonicalizationConfig::default())
     }
 }

@@ -16,7 +16,7 @@ use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
 use crate::api::http::{
     configure, get_delta, get_delta_head, get_delta_since, get_state, push_delta,
 };
-use crate::canonicalization::CanonicalizationMode;
+use crate::canonicalization::CanonicalizationConfig;
 use crate::clock::SystemClock;
 use crate::logging::LoggingConfig;
 use crate::network::{NetworkType, miden::MidenNetworkClient};
@@ -30,7 +30,7 @@ pub struct ServerBuilder {
     storage: Option<StorageRegistry>,
     metadata: Option<Arc<dyn MetadataStore>>,
     keystore_path: Option<std::path::PathBuf>,
-    canonicalization_mode: CanonicalizationMode,
+    canonicalization: Option<CanonicalizationConfig>,
     logging_config: Option<LoggingConfig>,
     http_enabled: bool,
     http_port: u16,
@@ -46,7 +46,7 @@ impl ServerBuilder {
             storage: None,
             metadata: None,
             keystore_path: None,
-            canonicalization_mode: CanonicalizationMode::default(),
+            canonicalization: Some(CanonicalizationConfig::default()),
             logging_config: None,
             http_enabled: true,
             http_port: 3000,
@@ -159,14 +159,14 @@ impl ServerBuilder {
     ///     30,       // 30 second check interval
     /// );
     /// let builder = ServerBuilder::new()
-    ///     .with_canonicalization(CanonicalizationMode::Enabled(config));
+    ///     .with_canonicalization(Some(config));
     ///
     /// // Optimistic mode - no verification
     /// let builder = ServerBuilder::new()
-    ///     .with_canonicalization(CanonicalizationMode::Optimistic);
+    ///     .with_canonicalization(None);
     /// ```
-    pub fn with_canonicalization(mut self, mode: CanonicalizationMode) -> Self {
-        self.canonicalization_mode = mode;
+    pub fn with_canonicalization(mut self, config: Option<CanonicalizationConfig>) -> Self {
+        self.canonicalization = config;
         self
     }
 
@@ -314,7 +314,7 @@ impl ServerBuilder {
             metadata,
             network_client: Arc::new(Mutex::new(network_client)),
             signing,
-            canonicalization_mode: self.canonicalization_mode,
+            canonicalization: self.canonicalization,
             clock: Arc::new(SystemClock),
         };
 
@@ -374,21 +374,18 @@ impl ServerHandle {
 
         let mut tasks = Vec::new();
 
-        // Start background jobs based on canonicalization mode
-        match &self.app_state.canonicalization_mode {
-            CanonicalizationMode::Enabled(config) => {
-                tracing::info!(
-                    delay_seconds = config.delay_seconds,
-                    check_interval_seconds = config.check_interval_seconds,
-                    "Starting canonicalization worker"
-                );
-                crate::services::start_canonicalization_worker(self.app_state.clone());
-            }
-            CanonicalizationMode::Optimistic => {
-                tracing::info!(
-                    "Running in optimistic mode - deltas accepted without on-chain verification"
-                );
-            }
+        // Start background jobs based on canonicalization config
+        if let Some(config) = &self.app_state.canonicalization {
+            tracing::info!(
+                delay_seconds = config.delay_seconds,
+                check_interval_seconds = config.check_interval_seconds,
+                "Starting canonicalization worker"
+            );
+            crate::services::start_canonicalization_worker(self.app_state.clone());
+        } else {
+            tracing::info!(
+                "Running in optimistic mode - deltas accepted without on-chain verification"
+            );
         }
 
         // Start HTTP server if enabled

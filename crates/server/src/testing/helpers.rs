@@ -148,7 +148,7 @@ pub async fn create_test_app_state() -> AppState {
         metadata: Arc::new(metadata),
         network_client: Arc::new(tokio::sync::Mutex::new(mock_client)),
         signing,
-        canonicalization_mode: crate::canonicalization::CanonicalizationMode::default(),
+        canonicalization: Some(crate::canonicalization::CanonicalizationConfig::default()),
         clock: Arc::new(crate::clock::SystemClock),
     }
 }

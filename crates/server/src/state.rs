@@ -1,4 +1,4 @@
-use crate::canonicalization::CanonicalizationMode;
+use crate::canonicalization::CanonicalizationConfig;
 use crate::clock::Clock;
 use crate::network::NetworkClient;
 use crate::signing::Signer;
@@ -12,6 +12,6 @@ pub struct AppState {
     pub metadata: Arc<dyn MetadataStore>,
     pub network_client: Arc<Mutex<dyn NetworkClient>>,
     pub signing: Signer,
-    pub canonicalization_mode: CanonicalizationMode,
+    pub canonicalization: Option<CanonicalizationConfig>,
     pub clock: Arc<dyn Clock>,
 }

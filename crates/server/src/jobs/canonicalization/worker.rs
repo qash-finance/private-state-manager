@@ -1,4 +1,3 @@
-use crate::canonicalization::CanonicalizationMode;
 use crate::error::Result;
 use crate::state::AppState;
 use tokio::time::interval;
@@ -12,11 +11,11 @@ pub fn start_worker(state: AppState) {
 }
 
 async fn run_worker(state: AppState) {
-    let config = match &state.canonicalization_mode {
-        CanonicalizationMode::Enabled(config) => config.clone(),
-        CanonicalizationMode::Optimistic => {
+    let config = match &state.canonicalization {
+        Some(config) => config.clone(),
+        None => {
             tracing::warn!(
-                "Canonicalization worker started in Optimistic mode - this should not happen"
+                "Canonicalization worker started in optimistic mode - this should not happen"
             );
             return;
         }

@@ -80,7 +80,6 @@ pub async fn configure_account(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonicalization::CanonicalizationMode;
     use crate::storage::{StorageBackend, StorageRegistry};
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
     use std::collections::HashMap;
@@ -111,7 +110,7 @@ mod tests {
             metadata: Arc::new(metadata_store),
             network_client: Arc::new(Mutex::new(network_client)),
             signing,
-            canonicalization_mode: CanonicalizationMode::Optimistic,
+            canonicalization: None, // Optimistic mode for tests
             clock: Arc::new(crate::clock::test::MockClock::default()),
         }
     }

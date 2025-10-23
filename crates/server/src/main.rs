@@ -1,7 +1,7 @@
 pub use private_state_manager_shared::{FromJson, ToJson};
 
 use server::builder::ServerBuilder;
-use server::canonicalization::{CanonicalizationConfig, CanonicalizationMode};
+use server::canonicalization::CanonicalizationConfig;
 use server::logging::LoggingConfig;
 use server::network::NetworkType;
 use server::storage::StorageRegistry;
@@ -33,13 +33,13 @@ async fn main() {
         .await
         .expect("Failed to initialize metadata store");
 
-    // Set rules for canonicalization worker (delay for canonical and check interval)
-    let canonicalization_mode = CanonicalizationMode::Enabled(CanonicalizationConfig::default());
+    // Set rules for canonicalization
+    let canonicalization = Some(CanonicalizationConfig::default());
 
     ServerBuilder::new()
         .with_logging(LoggingConfig::default())
         .network(NetworkType::MidenTestnet)
-        .with_canonicalization(canonicalization_mode)
+        .with_canonicalization(canonicalization)
         .storage(storage_registry)
         .metadata(Arc::new(metadata))
         .keystore(keystore_path)
