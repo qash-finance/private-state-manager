@@ -78,210 +78,40 @@ In most networks, the nonce is an incremental counter that serves as a protectio
  - The requests authentication (public/private keys, JWT etc.)
  - The acknowledgement (ack) signature scheme (falcon, ed25519, etc.)
 
+## Goals and non-goals
+
+- Goals
+  - Provide private, append-only, canonical state sync across devices.
+  - Support pluggable networks, storage backends, auth, and ack schemes.
+  - Offer consistent behavior across HTTP and gRPC APIs.
+  - Ensure robust integrity guarantees (no-fork, authenticated deltas).
+- Non-goals
+  - Arbitrary conflict resolution outside network rules.
+  - General-purpose database semantics (transactions, secondary indexes).
+  - Exposing private state to untrusted parties.
+
+## Trust model
+
+- The client trusts: its own keys, the selected network’s validation rules, and the ack signer public key.
+- The client does not need to trust: the server operator (when running in enclave + encrypted storage), or other account users beyond configured cosigners.
+- Threats: malicious operator, network partitions, replay, tampering-at-rest, downgrade of canonicalization policy.
+
+## Normative invariants (MUST/SHOULD)
+
+- State and Delta payloads MUST be deterministic JSON; fields MUST produce stable commitments.
+- Deltas MUST be append-only and reference `prev_commitment` that matches the persisted state at acceptance time.
+- In canonicalization-enabled mode, deltas MUST be stored as `candidate` first and only become `canonical` after on-chain verification.
+- `get_delta_since` MUST exclude `discarded` and SHOULD exclude `candidate` deltas (default behavior).
+- Storage updates for making a delta canonical SHOULD atomically persist the updated state and the updated delta status.
+- Ack signatures MUST be computed over a canonical serialization of the delta content with domain separation.
+
+## Related documents
+
+- API (HTTP/gRPC): [api.md](./api.md)
+- Processes and canonicalization: [processes.md](./processes.md)
+
 ## Components
 
-### API
+See [components.md](./components.md) for API, Metadata, Auth, Acknowledger, Network, and Storage component details.
 
-The API exposes a simple interface for operating states and deltas with HTTP and gRPC protocols supported. The behaviour of the system will be the same regardless of the protocol used, this ensures consistency across different clients.
-
-```rust
-trait API {
-  // Configure a new account passing an initial state and authentication credentials.
-  fn configure(&self, params: ConfigureAccountParams) -> Result<ConfigureAccountResult>;
-
-  // Push a new delta to the account, the server responds with the acknowledgement.
-  fn push_delta(&self, params: PushDeltaParams) -> Result<PushDeltaResult>;
-
-  // Get a specific delta by nonce.
-  fn get_delta(&self, params: GetDeltaParams) -> Result<GetDeltaResult>;
-
-  // Get  merged delta since a given nonce
-  fn get_delta_since(&self, params: GetDeltaSinceParams) -> Result<GetDeltaSinceResult>;
-
-  // Get the current state of the account
-  fn get_state(&self, params: GetStateParams) -> Result<GetStateResult>;
-}
-```
-
-### Metadata
-
-Metadata is a component that stores the configuration and metadata of the accounts hosted by the private state manager. It's also responsible for validating the authentication credentials.
-
-Account metadata is stored in a key-value store, the key is the account ID and the value is the AccountMetadata object.
-
-```rust
-trait AccountMetadataStore {
-  // Get the metadata of an account
-  fn get(&self, account_id: &str) -> Result<AccountMetadata>;
-
-  // Store the metadata of an account
-  fn set(&self, account_id: &str, metadata: AccountMetadata) -> Result<()>;
-
-  // List all account IDs
-  fn list(&self) -> Result<Vec<String>>;
-
-  // Update the authentication configuration of an account
-  fn update_auth(&self, account_id: &str, auth: Auth) -> Result<()>;
-}
-
-pub struct AccountMetadata {
-    // The account ID
-    pub account_id: String,
-
-    // The authentication configuration
-    pub auth: Auth,
-
-    // The storage type
-    pub storage_type: StorageType,
-
-    pub created_at: String,
-    pub updated_at: String,
-}
-```
-
-### Auth
-
-Auth is the authentication configuration of an account, it's used to verify the authenticity of the requests made to the server, supporting extensions to multiple types of Credentials, like public/private keys, JWT, etc. At the moment, the only supported authentication scheme is the Miden Falcon RPO signature scheme.
-
-`cosigner_pubkeys` is a list of public keys that are authorized to sign requests on behalf of the account, and it should match the cosigners of the account in Miden network.
-
-```rust
-pub enum Auth {
-    // Miden Falcon RPO signature scheme
-    MidenFalconRpo { cosigner_pubkeys: Vec<String> },
-}
-```
-
-### Acknowledger
-
-Acknowledger acts as the component that generates proofs of stored deltas, as a security measure, clients integrating Private State Manager will require this ack proof in order to perform some network operation, like submitting a transaction.
-
-Acknowledger can be extended to support multiple schemes, but the most practical implementation is to use asymetric cryptography, in the future we might include support to other primitives, like ZK proofs.
-
-```rust
-pub enum Acknowledger {
-    FilesystemMidenFalconRpo(MidenFalconRpoSigner),
-}
-
-pub trait Acknowledger {
-    // Initial implementations will use asymetric
-    // cryptography, extensible to multiple schemes.
-    pub fn pubkey(&self) -> String;
-
-    // Receives a delta with no acknowledgement and
-    // returns it with an acknowledgement in it.
-    pub fn ack_delta(&self, delta: &DeltaObject) -> Result<DeltaObject>;
-}
-```
-
-### Network 
-
-Network is the component that handles the communication with the blockchain or system that holds the canonical state, it's responsible for verifying the state and deltas validity, and for implementing the custom logic for applying the deltas to the state.
-
-Each networks might have different ways to apply deltas to state or to verify validity, so we abstract the implementation details and provide a common interface for all networks.
-
-```rust
-trait NetworkClient {
-
-  /// Verify state matches on-chain and return commitment
-  async fn verify_state(
-    &mut self,
-    account_id: &str,
-    state_json: &serde_json::Value,
-  ) -> Result<String, String>;
-
-  /// Verify delta is valid for given state
-  fn verify_delta(
-    &self,
-    prev_proof: &str,
-    prev_state_json: &serde_json::Value,
-    delta_payload: &serde_json::Value,
-  ) -> Result<(), String>;
-
-  /// Apply delta to state
-  fn apply_delta(
-    &self,
-    prev_state_json: &serde_json::Value,
-    delta_payload: &serde_json::Value,
-  ) -> Result<(serde_json::Value, String), String>;
-
-  /// Merge multiple deltas
-  fn merge_deltas(
-    &self,
-    delta_payloads: Vec<serde_json::Value>,
-  ) -> Result<serde_json::Value, String>;
-
-  /// Validate account ID format
-  fn validate_account_id(&self, account_id: &str) -> Result<(), String>;
-
-  /// Determine if account auth should be updated given the state
-  async fn should_update_auth(
-    &mut self,
-    state_json: &serde_json::Value,
-  ) -> Result<Option<Auth>, String>;
-}
-```
-
-### Storage
-
-Storage is the component responsible for persisting account state and deltas, ensuring append-only semantics for deltas and tracking their lifecycle status (candidate, canonical, discarded). It is designed to be pluggable across multiple backends (e.g., filesystem, cloud object stores, databases) and selectable per account via `StorageType` in metadata.
-
-```rust
-trait StorageBackend {
-  // Persist the full account state and its commitment
-  async fn submit_state(&self, state: &AccountState) -> Result<(), String>;
-
-  // Persist a delta object (append-only)
-  async fn submit_delta(&self, delta: &DeltaObject) -> Result<(), String>;
-
-  // Retrieve the latest account state by account ID
-  async fn pull_state(&self, account_id: &str) -> Result<AccountState, String>;
-
-  // Retrieve a specific delta by nonce
-  async fn pull_delta(&self, account_id: &str, nonce: u64) -> Result<DeltaObject, String>;
-
-  // Retrieve all deltas after a given nonce (exclusive)
-  async fn pull_deltas_after(
-    &self,
-    account_id: &str,
-    from_nonce: u64,
-  ) -> Result<Vec<DeltaObject>, String>;
-}
-```
-
-## Processes
-
-### Services overview
-
-- **configure_account**: creates a new account by validating the provided initial state against the network, persisting it, and storing account metadata (auth, storage type, timestamps).
-- **push_delta**: verifies the delta against the current state, computes the new commitment, attaches an acknowledgement, and either enqueues it as a candidate (canonicalization enabled) or immediately applies it and marks it canonical (optimistic mode).
-- **get_state**: authenticates and returns the latest persisted account state.
-- **get_delta**: authenticates and returns a specific delta by nonce.
-- **get_delta_since**: authenticates, fetches deltas after a given nonce (excluding discarded), merges their payloads via the network client, and returns a single merged delta snapshot.
-
-### Canonicalization
-
-Canonicalization promotes candidate deltas to canonical only after the resulting state is verified on-chain. It runs as a background worker when canonicalization is enabled.
-
-- **Modes**
-  - **Candidate mode (canonicalization enabled)**: `push_delta` stores deltas as `candidate` with a timestamp. A background worker periodically evaluates them.
-  - **Optimistic mode (canonicalization disabled)**: `push_delta` immediately applies the delta, updates state, and stores the delta as `canonical`.
-
-- **Worker loop (candidate mode)**
-  - Runs every `check_interval_seconds` (default 60 secs).
-  - For each account:
-    - Pull all deltas and select ready candidates using a time-based filter (candidate for at least `delay_seconds`).
-    - For each candidate delta in nonce order:
-      1) Fetch current persisted state.
-      2) Apply the delta using the `NetworkClient.apply_delta` function to compute the expected new state and commitment.
-      3) Verify the resulting state on-chain via `NetworkClient.verify_state`.
-      4) If the on-chain commitment matches the delta’s `new_commitment`:
-         - Update the persisted account state with the new state and commitment.
-         - Optionally refresh account auth via `NetworkClient.should_update_auth` and persist metadata if needed.
-         - Mark the delta `canonical` with the current timestamp and persist it.
-      5) Otherwise:
-         - Mark the delta `discarded` with the current timestamp and persist it.
-
-- **State machine**
-  - `candidate` → `canonical` (on-chain commitment match) or `candidate` → `discarded` (mismatch).
-  - Only non-discarded deltas contribute to `get_delta_since` merging.
+ 
