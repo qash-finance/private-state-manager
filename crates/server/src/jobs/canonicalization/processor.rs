@@ -162,7 +162,9 @@ impl DeltasProcessorBase {
 
         let verify_result = {
             let mut client = self.state.network_client.lock().await;
-            client.verify_state(&delta.account_id, &new_state_json).await
+            client
+                .verify_state(&delta.account_id, &new_state_json)
+                .await
         };
 
         match verify_result {

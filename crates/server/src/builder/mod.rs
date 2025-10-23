@@ -6,22 +6,22 @@
 //! - Authentication methods (MidenFalconRpo, EthereumECDSA, etc.)
 //! - API protocols (HTTP, gRPC)
 
-use axum::{Router, routing::get, routing::post};
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tonic::transport::Server;
+pub mod clock;
+pub mod handle;
+pub mod logging;
+pub mod state;
 
-use crate::api::grpc::StateManagerService;
-use crate::api::grpc::state_manager::state_manager_server::StateManagerServer;
-use crate::api::http::{configure, get_delta, get_delta_since, get_state, push_delta};
-use crate::canonicalization::CanonicalizationConfig;
 use crate::ack::Acknowledger;
+use crate::builder::handle::ServerHandle;
+use crate::canonicalization::CanonicalizationConfig;
 use crate::clock::SystemClock;
 use crate::logging::LoggingConfig;
 use crate::metadata::MetadataStore;
 use crate::network::{NetworkType, miden::MidenNetworkClient};
 use crate::state::AppState;
 use crate::storage::StorageRegistry;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Builder for configuring and creating a server instance
 pub struct ServerBuilder {
@@ -300,9 +300,7 @@ impl ServerBuilder {
             .metadata
             .ok_or("Metadata store not set. Use .metadata(...)")?;
 
-        let ack = self
-            .ack
-            .ok_or("Acknowledger not set. Use .ack(...)")?;
+        let ack = self.ack.ok_or("Acknowledger not set. Use .ack(...)")?;
 
         let network_client = MidenNetworkClient::from_network(network_type)
             .await
@@ -338,134 +336,4 @@ impl Default for ServerBuilder {
     }
 }
 
-/// Handle for a configured server instance
-///
-/// Provides methods to run the server with the configured settings.
-pub struct ServerHandle {
-    app_state: AppState,
-    http_enabled: bool,
-    http_port: u16,
-    grpc_enabled: bool,
-    grpc_port: u16,
-}
-
-impl ServerHandle {
-    /// Run the server with the configured settings
-    ///
-    /// This will start all enabled servers (HTTP and/or gRPC) and run them
-    /// concurrently until the process is terminated.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use server::builder::ServerBuilder;
-    /// use server::network::NetworkType;
-    ///
-    /// # async fn example() -> Result<(), String> {
-    /// let handle = ServerBuilder::new()
-    ///     .network(NetworkType::MidenTestnet)
-    ///     // ... other configuration
-    ///     .build()
-    ///     .await?;
-    ///
-    /// handle.run().await;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn run(self) {
-        async fn root() -> &'static str {
-            "Hello, World!"
-        }
-
-        let mut tasks = Vec::new();
-
-        // Start background jobs based on canonicalization config
-        if let Some(config) = &self.app_state.canonicalization {
-            tracing::info!(
-                delay_seconds = config.delay_seconds,
-                check_interval_seconds = config.check_interval_seconds,
-                "Starting canonicalization worker"
-            );
-            crate::services::start_canonicalization_worker(self.app_state.clone());
-        } else {
-            tracing::info!(
-                "Running in optimistic mode - deltas accepted without on-chain verification"
-            );
-        }
-
-        // Start HTTP server if enabled
-        if self.http_enabled {
-            let state = self.app_state.clone();
-            let port = self.http_port;
-
-            let task = tokio::spawn(async move {
-                let app = Router::new()
-                    .route("/", get(root))
-                    .route("/delta", post(push_delta))
-                    .route("/delta", get(get_delta))
-                    .route("/delta/since", get(get_delta_since))
-                    .route("/configure", post(configure))
-                    .route("/state", get(get_state))
-                    .with_state(state);
-
-                let addr = format!("0.0.0.0:{port}");
-                let listener = tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .expect("Failed to bind HTTP server");
-
-                tracing::info!(
-                    address = %listener.local_addr().unwrap(),
-                    "HTTP server listening"
-                );
-
-                axum::serve(listener, app)
-                    .await
-                    .expect("HTTP server failed");
-            });
-
-            tasks.push(task);
-        }
-
-        // Start gRPC server if enabled
-        if self.grpc_enabled {
-            let state = self.app_state.clone();
-            let port = self.grpc_port;
-
-            let task = tokio::spawn(async move {
-                let addr = format!("0.0.0.0:{port}")
-                    .parse()
-                    .expect("Invalid gRPC address");
-
-                let service = StateManagerService { app_state: state };
-
-                // Enable gRPC reflection
-                let reflection_service = tonic_reflection::server::Builder::configure()
-                    .register_encoded_file_descriptor_set(
-                        crate::api::grpc::state_manager::FILE_DESCRIPTOR_SET,
-                    )
-                    .build_v1()
-                    .expect("Failed to build reflection service");
-
-                tracing::info!(address = %addr, "gRPC server listening");
-
-                Server::builder()
-                    .add_service(StateManagerServer::new(service))
-                    .add_service(reflection_service)
-                    .serve(addr)
-                    .await
-                    .expect("gRPC server failed");
-            });
-
-            tasks.push(task);
-        }
-
-        if tasks.is_empty() {
-            tracing::warn!("No servers enabled");
-            return;
-        }
-
-        // Wait for all servers
-        for task in tasks {
-            let _ = task.await;
-        }
-    }
-}
+// ServerHandle moved to builder::handle

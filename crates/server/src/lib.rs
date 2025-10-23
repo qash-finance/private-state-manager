@@ -4,14 +4,17 @@ pub mod ack;
 pub mod api;
 pub mod builder;
 pub mod canonicalization;
-pub mod clock;
+// Moved under builder; re-export for stable paths
+pub use builder::clock;
 pub mod error;
 pub mod jobs;
-pub mod logging;
+// Moved under builder; re-export for stable paths
+pub use builder::logging;
 pub mod metadata;
 pub mod network;
 pub mod services;
-pub mod state;
+// Moved under builder; re-export for stable paths
+pub use builder::state;
 pub mod storage;
 
 // Testing utilities - only compiled when running tests

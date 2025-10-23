@@ -13,8 +13,7 @@ pub struct MockNetworkClient {
     pub verify_state_calls: Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
     pub verify_delta_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub apply_delta_responses: Arc<StdMutex<Vec<StdResult<(serde_json::Value, String), String>>>>,
-    pub should_update_auth_responses:
-        Arc<StdMutex<Vec<StdResult<Option<Auth>, String>>>>,
+    pub should_update_auth_responses: Arc<StdMutex<Vec<StdResult<Option<Auth>, String>>>>,
 }
 
 impl MockNetworkClient {
@@ -40,10 +39,7 @@ impl MockNetworkClient {
         self
     }
 
-    pub fn with_should_update_auth(
-        self,
-        response: StdResult<Option<Auth>, String>,
-    ) -> Self {
+    pub fn with_should_update_auth(self, response: StdResult<Option<Auth>, String>) -> Self {
         self.should_update_auth_responses
             .lock()
             .unwrap()
@@ -171,7 +167,6 @@ impl MockStorageBackend {
         self
     }
 
-
     pub fn get_submit_state_calls(&self) -> Vec<AccountState> {
         self.submit_state_calls.lock().unwrap().clone()
     }
@@ -232,7 +227,6 @@ impl StorageBackend for MockStorageBackend {
             .pop()
             .unwrap_or_else(|| Ok(vec![]))
     }
-
 }
 
 #[derive(Clone, Default)]

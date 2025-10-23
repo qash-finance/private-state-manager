@@ -135,8 +135,7 @@ pub async fn create_test_app_state() -> AppState {
             .expect("Failed to create network client");
 
     let mock_client = IntegrationMockNetworkClient::new(miden_client);
-    let signer = MidenFalconRpoSigner::new(keystore_dir)
-        .expect("Failed to create signer");
+    let signer = MidenFalconRpoSigner::new(keystore_dir).expect("Failed to create signer");
     let ack = Acknowledger::FilesystemMidenFalconRpo(signer);
 
     AppState {

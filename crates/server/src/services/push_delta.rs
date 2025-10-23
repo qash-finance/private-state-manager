@@ -1,5 +1,5 @@
-use crate::metadata::auth::Credentials;
 use crate::error::{PsmError, Result};
+use crate::metadata::auth::Credentials;
 use crate::services::resolve_account;
 use crate::state::AppState;
 use crate::storage::{AccountState, DeltaObject, DeltaStatus};
@@ -25,7 +25,8 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
         .map_err(|e| PsmError::StorageError(format!("Failed to fetch account state: {e}")))?;
 
     // Check for pending candidates before accepting new delta
-    let all_deltas = resolved.backend
+    let all_deltas = resolved
+        .backend
         .pull_deltas_after(&params.delta.account_id, 0)
         .await
         .map_err(|e| PsmError::StorageError(format!("Failed to check deltas: {e}")))?;
@@ -43,12 +44,15 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
 
     let (new_state_json, new_commitment) = {
         let client = state.network_client.lock().await;
-        client.verify_delta(
-            &current_state.commitment,
-            &current_state.state_json,
-            &params.delta.delta_payload,
-        ).map_err(PsmError::InvalidDelta)?;
-        client.apply_delta(&current_state.state_json, &params.delta.delta_payload)
+        client
+            .verify_delta(
+                &current_state.commitment,
+                &current_state.state_json,
+                &params.delta.delta_payload,
+            )
+            .map_err(PsmError::InvalidDelta)?;
+        client
+            .apply_delta(&current_state.state_json, &params.delta.delta_payload)
             .map_err(PsmError::InvalidDelta)?
     };
 
@@ -60,7 +64,10 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
 
     if state.canonicalization.is_some() {
         result_delta.status = DeltaStatus::candidate(now);
-        resolved.backend.submit_delta(&result_delta).await
+        resolved
+            .backend
+            .submit_delta(&result_delta)
+            .await
             .map_err(|e| PsmError::StorageError(format!("Failed to submit delta: {e}")))?;
     } else {
         result_delta.status = DeltaStatus::canonical(now.clone());
@@ -73,9 +80,15 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
             updated_at: now,
         };
 
-        resolved.backend.submit_state(&new_state).await
+        resolved
+            .backend
+            .submit_state(&new_state)
+            .await
             .map_err(|e| PsmError::StorageError(format!("Failed to update state: {e}")))?;
-        resolved.backend.submit_delta(&result_delta).await
+        resolved
+            .backend
+            .submit_delta(&result_delta)
+            .await
             .map_err(|e| PsmError::StorageError(format!("Failed to submit delta: {e}")))?;
     }
 

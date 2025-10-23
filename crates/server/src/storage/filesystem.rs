@@ -168,5 +168,4 @@ impl StorageBackend for FilesystemService {
 
         Ok(deltas)
     }
-
 }

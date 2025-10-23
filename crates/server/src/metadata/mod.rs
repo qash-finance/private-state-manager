@@ -31,16 +31,11 @@ pub trait MetadataStore: Send + Sync {
     async fn list(&self) -> Result<Vec<String>, String>;
 
     /// Update the authentication configuration for an account
-    async fn update_auth(
-        &self,
-        account_id: &str,
-        new_auth: Auth,
-        now: &str,
-    ) -> Result<(), String> {
+    async fn update_auth(&self, account_id: &str, new_auth: Auth, now: &str) -> Result<(), String> {
         let mut metadata = self
             .get(account_id)
             .await?
-            .ok_or_else(|| format!("Account not found: {}", account_id))?;
+            .ok_or_else(|| format!("Account not found: {account_id}"))?;
 
         if metadata.auth == new_auth {
             return Ok(());

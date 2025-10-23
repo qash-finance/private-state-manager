@@ -1,5 +1,5 @@
-use crate::network::miden::MidenNetworkClient;
 use crate::network::NetworkType;
+use crate::network::miden::MidenNetworkClient;
 
 /// Integration test for verifying we can connect to Miden testnet
 /// To run: cargo test --package private-state-manager-server --test miden_rpc_integration_test

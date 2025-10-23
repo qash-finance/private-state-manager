@@ -177,7 +177,6 @@ pub trait StorageBackend: Send + Sync {
         account_id: &str,
         from_nonce: u64,
     ) -> Result<Vec<DeltaObject>, String>;
-
 }
 
 /// Storage registry that maps storage types to their backend implementations

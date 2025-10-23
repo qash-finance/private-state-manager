@@ -102,8 +102,7 @@ mod tests {
         let keystore_dir =
             std::env::temp_dir().join(format!("test_keystore_{}", uuid::Uuid::new_v4()));
 
-        let signer = MidenFalconRpoSigner::new(keystore_dir)
-            .expect("Failed to create signer");
+        let signer = MidenFalconRpoSigner::new(keystore_dir).expect("Failed to create signer");
         let ack = Acknowledger::FilesystemMidenFalconRpo(signer);
 
         AppState {

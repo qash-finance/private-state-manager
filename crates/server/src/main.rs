@@ -35,8 +35,7 @@ async fn main() {
         .expect("Failed to initialize metadata store");
 
     // Initialize acknowledger
-    let signer = MidenFalconRpoSigner::new(keystore_path)
-        .expect("Failed to initialize signer");
+    let signer = MidenFalconRpoSigner::new(keystore_path).expect("Failed to initialize signer");
     let ack = Acknowledger::FilesystemMidenFalconRpo(signer);
 
     ServerBuilder::new()
