@@ -305,7 +305,7 @@ impl ServerBuilder {
                 .map_err(|e| format!("Failed to initialize server signing: {e}"))?;
 
         tracing::info!(
-            server_pubkey = ?signing.server_pubkey(),
+            server_pubkey = %signing.server_pubkey_hex(),
             "Server signing key initialized"
         );
 

@@ -3,6 +3,7 @@ pub mod miden_falcon_rpo;
 use crate::error::PsmError;
 use miden_objects::Word;
 use miden_objects::crypto::dsa::rpo_falcon512::{PublicKey, SecretKey, Signature};
+use miden_objects::utils::Serializable;
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, PsmError>;
@@ -40,6 +41,13 @@ impl Signer {
         match self {
             Signer::MidenFalconRpo(signer) => signer.server_pubkey(),
         }
+    }
+
+    /// Get the server's public key as a hex string
+    pub fn server_pubkey_hex(&self) -> String {
+        let pubkey = self.server_pubkey();
+        let pubkey_word: Word = pubkey.into();
+        format!("0x{}", hex::encode(pubkey_word.to_bytes()))
     }
 
     /// Add a key to the keystore

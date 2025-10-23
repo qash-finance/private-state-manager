@@ -33,7 +33,7 @@ async fn main() {
         .await
         .expect("Failed to initialize metadata store");
 
-    // Set rules for canonicalization
+    // Set rules for canonicalization worker (delay for canonical and check interval)
     let canonicalization_mode = CanonicalizationMode::Enabled(CanonicalizationConfig::default());
 
     ServerBuilder::new()
