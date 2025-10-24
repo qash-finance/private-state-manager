@@ -2,7 +2,7 @@ use crate::error::{PsmError, Result};
 use crate::metadata::auth::Credentials;
 use crate::services::resolve_account;
 use crate::state::AppState;
-use crate::storage::AccountState;
+use crate::state_object::StateObject;
 
 #[derive(Debug, Clone)]
 pub struct GetStateParams {
@@ -12,7 +12,7 @@ pub struct GetStateParams {
 
 #[derive(Debug, Clone)]
 pub struct GetStateResult {
-    pub state: AccountState,
+    pub state: StateObject,
 }
 
 pub async fn get_state(state: &AppState, params: GetStateParams) -> Result<GetStateResult> {

@@ -1,9 +1,10 @@
+use crate::delta_object::DeltaObject;
 use crate::metadata::auth::{Auth, ExtractCredentials};
 use crate::services::{
     self, ConfigureAccountParams, GetDeltaParams, GetStateParams, PushDeltaParams,
 };
 use crate::state::AppState;
-use crate::storage::{DeltaObject, StorageType};
+use crate::storage::StorageType;
 use tonic::{Request, Response, Status};
 
 // Include the generated protobuf code
@@ -210,13 +211,13 @@ impl StateManager for StateManagerService {
 // Helper functions to convert between internal types and protobuf types
 fn delta_to_proto(delta: &DeltaObject) -> state_manager::DeltaObject {
     let (candidate_at, canonical_at, discarded_at) = match &delta.status {
-        crate::storage::DeltaStatus::Candidate { timestamp } => {
+        crate::delta_object::DeltaStatus::Candidate { timestamp } => {
             (Some(timestamp.clone()), None, None)
         }
-        crate::storage::DeltaStatus::Canonical { timestamp } => {
+        crate::delta_object::DeltaStatus::Canonical { timestamp } => {
             (Some(timestamp.clone()), Some(timestamp.clone()), None)
         }
-        crate::storage::DeltaStatus::Discarded { timestamp } => {
+        crate::delta_object::DeltaStatus::Discarded { timestamp } => {
             (None, None, Some(timestamp.clone()))
         }
     };
@@ -234,7 +235,7 @@ fn delta_to_proto(delta: &DeltaObject) -> state_manager::DeltaObject {
     }
 }
 
-fn state_to_proto(state: &crate::storage::AccountState) -> state_manager::AccountState {
+fn state_to_proto(state: &crate::state_object::StateObject) -> state_manager::AccountState {
     state_manager::AccountState {
         account_id: state.account_id.clone(),
         state_json: state.state_json.to_string(),

@@ -1,7 +1,8 @@
+use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::metadata::auth::{Auth, Credentials};
 use crate::services::{ConfigureAccountParams, PushDeltaParams};
 use crate::services::{configure_account, push_delta};
-use crate::storage::{DeltaObject, DeltaStatus, StorageType};
+use crate::storage::StorageType;
 use crate::testing::helpers::*;
 use miden_objects::crypto::hash::rpo::Rpo256;
 use miden_objects::utils::Deserializable;

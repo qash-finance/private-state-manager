@@ -1,10 +1,12 @@
+use crate::delta_object::DeltaObject;
 use crate::metadata::auth::{Auth, AuthHeader, Credentials};
 use crate::services::{
     self, ConfigureAccountParams, GetDeltaParams, GetDeltaSinceParams, GetStateParams,
     PushDeltaParams,
 };
 use crate::state::AppState;
-use crate::storage::{AccountState, DeltaObject, StorageType};
+use crate::state_object::StateObject;
+use crate::storage::StorageType;
 use axum::{Json, extract::Query, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -154,7 +156,7 @@ pub async fn get_state(
     State(state): State<AppState>,
     AuthHeader(credentials): AuthHeader,
     Query(query): Query<StateQuery>,
-) -> (StatusCode, Json<AccountState>) {
+) -> (StatusCode, Json<StateObject>) {
     let params = GetStateParams {
         account_id: query.account_id,
         credentials,
@@ -164,7 +166,7 @@ pub async fn get_state(
         Ok(response) => (StatusCode::OK, Json(response.state)),
         Err(e) => (
             StatusCode::NOT_FOUND,
-            Json(AccountState {
+            Json(StateObject {
                 account_id: e.to_string(),
                 ..Default::default()
             }),

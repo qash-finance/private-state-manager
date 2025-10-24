@@ -1,8 +1,8 @@
+use crate::delta_object::DeltaObject;
 use crate::error::{PsmError, Result};
 use crate::metadata::auth::Credentials;
 use crate::services::resolve_account;
 use crate::state::AppState;
-use crate::storage::DeltaObject;
 
 #[derive(Debug, Clone)]
 pub struct GetDeltaParams {

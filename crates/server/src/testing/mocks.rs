@@ -1,7 +1,9 @@
+use crate::delta_object::DeltaObject;
 use crate::metadata::MetadataStore;
 use crate::metadata::auth::{Auth, Credentials};
 use crate::network::NetworkClient;
-use crate::storage::{AccountState, StorageBackend};
+use crate::state_object::StateObject;
+use crate::storage::StorageBackend;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -174,13 +176,12 @@ impl NetworkClient for MockNetworkClient {
 #[derive(Clone, Default)]
 pub struct MockStorageBackend {
     pub submit_state_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
-    pub submit_state_calls: Arc<StdMutex<Vec<AccountState>>>,
+    pub submit_state_calls: Arc<StdMutex<Vec<StateObject>>>,
     pub submit_delta_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
-    pub submit_delta_calls: Arc<StdMutex<Vec<crate::storage::DeltaObject>>>,
-    pub pull_state_responses: Arc<StdMutex<Vec<StdResult<AccountState, String>>>>,
-    pub pull_delta_responses: Arc<StdMutex<Vec<StdResult<crate::storage::DeltaObject, String>>>>,
-    pub pull_deltas_after_responses:
-        Arc<StdMutex<Vec<StdResult<Vec<crate::storage::DeltaObject>, String>>>>,
+    pub submit_delta_calls: Arc<StdMutex<Vec<DeltaObject>>>,
+    pub pull_state_responses: Arc<StdMutex<Vec<StdResult<StateObject, String>>>>,
+    pub pull_delta_responses: Arc<StdMutex<Vec<StdResult<DeltaObject, String>>>>,
+    pub pull_deltas_after_responses: Arc<StdMutex<Vec<StdResult<Vec<DeltaObject>, String>>>>,
 }
 
 impl MockStorageBackend {
@@ -198,20 +199,17 @@ impl MockStorageBackend {
         self
     }
 
-    pub fn with_pull_state(self, response: StdResult<AccountState, String>) -> Self {
+    pub fn with_pull_state(self, response: StdResult<StateObject, String>) -> Self {
         self.pull_state_responses.lock().unwrap().push(response);
         self
     }
 
-    pub fn with_pull_delta(self, response: StdResult<crate::storage::DeltaObject, String>) -> Self {
+    pub fn with_pull_delta(self, response: StdResult<DeltaObject, String>) -> Self {
         self.pull_delta_responses.lock().unwrap().push(response);
         self
     }
 
-    pub fn with_pull_deltas_after(
-        self,
-        response: StdResult<Vec<crate::storage::DeltaObject>, String>,
-    ) -> Self {
+    pub fn with_pull_deltas_after(self, response: StdResult<Vec<DeltaObject>, String>) -> Self {
         self.pull_deltas_after_responses
             .lock()
             .unwrap()
@@ -219,18 +217,18 @@ impl MockStorageBackend {
         self
     }
 
-    pub fn get_submit_state_calls(&self) -> Vec<AccountState> {
+    pub fn get_submit_state_calls(&self) -> Vec<StateObject> {
         self.submit_state_calls.lock().unwrap().clone()
     }
 
-    pub fn get_submit_delta_calls(&self) -> Vec<crate::storage::DeltaObject> {
+    pub fn get_submit_delta_calls(&self) -> Vec<DeltaObject> {
         self.submit_delta_calls.lock().unwrap().clone()
     }
 }
 
 #[async_trait]
 impl StorageBackend for MockStorageBackend {
-    async fn submit_state(&self, state: &AccountState) -> StdResult<(), String> {
+    async fn submit_state(&self, state: &StateObject) -> StdResult<(), String> {
         self.submit_state_calls.lock().unwrap().push(state.clone());
         self.submit_state_responses
             .lock()
@@ -239,7 +237,7 @@ impl StorageBackend for MockStorageBackend {
             .unwrap_or(Ok(()))
     }
 
-    async fn submit_delta(&self, delta: &crate::storage::DeltaObject) -> StdResult<(), String> {
+    async fn submit_delta(&self, delta: &DeltaObject) -> StdResult<(), String> {
         self.submit_delta_calls.lock().unwrap().push(delta.clone());
         self.submit_delta_responses
             .lock()
@@ -248,7 +246,7 @@ impl StorageBackend for MockStorageBackend {
             .unwrap_or(Ok(()))
     }
 
-    async fn pull_state(&self, _account_id: &str) -> StdResult<AccountState, String> {
+    async fn pull_state(&self, _account_id: &str) -> StdResult<StateObject, String> {
         self.pull_state_responses
             .lock()
             .unwrap()
@@ -256,11 +254,7 @@ impl StorageBackend for MockStorageBackend {
             .unwrap_or_else(|| Err("No state found".to_string()))
     }
 
-    async fn pull_delta(
-        &self,
-        _account_id: &str,
-        _nonce: u64,
-    ) -> StdResult<crate::storage::DeltaObject, String> {
+    async fn pull_delta(&self, _account_id: &str, _nonce: u64) -> StdResult<DeltaObject, String> {
         self.pull_delta_responses
             .lock()
             .unwrap()
@@ -272,7 +266,7 @@ impl StorageBackend for MockStorageBackend {
         &self,
         _account_id: &str,
         _from_nonce: u64,
-    ) -> StdResult<Vec<crate::storage::DeltaObject>, String> {
+    ) -> StdResult<Vec<DeltaObject>, String> {
         self.pull_deltas_after_responses
             .lock()
             .unwrap()

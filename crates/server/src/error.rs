@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 use std::fmt;
 
@@ -90,11 +90,17 @@ impl fmt::Display for PsmError {
             PsmError::InvalidAccountId(msg) => write!(f, "Invalid account ID: {msg}"),
             PsmError::StateNotFound(id) => write!(f, "State not found for account '{id}'"),
             PsmError::DeltaNotFound { account_id, nonce } => {
-                write!(f, "Delta not found for account '{account_id}' at nonce {nonce}")
+                write!(
+                    f,
+                    "Delta not found for account '{account_id}' at nonce {nonce}"
+                )
             }
             PsmError::InvalidDelta(msg) => write!(f, "Invalid delta: {msg}"),
             PsmError::ConflictPendingDelta => {
-                write!(f, "Cannot push new delta: there is already a non-canonical delta pending")
+                write!(
+                    f,
+                    "Cannot push new delta: there is already a non-canonical delta pending"
+                )
             }
             PsmError::CommitmentMismatch { expected, actual } => {
                 write!(f, "Commitment mismatch: expected {expected}, got {actual}")

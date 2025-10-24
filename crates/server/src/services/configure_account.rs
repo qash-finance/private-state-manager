@@ -2,7 +2,8 @@ use crate::error::{PsmError, Result};
 use crate::metadata::AccountMetadata;
 use crate::metadata::auth::{Auth, Credentials};
 use crate::state::AppState;
-use crate::storage::{AccountState, StorageType};
+use crate::state_object::StateObject;
+use crate::storage::StorageType;
 
 #[derive(Debug, Clone)]
 pub struct ConfigureAccountParams {
@@ -58,7 +59,7 @@ pub async fn configure_account(
     };
 
     let now = state.clock.now_rfc3339();
-    let account_state = AccountState {
+    let account_state = StateObject {
         account_id: params.account_id.clone(),
         state_json: params.initial_state,
         commitment,

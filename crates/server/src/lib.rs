@@ -7,11 +7,13 @@ pub use builder::canonicalization;
 pub use builder::clock;
 pub use builder::logging;
 pub use builder::state;
+pub mod delta_object;
 pub mod error;
 pub mod jobs;
 pub mod metadata;
 pub mod network;
 pub mod services;
+pub mod state_object;
 pub mod storage;
 
 #[cfg(test)]

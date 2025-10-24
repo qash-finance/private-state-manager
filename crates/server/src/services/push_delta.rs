@@ -1,8 +1,9 @@
+use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::error::{PsmError, Result};
 use crate::metadata::auth::Credentials;
 use crate::services::resolve_account;
 use crate::state::AppState;
-use crate::storage::{AccountState, DeltaObject, DeltaStatus};
+use crate::state_object::StateObject;
 
 #[derive(Debug, Clone)]
 pub struct PushDeltaParams {
@@ -74,7 +75,7 @@ pub async fn push_delta(state: &AppState, params: PushDeltaParams) -> Result<Pus
     } else {
         result_delta.status = DeltaStatus::canonical(now.clone());
 
-        let new_state = AccountState {
+        let new_state = StateObject {
             account_id: result_delta.account_id.clone(),
             commitment: result_delta.new_commitment.clone(),
             state_json: new_state_json,

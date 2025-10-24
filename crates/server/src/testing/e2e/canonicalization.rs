@@ -1,7 +1,8 @@
+use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::metadata::auth::{Auth, Credentials};
 use crate::services::{ConfigureAccountParams, PushDeltaParams};
 use crate::services::{configure_account, process_canonicalizations_now, push_delta};
-use crate::storage::{DeltaObject, DeltaStatus, StorageType};
+use crate::storage::StorageType;
 use crate::testing::helpers::*;
 
 /// Test canonicalization lifecycle - delta is discarded when on-chain doesn't match

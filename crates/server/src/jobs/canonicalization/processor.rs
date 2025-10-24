@@ -1,7 +1,8 @@
 use crate::canonicalization::CanonicalizationConfig;
+use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::error::{PsmError, Result};
 use crate::state::AppState;
-use crate::storage::{AccountState, DeltaObject, DeltaStatus};
+use crate::state_object::StateObject;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
@@ -210,7 +211,7 @@ impl DeltasProcessorBase {
 
         let now = self.state.clock.now_rfc3339();
 
-        let updated_state = AccountState {
+        let updated_state = StateObject {
             account_id: delta.account_id.clone(),
             state_json: new_state_json.clone(),
             commitment: new_commitment,

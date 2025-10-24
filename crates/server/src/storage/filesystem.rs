@@ -1,4 +1,6 @@
-use crate::storage::{AccountState, DeltaObject, StorageBackend};
+use crate::delta_object::DeltaObject;
+use crate::state_object::StateObject;
+use crate::storage::StorageBackend;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -99,7 +101,7 @@ impl FilesystemService {
 
 #[async_trait]
 impl StorageBackend for FilesystemService {
-    async fn submit_state(&self, state: &AccountState) -> Result<(), String> {
+    async fn submit_state(&self, state: &StateObject) -> Result<(), String> {
         let content = serde_json::to_string_pretty(state)
             .map_err(|e| format!("Failed to serialize state: {e}"))?;
 
@@ -117,14 +119,14 @@ impl StorageBackend for FilesystemService {
         self.write(&app_path, &content).await
     }
 
-    async fn pull_state(&self, account_id: &str) -> Result<AccountState, String> {
+    async fn pull_state(&self, account_id: &str) -> Result<StateObject, String> {
         let app_path = self.get_state_path(account_id);
 
         let content = fs::read_to_string(&app_path)
             .await
             .map_err(|e| format!("Failed to read state file: {e}"))?;
 
-        let state: AccountState = serde_json::from_str(&content)
+        let state: StateObject = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to deserialize state: {e}"))?;
 
         Ok(state)

@@ -1,7 +1,7 @@
 pub mod miden_falcon_rpo;
 
+use crate::delta_object::DeltaObject;
 use crate::error::Result;
-use crate::storage::DeltaObject;
 
 pub use miden_falcon_rpo::MidenFalconRpoSigner;
 
