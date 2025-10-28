@@ -32,12 +32,12 @@ impl FalconRpoSigner {
 }
 
 pub trait IntoWord {
-    fn into_word(&self) -> Word;
+    fn into_word(self) -> Word;
 }
 
 impl IntoWord for AccountId {
-    fn into_word(&self) -> Word {
-        let account_id_felts: [Felt; 2] = (*self).into();
+    fn into_word(self) -> Word {
+        let account_id_felts: [Felt; 2] = (self).into();
 
         let message_elements = vec![
             account_id_felts[0],
@@ -51,11 +51,11 @@ impl IntoWord for AccountId {
 }
 
 pub trait IntoHex {
-    fn into_hex(&self) -> String;
+    fn into_hex(self) -> String;
 }
 
 impl IntoHex for Signature {
-    fn into_hex(&self) -> String {
+    fn into_hex(self) -> String {
         use miden_objects::utils::Serializable;
         let signature_bytes = self.to_bytes();
         format!("0x{}", hex::encode(&signature_bytes))
@@ -75,12 +75,12 @@ pub fn verify_commitment_signature(
 }
 
 pub trait HexIntoWord {
-    fn hex_into_word(&self) -> Result<Word, String>;
+    fn hex_into_word(self) -> Result<Word, String>;
 }
 
 impl HexIntoWord for &str {
-    fn hex_into_word(&self) -> Result<Word, String> {
-        let commitment_hex = self.strip_prefix("0x").unwrap_or(&self);
+    fn hex_into_word(self) -> Result<Word, String> {
+        let commitment_hex = self.strip_prefix("0x").unwrap_or(self);
 
         let bytes =
             hex::decode(commitment_hex).map_err(|e| format!("Invalid commitment hex: {e}"))?;
@@ -104,23 +104,23 @@ impl HexIntoWord for &str {
 }
 
 pub trait HexIntoPublicKey {
-    fn hex_into_public_key(&self) -> Result<PublicKey, String>;
+    fn hex_into_public_key(self) -> Result<PublicKey, String>;
 }
 
 impl HexIntoPublicKey for &str {
-    fn hex_into_public_key(&self) -> Result<PublicKey, String> {
-        let word = Word::try_from(*self).map_err(|e| format!("Invalid public key hex: {e}"))?;
+    fn hex_into_public_key(self) -> Result<PublicKey, String> {
+        let word = Word::try_from(self).map_err(|e| format!("Invalid public key hex: {e}"))?;
         Ok(PublicKey::new(word))
     }
 }
 
 pub trait HexIntoSignature {
-    fn hex_into_signature(&self) -> Result<Signature, String>;
+    fn hex_into_signature(self) -> Result<Signature, String>;
 }
 
 impl HexIntoSignature for &str {
-    fn hex_into_signature(&self) -> Result<Signature, String> {
-        let hex_str = self.strip_prefix("0x").unwrap_or(&self);
+    fn hex_into_signature(self) -> Result<Signature, String> {
+        let hex_str = self.strip_prefix("0x").unwrap_or(self);
         let bytes = hex::decode(hex_str).map_err(|e| format!("Invalid signature hex: {e}"))?;
 
         const EXPECTED_SIG_LEN: usize = 1563;

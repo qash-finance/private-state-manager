@@ -3,8 +3,8 @@ use crate::error::{ClientError, ClientResult};
 use crate::proto::state_manager_client::StateManagerClient;
 use crate::proto::{
     AuthConfig, ConfigureRequest, ConfigureResponse, GetDeltaRequest, GetDeltaResponse,
-    GetDeltaSinceRequest, GetDeltaSinceResponse, GetStateRequest, GetStateResponse,
-    PushDeltaRequest, PushDeltaResponse,
+    GetDeltaSinceRequest, GetDeltaSinceResponse, GetPubkeyRequest, GetStateRequest,
+    GetStateResponse, PushDeltaRequest, PushDeltaResponse,
 };
 use miden_objects::account::AccountId;
 use tonic::metadata::MetadataValue;
@@ -168,5 +168,12 @@ impl PsmClient {
         }
 
         Ok(inner)
+    }
+
+    pub async fn get_pubkey(&mut self) -> ClientResult<String> {
+        let request = tonic::Request::new(GetPubkeyRequest {});
+        let response = self.client.get_pubkey(request).await?;
+        let inner = response.into_inner();
+        Ok(inner.pubkey)
     }
 }
