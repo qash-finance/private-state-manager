@@ -3,10 +3,11 @@ use miden_lib::account::{
     wallets::BasicWallet,
 };
 use miden_objects::{
-    Felt, Word,
+    Felt, Word, ZERO,
     account::delta::{AccountStorageDelta, AccountVaultDelta},
     account::{Account, AccountBuilder, AccountDelta, PublicKeyCommitment},
     crypto::dsa::rpo_falcon512::SecretKey,
+    transaction::{InputNotes, OutputNotes, TransactionSummary},
 };
 use private_state_manager_shared::{FromJson, ToJson};
 use std::fs;
@@ -100,12 +101,20 @@ async fn generate_multisig_fixtures() {
         hex::encode(current_commitment.as_bytes())
     );
 
+    // Create a TransactionSummary with the delta
+    let tx_summary_1 = TransactionSummary::new(
+        delta_1,
+        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
+        Word::from([ZERO; 4]),  // Salt
+    );
+
     let delta_1_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
         "nonce": 1,
         "prev_commitment": format!("0x{}", hex::encode(prev_commitment_1.as_bytes())),
         "new_commitment": format!("0x{}", hex::encode(current_commitment.as_bytes())),
-        "delta_payload": delta_1.to_json()
+        "delta_payload": tx_summary_1.to_json()
     });
 
     fs::write(
@@ -152,12 +161,20 @@ async fn generate_multisig_fixtures() {
         hex::encode(current_commitment.as_bytes())
     );
 
+    // Create a TransactionSummary with the delta
+    let tx_summary_2 = TransactionSummary::new(
+        delta_2,
+        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
+        Word::from([ZERO; 4]),  // Salt
+    );
+
     let delta_2_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
         "nonce": 2,
         "prev_commitment": format!("0x{}", hex::encode(prev_commitment_2.as_bytes())),
         "new_commitment": format!("0x{}", hex::encode(current_commitment.as_bytes())),
-        "delta_payload": delta_2.to_json()
+        "delta_payload": tx_summary_2.to_json()
     });
 
     fs::write(
@@ -200,12 +217,20 @@ async fn generate_multisig_fixtures() {
         hex::encode(current_commitment.as_bytes())
     );
 
+    // Create a TransactionSummary with the delta
+    let tx_summary_3 = TransactionSummary::new(
+        delta_3,
+        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
+        Word::from([ZERO; 4]),  // Salt
+    );
+
     let delta_3_fixture = serde_json::json!({
         "account_id": format!("{}", account_id),
         "nonce": 3,
         "prev_commitment": format!("0x{}", hex::encode(prev_commitment_3.as_bytes())),
         "new_commitment": format!("0x{}", hex::encode(current_commitment.as_bytes())),
-        "delta_payload": delta_3.to_json()
+        "delta_payload": tx_summary_3.to_json()
     });
 
     fs::write(

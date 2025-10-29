@@ -4,11 +4,13 @@ use crate::metadata::auth::{Auth, Credentials};
 use crate::network::miden::account_inspector::MidenAccountInspector;
 use crate::network::{NetworkClient, NetworkType};
 use async_trait::async_trait;
-use miden_objects::account::{Account, AccountDelta, AccountId};
+use miden_objects::account::{Account, AccountId};
 use miden_objects::crypto::dsa::rpo_falcon512::PublicKey;
+use miden_objects::transaction::TransactionSummary;
 use miden_objects::utils::{Deserializable, Serializable};
 use miden_rpc_client::MidenRpcClient;
 use private_state_manager_shared::{FromJson, ToJson};
+use miden_objects::transaction::{InputNote, InputNotes, OutputNote, OutputNotes};
 
 /// Miden network client for fetching on-chain account data
 pub struct MidenNetworkClient {
@@ -94,7 +96,7 @@ impl NetworkClient for MidenNetworkClient {
         prev_state_json: &serde_json::Value,
         delta_payload: &serde_json::Value,
     ) -> Result<(), String> {
-        AccountDelta::from_json(delta_payload)?;
+        TransactionSummary::from_json(delta_payload)?;
         let account = Account::from_json(prev_state_json)?;
 
         let current_commitment = account.commitment();
@@ -114,11 +116,11 @@ impl NetworkClient for MidenNetworkClient {
         prev_state_json: &serde_json::Value,
         delta_payload: &serde_json::Value,
     ) -> Result<(serde_json::Value, String), String> {
-        let delta = AccountDelta::from_json(delta_payload)?;
+        let tx_summary = TransactionSummary::from_json(delta_payload)?;
         let mut account = Account::from_json(prev_state_json)?;
 
         account
-            .apply_delta(&delta)
+            .apply_delta(&tx_summary.account_delta())
             .map_err(|e| format!("Failed to apply delta to account: {e}"))?;
 
         let new_commitment = format!("0x{}", hex::encode(account.commitment().as_bytes()));
@@ -135,24 +137,48 @@ impl NetworkClient for MidenNetworkClient {
             return Err("Cannot merge empty delta list".to_string());
         }
 
-        let mut deltas: Vec<AccountDelta> = delta_payloads
+        let tx_summaries: Vec<TransactionSummary> = delta_payloads
             .iter()
-            .map(AccountDelta::from_json)
+            .map(TransactionSummary::from_json)
             .collect::<Result<Vec<_>, _>>()?;
 
-        if deltas.is_empty() {
+        if tx_summaries.is_empty() {
             return Err("No valid deltas to merge".to_string());
         }
 
-        let mut merged = deltas.remove(0);
+        // Start with the first TransactionSummary and extract its components
+        let first = &tx_summaries[0];
+        let mut merged_account_delta = first.account_delta().clone();
+        let mut all_input_notes: Vec<InputNote> = first.input_notes().iter().cloned().collect();
+        let mut all_output_notes: Vec<OutputNote> = first.output_notes().iter().cloned().collect();
 
-        for delta in deltas {
-            merged
-                .merge(delta)
-                .map_err(|e| format!("Failed to merge deltas: {e}"))?;
+        for tx_summary in tx_summaries.iter().skip(1) {
+            all_input_notes.extend(tx_summary.input_notes().iter().cloned());
+            all_output_notes.extend(tx_summary.output_notes().iter().cloned());
+            merged_account_delta
+                .merge(tx_summary.account_delta().clone())
+                .map_err(|e| format!("Failed to merge account deltas: {e}"))?;
         }
 
-        Ok(merged.to_json())
+        // Create aggregated InputNotes and OutputNotes
+        let aggregated_input_notes = InputNotes::new(all_input_notes)
+            .map_err(|e| format!("Failed to create aggregated input notes: {e}"))?;
+        let aggregated_output_notes = OutputNotes::new(all_output_notes)
+            .map_err(|e| format!("Failed to create aggregated output notes: {e}"))?;
+
+        // Use the salt from the last TransactionSummary
+        // TODO: Maybe we should use a 0 salt to prevent confusions.
+        let salt = tx_summaries.last().unwrap().salt();
+
+        // Create the merged TransactionSummary
+        let merged_tx_summary = TransactionSummary::new(
+            merged_account_delta,
+            aggregated_input_notes,
+            aggregated_output_notes,
+            salt,
+        );
+
+        Ok(merged_tx_summary.to_json())
     }
 
     fn validate_account_id(&self, account_id: &str) -> Result<(), String> {

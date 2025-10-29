@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use miden_objects::account::{AccountDelta, AccountId, AccountStorageDelta, AccountVaultDelta};
 use miden_objects::crypto::dsa::rpo_falcon512::SecretKey;
 use miden_objects::crypto::hash::rpo::Rpo256;
+use miden_objects::transaction::{InputNotes, OutputNotes, TransactionSummary};
 use miden_objects::utils::Serializable;
-use miden_objects::{Felt, FieldElement, Word};
+use miden_objects::{Felt, FieldElement, Word, ZERO};
 use private_state_manager_shared::hex::IntoHex;
 use private_state_manager_shared::{FromJson, ToJson};
 
@@ -264,7 +265,15 @@ pub fn create_test_delta_payload(account_id_hex: &str) -> serde_json::Value {
     )
     .expect("Valid empty delta");
 
-    delta.to_json()
+    // Wrap the AccountDelta in a TransactionSummary
+    let tx_summary = TransactionSummary::new(
+        delta,
+        InputNotes::new(Vec::new()).unwrap(),
+        OutputNotes::new(Vec::new()).unwrap(),
+        Word::from([ZERO; 4]),  // Salt
+    );
+
+    tx_summary.to_json()
 }
 
 pub fn generate_falcon_signature(account_id_hex: &str) -> (String, String, String) {

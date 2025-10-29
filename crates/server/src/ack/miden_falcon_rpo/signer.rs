@@ -2,12 +2,12 @@ use crate::delta_object::DeltaObject;
 use crate::error::{MidenFalconRpoResult as Result, PsmError};
 use miden_keystore::{FilesystemKeyStore, KeyStore};
 use miden_objects::{
-    Felt, Word,
+    Word,
     crypto::dsa::rpo_falcon512::{PublicKey, Signature},
-    crypto::hash::rpo::Rpo256,
+    transaction::TransactionSummary,
     utils::Serializable,
 };
-use private_state_manager_shared::hex::IntoHex;
+use private_state_manager_shared::{hex::IntoHex, FromJson};
 use rand_chacha::ChaCha20Rng;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,40 +49,11 @@ impl MidenFalconRpoSigner {
     }
 
     pub(crate) fn ack_delta(&self, mut delta: DeltaObject) -> crate::ack::Result<DeltaObject> {
-        let commitment_digest = self.commitment_to_digest(&delta.new_commitment)?;
-        let signature = self.sign_with_server_key(commitment_digest)?;
+        let tx_summary = TransactionSummary::from_json(&delta.delta_payload)
+            .map_err(|e| PsmError::InvalidDelta(format!("Failed to deserialize TransactionSummary: {e}")))?;
+
+        let signature = self.sign_with_server_key(tx_summary.to_commitment())?;
         delta.ack_sig = Some(hex::encode(signature.to_bytes()));
         Ok(delta)
-    }
-
-    fn commitment_to_digest(&self, commitment_hex: &str) -> crate::ack::Result<Word> {
-        let commitment_hex = commitment_hex.strip_prefix("0x").unwrap_or(commitment_hex);
-
-        let bytes = hex::decode(commitment_hex)
-            .map_err(|e| PsmError::InvalidCommitment(format!("Invalid hex: {e}")))?;
-
-        if bytes.len() != 32 {
-            return Err(PsmError::InvalidCommitment(format!(
-                "Commitment must be 32 bytes, got {}",
-                bytes.len()
-            )));
-        }
-
-        let mut felts = Vec::new();
-        for chunk in bytes.chunks(8) {
-            let mut arr = [0u8; 8];
-            arr[..chunk.len()].copy_from_slice(chunk);
-            let value = u64::from_le_bytes(arr);
-            felts.push(
-                Felt::try_from(value).map_err(|e| {
-                    PsmError::InvalidCommitment(format!("Invalid field element: {e}"))
-                })?,
-            );
-        }
-
-        let message_elements = vec![felts[0], felts[1], felts[2], felts[3]];
-
-        let digest = Rpo256::hash_elements(&message_elements);
-        Ok(digest)
     }
 }

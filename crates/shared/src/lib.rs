@@ -1,5 +1,6 @@
 use base64::Engine;
-use miden_objects::account::{Account, AccountDelta};
+use miden_objects::account::Account;
+use miden_objects::transaction::TransactionSummary;
 use miden_objects::utils::serde::{Deserializable, Serializable};
 
 pub mod auth;
@@ -39,7 +40,7 @@ impl FromJson for Account {
     }
 }
 
-impl ToJson for AccountDelta {
+impl ToJson for TransactionSummary {
     fn to_json(&self) -> serde_json::Value {
         let bytes = self.to_bytes();
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -49,7 +50,7 @@ impl ToJson for AccountDelta {
     }
 }
 
-impl FromJson for AccountDelta {
+impl FromJson for TransactionSummary {
     fn from_json(json: &serde_json::Value) -> Result<Self, String> {
         let encoded = json
             .get("data")
@@ -60,7 +61,7 @@ impl FromJson for AccountDelta {
             .decode(encoded)
             .map_err(|e| format!("Base64 decode error: {e}"))?;
 
-        AccountDelta::read_from_bytes(&bytes)
+        TransactionSummary::read_from_bytes(&bytes)
             .map_err(|e| format!("AccountDelta deserialization error: {e}"))
     }
 }
