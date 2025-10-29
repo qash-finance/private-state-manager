@@ -2,6 +2,7 @@ use miden_objects::account::AccountId;
 use miden_objects::crypto::dsa::rpo_falcon512::{PublicKey, SecretKey, Signature};
 use miden_objects::crypto::hash::rpo::Rpo256;
 use miden_objects::{Felt, FieldElement, Word};
+use miden_objects::utils::Deserializable;
 use private_state_manager_shared::hex::{FromHex, IntoHex};
 
 pub struct FalconRpoSigner {
@@ -66,6 +67,7 @@ pub trait HexIntoWord {
 
 impl HexIntoWord for &str {
     fn hex_into_word(self) -> Result<Word, String> {
+
         let commitment_hex = self.strip_prefix("0x").unwrap_or(self);
 
         let bytes =
@@ -75,17 +77,9 @@ impl HexIntoWord for &str {
             return Err(format!("Commitment must be 32 bytes, got {}", bytes.len()));
         }
 
-        let mut felts = Vec::new();
-        for chunk in bytes.chunks(8) {
-            let mut arr = [0u8; 8];
-            arr[..chunk.len()].copy_from_slice(chunk);
-            let value = u64::from_le_bytes(arr);
-            felts.push(Felt::try_from(value).map_err(|e| format!("Invalid field element: {e}"))?);
-        }
-
-        let message_elements = vec![felts[0], felts[1], felts[2], felts[3]];
-        let digest = Rpo256::hash_elements(&message_elements);
-        Ok(digest)
+        // Use Word::read_from_bytes to deserialize the commitment correctly
+        Word::read_from_bytes(&bytes)
+            .map_err(|e| format!("Failed to deserialize Word from bytes: {e}"))
     }
 }
 

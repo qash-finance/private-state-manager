@@ -52,7 +52,8 @@ impl MidenFalconRpoSigner {
         let tx_summary = TransactionSummary::from_json(&delta.delta_payload)
             .map_err(|e| PsmError::InvalidDelta(format!("Failed to deserialize TransactionSummary: {e}")))?;
 
-        let signature = self.sign_with_server_key(tx_summary.to_commitment())?;
+        let tx_commitment = tx_summary.to_commitment();
+        let signature = self.sign_with_server_key(tx_commitment)?;
         delta.ack_sig = Some(hex::encode(signature.to_bytes()));
         Ok(delta)
     }
