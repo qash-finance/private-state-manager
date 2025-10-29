@@ -5,8 +5,6 @@ members = [
     "crates/server",
     "crates/miden-rpc-client",
     "crates/miden-keystore",
-]
-exclude = [
     "examples/rust",
 ]
 resolver = "2"
@@ -14,6 +12,11 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+authors = ["OpenZeppelin"]
+license = "AGPL"
+repository = "https://github.com/OpenZeppelin/private-state-manager"
+homepage = "https://github.com/OpenZeppelin/private-state-manager"
 
 # Reproducible build configuration (workspace-wide)
 [profile.release]
@@ -21,3 +24,28 @@ strip = true           # Strip debug symbols for smaller, more reproducible bina
 lto = true            # Link-time optimization for better optimization and determinism
 codegen-units = 1     # Single codegen unit for maximum reproducibility
 incremental = false   # Disable incremental compilation for reproducibility
+
+[workspace.dependencies]
+# Core
+serde = "1.0.228"
+serde_json = "1.0.145"
+tokio = "1.47.1"
+tonic = "0.13.0"
+prost = "0.13.4"
+tonic-build = "0.13.0"
+thiserror = "2.0.9"
+hex = "0.4.3"
+base64 = "0.22"
+rand_chacha = "0.9.0"
+tempfile = "3.15.0"
+rand = "0.9"
+anyhow = { version = "1.0", features = ["backtrace", "std"] }
+assert_matches = "1.5"
+rstest = "0.26"
+
+# Miden
+miden-objects = { git = "https://github.com/0xMiden/miden-base.git", package = "miden-objects", branch = "next" }
+miden-lib = { git = "https://github.com/0xMiden/miden-base.git", package = "miden-lib", branch = "next" }
+miden-node-proto = { git = "https://github.com/0xMiden/miden-node.git", package = "miden-node-proto", branch = "next" }
+miden-client = { git = "https://github.com/0xMiden/miden-client.git", branch = "next" }
+miden-client-sqlite-store = { git = "https://github.com/0xMiden/miden-client.git", branch = "next", package = "miden-client-sqlite-store" }

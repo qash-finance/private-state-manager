@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-miden-objects = { git = "https://github.com/0xMiden/miden-base.git", package = "miden-objects", branch = "next" }
-miden-lib = { git = "https://github.com/0xMiden/miden-base.git", package = "miden-lib", branch = "next" }
-serde_json = "1.0.145"
-base64 = "0.22"
+miden-objects = { workspace = true }
+miden-lib = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
 rand = "0.8"
-hex = "0.4.3"
+hex = { workspace = true }
