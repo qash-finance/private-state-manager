@@ -1,0 +1,279 @@
+use std::fmt;
+
+use miden_client::account::component::{AccountComponent, BasicWallet};
+use miden_client::account::{
+    Account, AccountBuilder, AccountStorageMode, AccountType, StorageMap, StorageSlot,
+};
+use miden_client::transaction::{
+    TransactionAuthenticator, TransactionExecutorError, TransactionKernel, TransactionRequest,
+    TransactionRequestBuilder, TransactionRequestError, TransactionScript, TransactionSummary,
+};
+use miden_client::{Client, ClientError, Deserializable, Word};
+
+// NamedSource is not exported by miden_client, so we import it from miden_objects (transitive dependency)
+use miden_objects::account::{AccountId, Signature};
+use miden_objects::assembly::diagnostics::NamedSource;
+use miden_objects::{Felt, Hasher};
+
+// Load Multisig Auth MASM code from file (includes PSM verification)
+const MULTISIG_AUTH: &str = include_str!("../masm/multisig.masm");
+const PSM_LIB: &str = include_str!("../masm/psm.masm");
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum MultisigError {
+    Assembly(String),
+    TransactionRequest(TransactionRequestError),
+    Client(ClientError),
+    Executor(TransactionExecutorError),
+    UnexpectedSuccess,
+}
+
+impl fmt::Display for MultisigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MultisigError::Assembly(err) => write!(f, "assembly error: {}", err),
+            MultisigError::TransactionRequest(err) => {
+                write!(f, "transaction request error: {}", err)
+            }
+            MultisigError::Client(err) => write!(f, "client error: {}", err),
+            MultisigError::Executor(err) => write!(f, "transaction executor error: {}", err),
+            MultisigError::UnexpectedSuccess => write!(
+                f,
+                "transaction executed successfully when failure was expected"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MultisigError {}
+
+impl From<TransactionRequestError> for MultisigError {
+    fn from(err: TransactionRequestError) -> Self {
+        MultisigError::TransactionRequest(err)
+    }
+}
+
+impl From<ClientError> for MultisigError {
+    fn from(err: ClientError) -> Self {
+        MultisigError::Client(err)
+    }
+}
+
+impl From<TransactionExecutorError> for MultisigError {
+    fn from(err: TransactionExecutorError) -> Self {
+        MultisigError::Executor(err)
+    }
+}
+
+/// Create a multisig PSM account with 2-of-2 threshold
+pub fn create_multisig_psm_account(
+    client1_pubkey_hex: &str,
+    client2_pubkey_hex: &str,
+    psm_server_pubkey_hex: &str,
+    init_seed: [u8; 32],
+) -> Account {
+    // Convert pubkey commitments (Word) from hex to Word
+    // The client sends public key commitments (32 bytes), not full keys
+    let psm_pubkey_bytes =
+        hex::decode(&psm_server_pubkey_hex[2..]).expect("Failed to decode PSM pubkey");
+    let psm_commitment_word =
+        Word::read_from_bytes(&psm_pubkey_bytes).expect("Failed to convert PSM commitment to Word");
+
+    let client1_pubkey_bytes =
+        hex::decode(&client1_pubkey_hex[2..]).expect("Failed to decode client1 pubkey");
+    let client1_commitment_word = Word::read_from_bytes(&client1_pubkey_bytes)
+        .expect("Failed to convert client1 commitment to Word");
+
+    let client2_pubkey_bytes =
+        hex::decode(&client2_pubkey_hex[2..]).expect("Failed to decode client2 pubkey");
+    let client2_commitment_word = Word::read_from_bytes(&client2_pubkey_bytes)
+        .expect("Failed to convert client2 commitment to Word");
+
+    // Build multisig auth component with storage slots
+    // Storage layout for multisig.masm:
+    // Slot 0: [threshold, num_approvers, 0, 0]
+    // Slot 1: Public keys map (client1, client2)
+    // Slot 2: Executed transactions map (empty initially)
+    // Slot 3: Procedure thresholds map (empty initially)
+    // Slot 4: PSM selector [1,0,0,0] = ON
+    // Slot 5: PSM public key map
+
+    // Slot 0: Multisig config - require 2 out of 2 signatures
+    let slot_0 = StorageSlot::Value(Word::from([2u32, 2, 0, 0]));
+
+    // Slot 1: Client public key commitments map
+    let mut client_pubkeys_map = StorageMap::new();
+    let _ = client_pubkeys_map.insert(
+        Word::from([0u32, 0, 0, 0]), // index 0 - client1
+        client1_commitment_word,
+    );
+    let _ = client_pubkeys_map.insert(
+        Word::from([1u32, 0, 0, 0]), // index 1 - client2
+        client2_commitment_word,
+    );
+    let slot_1 = StorageSlot::Map(client_pubkeys_map);
+
+    // Slot 2: Executed transactions map (empty)
+    let slot_2 = StorageSlot::Map(StorageMap::new());
+
+    // Slot 3: Procedure thresholds map (empty)
+    let slot_3 = StorageSlot::Map(StorageMap::new());
+
+    // Slot 4: PSM selector [1,0,0,0] = ON
+    let slot_4 = StorageSlot::Value(Word::from([1u32, 0, 0, 0]));
+
+    // Slot 5: PSM public key commitment map (single entry at index 0)
+    let mut psm_key_map = StorageMap::new();
+    let _ = psm_key_map.insert(
+        Word::from([0u32, 0, 0, 0]), // index 0
+        psm_commitment_word,
+    );
+    let slot_5 = StorageSlot::Map(psm_key_map);
+
+    // Create PSM library with openzeppelin::psm namespace using NamedSource
+    let psm_source = NamedSource::new("openzeppelin::psm", PSM_LIB);
+
+    // First, compile the PSM library using a fresh assembler
+    let psm_library = TransactionKernel::assembler()
+        .assemble_library([psm_source])
+        .expect("Failed to compile PSM library");
+
+    // Then create a new assembler with the PSM library for multisig auth compilation
+    let assembler = TransactionKernel::assembler()
+        .with_dynamic_library(psm_library)
+        .expect("Failed to add PSM library to assembler");
+
+    let auth_component = AccountComponent::compile(
+        MULTISIG_AUTH.to_string(),
+        assembler,
+        vec![slot_0, slot_1, slot_2, slot_3, slot_4, slot_5],
+    )
+    .expect("Failed to compile auth component")
+    .with_supports_all_types();
+
+    // Create account with both clients as cosigners
+    AccountBuilder::new(init_seed)
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Private)
+        .with_auth_component(auth_component)
+        .with_component(BasicWallet)
+        .build()
+        .expect("Failed to build account")
+}
+
+#[allow(dead_code)]
+/// Builds the advice payload for a multisig configuration update and returns the
+/// resulting commitment that must appear on the operand stack before invoking
+/// `update_signers_and_threshold`.
+pub fn build_multisig_config_advice(
+    threshold: u64,
+    signer_commitments: &[Word],
+) -> (Word, Vec<Felt>) {
+    let num_approvers = signer_commitments.len() as u64;
+
+    let mut payload = Vec::with_capacity(4 + signer_commitments.len() * 4);
+    payload.extend_from_slice(&[
+        Felt::new(threshold),
+        Felt::new(num_approvers),
+        Felt::new(0),
+        Felt::new(0),
+    ]);
+
+    for commitment in signer_commitments.iter().rev() {
+        payload.extend_from_slice(commitment.as_elements());
+    }
+
+    let digest = Hasher::hash_elements(&payload);
+    let config_hash: Word = digest.into();
+    (config_hash, payload)
+}
+
+#[allow(dead_code)]
+fn build_update_signers_script() -> Result<TransactionScript, MultisigError> {
+    let psm_source = NamedSource::new("openzeppelin::psm", PSM_LIB);
+    let psm_library = TransactionKernel::assembler()
+        .assemble_library([psm_source])
+        .map_err(|err| MultisigError::Assembly(format!("Failed to compile PSM library: {err}")))?;
+
+    let mut assembler = TransactionKernel::assembler()
+        .with_dynamic_library(psm_library)
+        .map_err(|err| MultisigError::Assembly(format!("Failed to add PSM library: {err}")))?;
+
+    let multisig_module = NamedSource::new("account_auth::multisig", MULTISIG_AUTH);
+    assembler
+        .compile_and_statically_link(multisig_module)
+        .map_err(|err| MultisigError::Assembly(format!("Failed to link multisig module: {err}")))?;
+
+    let code = "
+    use.account_auth::multisig
+    begin
+    exec.multisig::update_signers_and_threshold
+    end";
+
+    let program = assembler.assemble_program(code).map_err(|err| {
+        MultisigError::Assembly(format!("Failed to compile update-signers script: {err}"))
+    })?;
+
+    Ok(TransactionScript::new(program))
+}
+
+#[allow(dead_code)]
+/// Builds a `TransactionRequest` that executes `update_signers_and_threshold` using the
+/// provided multisig configuration. Returns the request together with the advice map key
+/// (`MULTISIG_CONFIG_HASH`) so it can be reused elsewhere (e.g. for signature lookups).
+pub fn build_update_signers_transaction_request<I>(
+    threshold: u64,
+    signer_commitments: &[Word],
+    salt: Word,
+    extra_advice: I,
+) -> Result<(TransactionRequest, Word), MultisigError>
+where
+    I: IntoIterator<Item = (Word, Vec<Felt>)>,
+{
+    let (config_hash, config_values) = build_multisig_config_advice(threshold, signer_commitments);
+    let script = build_update_signers_script()?;
+
+    let request = TransactionRequestBuilder::new()
+        .custom_script(script)
+        .script_arg(config_hash)
+        .extend_advice_map([(config_hash, config_values)])
+        .extend_advice_map(extra_advice)
+        .auth_arg(salt)
+        .build()?;
+
+    Ok((request, config_hash))
+}
+
+#[allow(dead_code)]
+pub fn build_signature_advice_entry(
+    pubkey_commitment: Word,
+    message: Word,
+    signature: &Signature,
+) -> (Word, Vec<Felt>) {
+    let key = Hasher::merge(&[pubkey_commitment, message]);
+    let values = signature.to_prepared_signature();
+    (key, values)
+}
+
+#[allow(dead_code)]
+/// Executes the provided transaction request against the given account. If authentication fails
+/// with `Unauthorized`, the contained `TransactionSummary` is returned. Any other execution
+/// result (including success) is surfaced as an error.
+pub async fn execute_transaction_for_summary<AUTH>(
+    client: &mut Client<AUTH>,
+    account_id: AccountId,
+    request: TransactionRequest,
+) -> Result<TransactionSummary, MultisigError>
+where
+    AUTH: TransactionAuthenticator + Sync + 'static,
+{
+    match client.new_transaction(account_id, request).await {
+        Ok(_) => Err(MultisigError::UnexpectedSuccess),
+        Err(ClientError::TransactionExecutorError(TransactionExecutorError::Unauthorized(
+            summary,
+        ))) => Ok(*summary),
+        Err(ClientError::TransactionExecutorError(err)) => Err(MultisigError::Executor(err)),
+        Err(err) => Err(MultisigError::Client(err)),
+    }
+}

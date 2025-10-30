@@ -1,0 +1,45 @@
+
+use miden_client::auth::AuthSecretKey;
+use miden_client::crypto::rpo_falcon512::SecretKey;
+use miden_client::keystore::FilesystemKeyStore;
+use miden_client::Serializable;
+use rand_chacha::ChaCha20Rng;
+
+/// Generate a Falcon keypair and return (full_pubkey_hex, commitment_hex, secret_key)
+pub fn generate_falcon_keypair(
+  keystore: &FilesystemKeyStore<ChaCha20Rng>,
+) -> (String, String, SecretKey) {
+  // Generate a new secret key
+  let secret_key = SecretKey::new();
+  let auth_secret_key = AuthSecretKey::RpoFalcon512(secret_key.clone());
+
+  // Add it to the keystore
+  keystore
+      .add_key(&auth_secret_key)
+      .expect("Failed to add key to keystore");
+
+  // Get the public key and commitment
+  let actual_pubkey = secret_key.public_key();
+  let actual_commitment = actual_pubkey.to_commitment();
+
+  // Verify we can retrieve it
+  let retrieved_key = keystore
+      .get_key(actual_commitment)
+      .expect("Failed to get key")
+      .expect("Key not found in keystore");
+
+  // Verify the retrieved key matches
+  let AuthSecretKey::RpoFalcon512(retrieved_secret) = retrieved_key;
+  assert_eq!(
+      retrieved_secret.public_key().to_commitment(),
+      actual_commitment,
+      "Retrieved key doesn't match!"
+  );
+
+  // Return both full public key (for auth) and commitment (for account storage)
+  use private_state_manager_shared::hex::IntoHex;
+  let full_pubkey_hex = (&actual_pubkey).into_hex();
+  let commitment_hex = format!("0x{}", hex::encode(actual_commitment.to_bytes()));
+
+  (full_pubkey_hex, commitment_hex, secret_key)
+}

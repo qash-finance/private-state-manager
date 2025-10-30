@@ -16,6 +16,7 @@ miden-client = { workspace = true, features = ["tonic"] }
 miden-client-sqlite-store = { workspace = true }
 # NamedSource is not exported by miden_client, so we need miden_objects directly
 miden-objects = { workspace = true }
+miden-tx = { workspace = true }
 
 tokio = { workspace = true, features = ["full"] }
 hex = { workspace = true }
