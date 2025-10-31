@@ -46,7 +46,7 @@ async fn main() {
 
     ServerBuilder::new()
         .with_logging(LoggingConfig::default())
-        .network(NetworkType::MidenTestnet)
+        .network(NetworkType::MidenLocal)
         .with_canonicalization(Some(CanonicalizationConfig::default()))
         .storage(storage_registry)
         .metadata(Arc::new(metadata))
