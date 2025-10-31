@@ -137,10 +137,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_account_success() {
-        use crate::testing::helpers::generate_falcon_signature;
+        use crate::testing::helpers::{generate_falcon_signature, pubkey_hex_to_commitment_hex};
 
         let account_id_hex = "0x069cde0ebf59f29063051ad8a3d32d";
         let (_account_id, pubkey_hex, signature_hex) = generate_falcon_signature(account_id_hex);
+        let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
         let network_client = MockNetworkClient::new()
             .with_validate_credential(Ok(()))
@@ -161,7 +162,7 @@ mod tests {
         let params = ConfigureAccountParams {
             account_id: account_id_hex.to_string(),
             auth: Auth::MidenFalconRpo {
-                cosigner_pubkeys: vec![pubkey_hex],
+                cosigner_commitments: vec![commitment_hex],
             },
             initial_state,
             storage_type: StorageType::Filesystem,
@@ -185,15 +186,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_account_already_exists() {
-        use crate::testing::helpers::generate_falcon_signature;
+        use crate::testing::helpers::{generate_falcon_signature, pubkey_hex_to_commitment_hex};
 
         let account_id_hex = "0x069cde0ebf59f29063051ad8a3d32d";
         let (_account_id, pubkey_hex, signature_hex) = generate_falcon_signature(account_id_hex);
+        let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
         let existing_metadata = AccountMetadata {
             account_id: account_id_hex.to_string(),
             auth: Auth::MidenFalconRpo {
-                cosigner_pubkeys: vec![pubkey_hex.clone()],
+                cosigner_commitments: vec![commitment_hex.clone()],
             },
             storage_type: StorageType::Filesystem,
             created_at: "2024-01-01T00:00:00Z".to_string(),
@@ -211,7 +213,7 @@ mod tests {
         let params = ConfigureAccountParams {
             account_id: account_id_hex.to_string(),
             auth: Auth::MidenFalconRpo {
-                cosigner_pubkeys: vec![pubkey_hex],
+                cosigner_commitments: vec![commitment_hex],
             },
             initial_state: serde_json::json!({"balance": 100}),
             storage_type: StorageType::Filesystem,
@@ -229,10 +231,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_account_network_error() {
-        use crate::testing::helpers::generate_falcon_signature;
+        use crate::testing::helpers::{generate_falcon_signature, pubkey_hex_to_commitment_hex};
 
         let account_id_hex = "0x069cde0ebf59f29063051ad8a3d32d";
         let (_account_id, pubkey_hex, signature_hex) = generate_falcon_signature(account_id_hex);
+        let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
         let network_client = MockNetworkClient::new()
             .with_validate_credential(Ok(()))
@@ -248,7 +251,7 @@ mod tests {
         let params = ConfigureAccountParams {
             account_id: account_id_hex.to_string(),
             auth: Auth::MidenFalconRpo {
-                cosigner_pubkeys: vec![pubkey_hex],
+                cosigner_commitments: vec![commitment_hex],
             },
             initial_state: serde_json::json!({"balance": 100}),
             storage_type: StorageType::Filesystem,

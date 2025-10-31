@@ -11,8 +11,8 @@ pub struct PendingTransaction {
     pub tx_summary_commitment_hex: String,
     pub new_threshold: u64,
     pub signer_commitments_hex: Vec<String>, // ALL commitments for final tx (including new cosigner)
-    pub signer_pubkeys_hex: Vec<String>,      // ALL public keys (matching signer_commitments_hex order)
-    pub signers_required_hex: Vec<String>,   // Only EXISTING commitments that need to sign
+    pub signer_pubkeys_hex: Vec<String>, // ALL public keys (matching signer_commitments_hex order)
+    pub signers_required_hex: Vec<String>, // Only EXISTING commitments that need to sign
     pub salt_hex: String,
     pub psm_commitment_hex: String,
     pub current_nonce: u64,
@@ -26,7 +26,10 @@ impl PendingTransaction {
     }
 
     pub fn signer_commitments(&self) -> Vec<Word> {
-        self.signer_commitments_hex.iter().map(|h| hex_to_word(h)).collect()
+        self.signer_commitments_hex
+            .iter()
+            .map(|h| hex_to_word(h))
+            .collect()
     }
 
     pub fn salt(&self) -> Word {
@@ -89,9 +92,15 @@ impl PendingTxStore {
         Ok(pending_tx)
     }
 
-    pub fn add_signature(&self, commitment_hex: String, signature_hex: String) -> Result<(), String> {
+    pub fn add_signature(
+        &self,
+        commitment_hex: String,
+        signature_hex: String,
+    ) -> Result<(), String> {
         let mut pending_tx = self.load()?;
-        pending_tx.collected_signatures.insert(commitment_hex, signature_hex);
+        pending_tx
+            .collected_signatures
+            .insert(commitment_hex, signature_hex);
         self.save(&pending_tx)
     }
 

@@ -26,7 +26,6 @@ pub struct SessionState {
     pub user_secret_key: Option<SecretKey>,
     pub user_pubkey_hex: Option<String>,
     pub user_commitment_hex: Option<String>,
-    pub cosigner_pubkeys: Vec<String>,
     pub cosigner_commitments: Vec<String>,
     pub keystore: Arc<FilesystemKeyStore<StdRng>>,
     pub temp_dir: Arc<TempDir>,
@@ -35,8 +34,8 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(psm_endpoint: String, miden_endpoint: Endpoint) -> Result<Self, String> {
-        let temp_dir = TempDir::new()
-            .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+        let temp_dir =
+            TempDir::new().map_err(|e| format!("Failed to create temp directory: {}", e))?;
 
         let keystore_path = temp_dir.path().join("keystore");
         let keystore = FilesystemKeyStore::new(keystore_path)
@@ -56,7 +55,6 @@ impl SessionState {
             user_secret_key: None,
             user_pubkey_hex: None,
             user_commitment_hex: None,
-            cosigner_pubkeys: Vec::new(),
             cosigner_commitments: Vec::new(),
             keystore: Arc::new(keystore),
             temp_dir: Arc::new(temp_dir),
@@ -98,12 +96,14 @@ impl SessionState {
     }
 
     pub fn get_psm_client(&self) -> Result<&PsmClient, String> {
-        self.psm_client.as_ref()
+        self.psm_client
+            .as_ref()
             .ok_or_else(|| "PSM client not connected".to_string())
     }
 
     pub fn get_psm_client_mut(&mut self) -> Result<&mut PsmClient, String> {
-        self.psm_client.as_mut()
+        self.psm_client
+            .as_mut()
             .ok_or_else(|| "PSM client not connected".to_string())
     }
 
@@ -112,7 +112,9 @@ impl SessionState {
         let signer = FalconRpoSigner::new(secret_key);
         let auth = Auth::FalconRpoSigner(signer);
 
-        let client = self.psm_client.take()
+        let client = self
+            .psm_client
+            .take()
             .ok_or_else(|| "PSM client not connected".to_string())?;
 
         self.psm_client = Some(client.with_auth(auth));
@@ -120,17 +122,20 @@ impl SessionState {
     }
 
     pub fn get_miden_client(&self) -> Result<&Client<()>, String> {
-        self.miden_client.as_ref()
+        self.miden_client
+            .as_ref()
             .ok_or_else(|| "Miden client not connected".to_string())
     }
 
     pub fn get_miden_client_mut(&mut self) -> Result<&mut Client<()>, String> {
-        self.miden_client.as_mut()
+        self.miden_client
+            .as_mut()
             .ok_or_else(|| "Miden client not connected".to_string())
     }
 
     pub fn get_account(&self) -> Result<&Account, String> {
-        self.account.as_ref()
+        self.account
+            .as_ref()
             .ok_or_else(|| "No account loaded".to_string())
     }
 
@@ -140,18 +145,21 @@ impl SessionState {
     }
 
     pub fn get_secret_key(&self) -> Result<&SecretKey, String> {
-        self.user_secret_key.as_ref()
+        self.user_secret_key
+            .as_ref()
             .ok_or_else(|| "No keypair generated".to_string())
     }
 
     pub fn get_pubkey_hex(&self) -> Result<&str, String> {
-        self.user_pubkey_hex.as_ref()
+        self.user_pubkey_hex
+            .as_ref()
             .map(|s| s.as_str())
             .ok_or_else(|| "No keypair generated".to_string())
     }
 
     pub fn get_commitment_hex(&self) -> Result<&str, String> {
-        self.user_commitment_hex.as_ref()
+        self.user_commitment_hex
+            .as_ref()
             .map(|s| s.as_str())
             .ok_or_else(|| "No keypair generated".to_string())
     }
@@ -162,18 +170,15 @@ impl SessionState {
         self.account = Some(account);
     }
 
-    pub fn set_keypair(&mut self, pubkey_hex: String, commitment_hex: String, secret_key: SecretKey) {
+    pub fn set_keypair(
+        &mut self,
+        pubkey_hex: String,
+        commitment_hex: String,
+        secret_key: SecretKey,
+    ) {
         self.user_pubkey_hex = Some(pubkey_hex);
         self.user_commitment_hex = Some(commitment_hex);
         self.user_secret_key = Some(secret_key);
-    }
-
-    pub fn set_cosigner_pubkeys(&mut self, pubkeys: Vec<String>) {
-        self.cosigner_pubkeys = pubkeys;
-    }
-
-    pub fn get_cosigner_pubkeys(&self) -> &[String] {
-        &self.cosigner_pubkeys
     }
 
     pub fn get_data_dir(&self) -> PathBuf {

@@ -32,7 +32,7 @@ message AuthConfig {
 
 // Miden Falcon RPO authentication config
 message MidenFalconRpoAuth {
-  repeated string cosigner_pubkeys = 1;
+  repeated string cosigner_commitments = 1;
 }
 
 // Configure request

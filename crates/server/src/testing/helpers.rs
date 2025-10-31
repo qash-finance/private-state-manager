@@ -194,10 +194,10 @@ pub fn create_request_with_auth<T>(payload: T, pubkey: &str, sig: &str) -> Reque
     request
 }
 
-pub fn create_miden_falcon_rpo_auth(cosigner_pubkeys: Vec<String>) -> AuthConfig {
+pub fn create_miden_falcon_rpo_auth(cosigner_commitments: Vec<String>) -> AuthConfig {
     AuthConfig {
         auth_type: Some(auth_config::AuthType::MidenFalconRpo(MidenFalconRpoAuth {
-            cosigner_pubkeys,
+            cosigner_commitments,
         })),
     }
 }
@@ -270,7 +270,7 @@ pub fn create_test_delta_payload(account_id_hex: &str) -> serde_json::Value {
         delta,
         InputNotes::new(Vec::new()).unwrap(),
         OutputNotes::new(Vec::new()).unwrap(),
-        Word::from([ZERO; 4]),  // Salt
+        Word::from([ZERO; 4]), // Salt
     );
 
     tx_summary.to_json()
@@ -299,6 +299,17 @@ pub fn generate_falcon_signature(account_id_hex: &str) -> (String, String, Strin
     let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
     (account_id_hex.to_string(), pubkey_hex, signature_hex)
+}
+
+pub fn pubkey_hex_to_commitment_hex(pubkey_hex: &str) -> String {
+    use miden_objects::crypto::dsa::rpo_falcon512::PublicKey;
+    use miden_objects::utils::{Deserializable, Serializable};
+
+    let pubkey_hex = pubkey_hex.strip_prefix("0x").unwrap_or(pubkey_hex);
+    let pubkey_bytes = hex::decode(pubkey_hex).expect("Valid public key hex");
+    let pubkey = PublicKey::read_from_bytes(&pubkey_bytes).expect("Valid public key");
+    let commitment = pubkey.to_commitment();
+    format!("0x{}", hex::encode(commitment.to_bytes()))
 }
 
 pub async fn update_mock_on_chain_commitment(

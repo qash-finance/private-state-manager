@@ -1,6 +1,6 @@
 use crate::testing::helpers::{
     create_router, create_test_app_state, generate_falcon_signature, load_fixture_account,
-    load_fixture_delta,
+    load_fixture_delta, pubkey_hex_to_commitment_hex,
 };
 
 use axum::{
@@ -17,13 +17,14 @@ async fn test_configure_and_push_delta_with_auth() {
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
-    // Step 1: Configure account with the cosigner public key
+    // Step 1: Configure account with the cosigner commitment
     let configure_body = json!({
         "account_id": account_id_hex,
         "auth": {
             "MidenFalconRpo": {
-                "cosigner_pubkeys": [pubkey_hex.clone()]
+                "cosigner_commitments": [commitment_hex]
             }
         },
         "initial_state": initial_state,
@@ -82,14 +83,15 @@ async fn test_push_delta_unauthorized_cosigner() {
 
     // Generate two different key pairs
     let (_, authorized_pubkey, _) = generate_falcon_signature(&account_id_hex);
+    let authorized_commitment = pubkey_hex_to_commitment_hex(&authorized_pubkey);
     let (_, unauthorized_pubkey, unauthorized_sig) = generate_falcon_signature(&account_id_hex);
 
-    // Configure account with ONLY the authorized pubkey
+    // Configure account with ONLY the authorized commitment
     let configure_body = json!({
         "account_id": account_id_hex,
         "auth": {
             "MidenFalconRpo": {
-                "cosigner_pubkeys": [authorized_pubkey] // Only this key is authorized
+                "cosigner_commitments": [authorized_commitment] // Only this commitment is authorized
             }
         },
         "initial_state": initial_state,
@@ -129,7 +131,7 @@ async fn test_push_delta_unauthorized_cosigner() {
     let mut app_clone = app.clone();
     let push_response = app_clone.call(push_request).await.unwrap();
 
-    // Should fail because the public key is not in cosigner_pubkeys list
+    // Should fail because the public key commitment is not in authorized commitments list
     assert_eq!(
         push_response.status(),
         StatusCode::BAD_REQUEST,
@@ -144,13 +146,14 @@ async fn test_push_delta_missing_auth_headers() {
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, _) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
     // Configure account
     let configure_body = json!({
         "account_id": account_id_hex,
         "auth": {
             "MidenFalconRpo": {
-                "cosigner_pubkeys": [pubkey_hex]
+                "cosigner_commitments": [commitment_hex]
             }
         },
         "initial_state": initial_state,

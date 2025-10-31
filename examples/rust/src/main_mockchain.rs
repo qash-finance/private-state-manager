@@ -1,14 +1,13 @@
 mod falcon;
 mod multisig;
 
-use miden_client::testing::MockChainBuilder;
-use miden_client::transaction::TransactionExecutorError;
 use miden_client::account::Account;
 use miden_client::crypto::rpo_falcon512::PublicKey;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_client::{Deserializable, Felt, Serializable, Word};
+use miden_client::testing::MockChainBuilder;
+use miden_client::transaction::TransactionExecutorError;
 use miden_client::vm::{AdviceInputs, AdviceMap};
-
+use miden_client::{Deserializable, Felt, Serializable, Word};
 
 use miden_objects::account::Signature as AccountSignature;
 use miden_objects::crypto::dsa::rpo_falcon512::Signature as RawFalconSignature;
@@ -46,9 +45,9 @@ async fn main() -> ClientResult<()> {
 
     println!("Setup: Generating keys...");
 
-    let (client1_full_pubkey_hex, client1_commitment_hex, client1_secret_key) =
+    let (_client1_full_pubkey_hex, client1_commitment_hex, client1_secret_key) =
         falcon::generate_falcon_keypair(&keystore);
-    let (client2_full_pubkey_hex, client2_commitment_hex, client2_secret_key) =
+    let (_client2_full_pubkey_hex, client2_commitment_hex, client2_secret_key) =
         falcon::generate_falcon_keypair(&keystore);
 
     println!("  ✓ Client 1 commitment: {}...", &client1_commitment_hex);
@@ -110,9 +109,9 @@ async fn main() -> ClientResult<()> {
 
     let auth_config = AuthConfig {
         auth_type: Some(AuthType::MidenFalconRpo(MidenFalconRpoAuth {
-            cosigner_pubkeys: vec![
-                client1_full_pubkey_hex.clone(),
-                client2_full_pubkey_hex.clone(),
+            cosigner_commitments: vec![
+                client1_commitment_hex.clone(),
+                client2_commitment_hex.clone(),
             ],
         })),
     };
@@ -189,10 +188,14 @@ async fn main() -> ClientResult<()> {
         let (_new_cosigner_full_pubkey_hex, new_cosigner_commitment_hex, _new_cosigner_secret_key) =
             falcon::generate_falcon_keypair(&keystore);
 
-        let signer_commitments = match [&client1_commitment_hex, &client2_commitment_hex, &new_cosigner_commitment_hex]
-            .into_iter()
-            .map(|hex_commitment| commitment_from_hex(hex_commitment))
-            .collect::<Result<Vec<_>, _>>()
+        let signer_commitments = match [
+            &client1_commitment_hex,
+            &client2_commitment_hex,
+            &new_cosigner_commitment_hex,
+        ]
+        .into_iter()
+        .map(|hex_commitment| commitment_from_hex(hex_commitment))
+        .collect::<Result<Vec<_>, _>>()
         {
             Ok(commitments) => commitments,
             Err(err) => {
@@ -201,14 +204,10 @@ async fn main() -> ClientResult<()> {
             }
         };
 
-        let salt = Word::from([
-            Felt::new(42),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-        ]);
+        let salt = Word::from([Felt::new(42), Felt::new(0), Felt::new(0), Felt::new(0)]);
 
-        let (config_hash, config_values) = multisig::build_multisig_config_advice(3, &signer_commitments);
+        let (config_hash, config_values) =
+            multisig::build_multisig_config_advice(3, &signer_commitments);
 
         let tx_script = match multisig::build_update_signers_script() {
             Ok(script) => script,
@@ -233,9 +232,7 @@ async fn main() -> ClientResult<()> {
             ..Default::default()
         };
 
-        let tx_context_init = match mock_chain
-            .build_tx_context(account.id(), &[], &[])
-        {
+        let tx_context_init = match mock_chain.build_tx_context(account.id(), &[], &[]) {
             Ok(builder) => match builder
                 .tx_script(tx_script.clone())
                 .tx_script_args(config_hash)
@@ -338,8 +335,10 @@ async fn main() -> ClientResult<()> {
                     }
                 };
 
-                let cosigner1_signature = AccountSignature::from(client1_secret_key.sign(tx_message));
-                let cosigner2_signature = AccountSignature::from(client2_secret_key.sign(tx_message));
+                let cosigner1_signature =
+                    AccountSignature::from(client1_secret_key.sign(tx_message));
+                let cosigner2_signature =
+                    AccountSignature::from(client2_secret_key.sign(tx_message));
 
                 let mut signature_advice = Vec::new();
                 signature_advice.push(multisig::build_signature_advice_entry(
@@ -368,15 +367,21 @@ async fn main() -> ClientResult<()> {
                     ..Default::default()
                 };
 
-                let tx_result = match mock_chain
-                    .build_tx_context(account.id(), &[], &[])
-                {
+                let tx_result = match mock_chain.build_tx_context(account.id(), &[], &[]) {
                     Ok(builder) => match builder
                         .tx_script(tx_script)
                         .tx_script_args(config_hash)
                         .add_signature(server_commitment.into(), tx_message, ack_signature)
-                        .add_signature(signer_commitments[0].into(), tx_message, cosigner1_signature)
-                        .add_signature(signer_commitments[1].into(), tx_message, cosigner2_signature)
+                        .add_signature(
+                            signer_commitments[0].into(),
+                            tx_message,
+                            cosigner1_signature,
+                        )
+                        .add_signature(
+                            signer_commitments[1].into(),
+                            tx_message,
+                            cosigner2_signature,
+                        )
                         .extend_advice_inputs(final_advice_inputs)
                         .auth_args(salt)
                         .build()
@@ -399,7 +404,10 @@ async fn main() -> ClientResult<()> {
                     }
                 };
 
-                println!("  ✓ Transaction executed (nonce: {})", tx_result.account_delta().nonce_delta().as_int());
+                println!(
+                    "  ✓ Transaction executed (nonce: {})",
+                    tx_result.account_delta().nonce_delta().as_int()
+                );
             }
             Ok(false) => {
                 println!("  ✗ Invalid PSM signature");

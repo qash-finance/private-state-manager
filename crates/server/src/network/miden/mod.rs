@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use miden_objects::account::{Account, AccountId};
 use miden_objects::crypto::dsa::rpo_falcon512::PublicKey;
 use miden_objects::transaction::TransactionSummary;
+use miden_objects::transaction::{InputNote, InputNotes, OutputNote, OutputNotes};
 use miden_objects::utils::{Deserializable, Serializable};
 use miden_rpc_client::MidenRpcClient;
 use private_state_manager_shared::{FromJson, ToJson};
-use miden_objects::transaction::{InputNote, InputNotes, OutputNote, OutputNotes};
 
 /// Miden network client for fetching on-chain account data
 pub struct MidenNetworkClient {
@@ -225,13 +225,13 @@ impl NetworkClient for MidenNetworkClient {
         let account = Account::from_json(state_json)?;
         let inspector = MidenAccountInspector::new(&account);
 
-        let pubkeys = inspector.extract_slot_1_pubkeys();
+        let commitments = inspector.extract_slot_1_pubkeys();
 
-        if pubkeys.is_empty() {
+        if commitments.is_empty() {
             Ok(None)
         } else {
             Ok(Some(Auth::MidenFalconRpo {
-                cosigner_pubkeys: pubkeys,
+                cosigner_commitments: commitments,
             }))
         }
     }

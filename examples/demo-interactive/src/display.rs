@@ -37,7 +37,10 @@ pub fn print_info(message: &str) {
 
 pub fn print_account_info(account: &Account) {
     print_section("Account Information");
-    println!("  Account ID:     {}", shorten_hex(&account.id().to_string()));
+    println!(
+        "  Account ID:     {}",
+        shorten_hex(&account.id().to_string())
+    );
     println!("  Account Type:   {:?}", account.account_type());
     println!("  Nonce:          {}", account.nonce());
 }
@@ -56,7 +59,10 @@ pub fn print_storage_overview(account: &Account) {
         Ok(word) => {
             let threshold = word[0].as_int();
             let num_cosigners = word[1].as_int();
-            println!("  Slot 0: Multisig Config ({}-of-{})", threshold, num_cosigners);
+            println!(
+                "  Slot 0: Multisig Config ({}-of-{})",
+                threshold, num_cosigners
+            );
         }
         Err(_) => println!("  Slot 0: Not set"),
     }
@@ -93,8 +99,16 @@ pub fn print_full_hex(label: &str, hex: &str) {
 pub fn print_connection_status(psm_connected: bool, miden_connected: bool) {
     print_section("Connection Status");
 
-    let psm_status = if psm_connected { "✓ Connected" } else { "✗ Not connected" };
-    let miden_status = if miden_connected { "✓ Connected" } else { "✗ Not connected" };
+    let psm_status = if psm_connected {
+        "✓ Connected"
+    } else {
+        "✗ Not connected"
+    };
+    let miden_status = if miden_connected {
+        "✓ Connected"
+    } else {
+        "✗ Not connected"
+    };
 
     println!("  PSM Server:   {}", psm_status);
     println!("  Miden Node:   {}", miden_status);

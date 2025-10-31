@@ -1,6 +1,6 @@
-use miden_objects::Word;
-use miden_objects::account::Account;
 use miden_client::Serializable;
+use miden_objects::account::Account;
+use miden_objects::Word;
 
 pub struct AccountInspector<'a> {
     account: &'a Account,

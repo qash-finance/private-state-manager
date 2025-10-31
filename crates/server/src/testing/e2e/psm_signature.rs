@@ -38,12 +38,13 @@ async fn test_server_signs_commitment_on_push_delta() {
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
     // Step 2: Configure account
     let configure_params = ConfigureAccountParams {
         account_id: account_id_hex.clone(),
         auth: Auth::MidenFalconRpo {
-            cosigner_pubkeys: vec![pubkey_hex.clone()],
+            cosigner_commitments: vec![commitment_hex],
         },
         initial_state,
         storage_type: StorageType::Filesystem,

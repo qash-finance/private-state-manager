@@ -1,8 +1,8 @@
 use miden_objects::account::AccountId;
 use miden_objects::crypto::dsa::rpo_falcon512::{PublicKey, SecretKey, Signature};
 use miden_objects::crypto::hash::rpo::Rpo256;
-use miden_objects::{Felt, FieldElement, Word};
 use miden_objects::utils::Deserializable;
+use miden_objects::{Felt, FieldElement, Word};
 use private_state_manager_shared::hex::{FromHex, IntoHex};
 
 pub struct FalconRpoSigner {
@@ -67,7 +67,6 @@ pub trait HexIntoWord {
 
 impl HexIntoWord for &str {
     fn hex_into_word(self) -> Result<Word, String> {
-
         let commitment_hex = self.strip_prefix("0x").unwrap_or(self);
 
         let bytes =

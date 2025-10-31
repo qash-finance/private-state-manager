@@ -104,9 +104,9 @@ async fn generate_multisig_fixtures() {
     // Create a TransactionSummary with the delta
     let tx_summary_1 = TransactionSummary::new(
         delta_1,
-        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
-        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
-        Word::from([ZERO; 4]),  // Salt
+        InputNotes::new(Vec::new()).unwrap(), // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(), // No output notes for this test
+        Word::from([ZERO; 4]),                // Salt
     );
 
     let delta_1_fixture = serde_json::json!({
@@ -164,9 +164,9 @@ async fn generate_multisig_fixtures() {
     // Create a TransactionSummary with the delta
     let tx_summary_2 = TransactionSummary::new(
         delta_2,
-        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
-        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
-        Word::from([ZERO; 4]),  // Salt
+        InputNotes::new(Vec::new()).unwrap(), // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(), // No output notes for this test
+        Word::from([ZERO; 4]),                // Salt
     );
 
     let delta_2_fixture = serde_json::json!({
@@ -220,9 +220,9 @@ async fn generate_multisig_fixtures() {
     // Create a TransactionSummary with the delta
     let tx_summary_3 = TransactionSummary::new(
         delta_3,
-        InputNotes::new(Vec::new()).unwrap(),  // No input notes for this test
-        OutputNotes::new(Vec::new()).unwrap(),  // No output notes for this test
-        Word::from([ZERO; 4]),  // Salt
+        InputNotes::new(Vec::new()).unwrap(), // No input notes for this test
+        OutputNotes::new(Vec::new()).unwrap(), // No output notes for this test
+        Word::from([ZERO; 4]),                // Salt
     );
 
     let delta_3_fixture = serde_json::json!({

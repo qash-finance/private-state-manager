@@ -29,8 +29,8 @@ pub fn generate_falcon_keypair(
 /// Derive commitment from public key hex
 pub fn pubkey_to_commitment(pubkey_hex: &str) -> Result<String, String> {
     let pubkey_hex = pubkey_hex.strip_prefix("0x").unwrap_or(pubkey_hex);
-    let pubkey_bytes = hex::decode(pubkey_hex)
-        .map_err(|e| format!("Invalid public key hex: {}", e))?;
+    let pubkey_bytes =
+        hex::decode(pubkey_hex).map_err(|e| format!("Invalid public key hex: {}", e))?;
 
     let public_key = PublicKey::read_from_bytes(&pubkey_bytes)
         .map_err(|e| format!("Failed to deserialize public key: {:?}", e))?;

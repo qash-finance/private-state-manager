@@ -12,12 +12,13 @@ async fn test_canonicalization_discards_mismatched_delta() {
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
     // Step 1: Configure account
     let configure_params = ConfigureAccountParams {
         account_id: account_id_hex.clone(),
         auth: Auth::MidenFalconRpo {
-            cosigner_pubkeys: vec![pubkey_hex.clone()],
+            cosigner_commitments: vec![commitment_hex],
         },
         initial_state,
         storage_type: StorageType::Filesystem,
@@ -123,12 +124,13 @@ async fn test_only_pending_candidates_are_processed() {
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
     // Configure account
     let configure_params = ConfigureAccountParams {
         account_id: account_id_hex.clone(),
         auth: Auth::MidenFalconRpo {
-            cosigner_pubkeys: vec![pubkey_hex.clone()],
+            cosigner_commitments: vec![commitment_hex],
         },
         initial_state,
         storage_type: StorageType::Filesystem,
@@ -196,19 +198,20 @@ async fn test_only_pending_candidates_are_processed() {
     );
 }
 
-/// Test that cosigner public keys are synced from storage to metadata after canonicalization
+/// Test that cosigner commitments are synced from storage to metadata after canonicalization
 #[tokio::test]
 async fn test_canonicalization_syncs_cosigner_pubkeys() {
     let state = create_test_app_state().await;
 
     let (_account_id, account_id_hex, initial_state) = load_fixture_account();
     let (_, pubkey_hex, signature_hex) = generate_falcon_signature(&account_id_hex);
+    let commitment_hex = pubkey_hex_to_commitment_hex(&pubkey_hex);
 
-    // Configure account with initial pubkey
+    // Configure account with initial commitment
     let configure_params = ConfigureAccountParams {
         account_id: account_id_hex.clone(),
         auth: Auth::MidenFalconRpo {
-            cosigner_pubkeys: vec![pubkey_hex.clone()],
+            cosigner_commitments: vec![commitment_hex],
         },
         initial_state,
         storage_type: StorageType::Filesystem,
@@ -226,8 +229,10 @@ async fn test_canonicalization_syncs_cosigner_pubkeys() {
         .expect("Should get metadata")
         .expect("Metadata should exist");
 
-    let initial_pubkeys = match &initial_metadata.auth {
-        Auth::MidenFalconRpo { cosigner_pubkeys } => cosigner_pubkeys.clone(),
+    let initial_commitments = match &initial_metadata.auth {
+        Auth::MidenFalconRpo {
+            cosigner_commitments,
+        } => cosigner_commitments.clone(),
     };
 
     // Push delta 1 (adds 4th approver)
@@ -261,10 +266,10 @@ async fn test_canonicalization_syncs_cosigner_pubkeys() {
     )
     .await;
 
-    // Run canonicalization - should canonicalize the delta and sync pubkeys
+    // Run canonicalization - should canonicalize the delta and sync commitments
     let _ = process_canonicalizations_now(&state).await;
 
-    // Verify metadata was updated with new public keys from storage
+    // Verify metadata was updated with new commitments from storage
     let updated_metadata = state
         .metadata
         .get(&account_id_hex)
@@ -272,18 +277,20 @@ async fn test_canonicalization_syncs_cosigner_pubkeys() {
         .expect("Should get metadata")
         .expect("Metadata should exist");
 
-    let updated_pubkeys = match &updated_metadata.auth {
-        Auth::MidenFalconRpo { cosigner_pubkeys } => cosigner_pubkeys.clone(),
+    let updated_commitments = match &updated_metadata.auth {
+        Auth::MidenFalconRpo {
+            cosigner_commitments,
+        } => cosigner_commitments.clone(),
     };
 
     assert_ne!(
-        initial_pubkeys.len(),
-        updated_pubkeys.len(),
-        "Metadata should have been updated with new pubkeys"
+        initial_commitments.len(),
+        updated_commitments.len(),
+        "Metadata should have been updated with new commitments"
     );
 
     assert_eq!(
-        updated_pubkeys.len(),
+        updated_commitments.len(),
         4,
         "Should have 4 public keys after delta 1 (added 4th approver)"
     );

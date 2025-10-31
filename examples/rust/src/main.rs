@@ -9,7 +9,9 @@ use miden_client::crypto::rpo_falcon512::PublicKey;
 use miden_client::crypto::RpoRandomCoin;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
-use miden_client::{Client, ClientError, Deserializable, ExecutionOptions, Felt, Serializable, Word};
+use miden_client::{
+    Client, ClientError, Deserializable, ExecutionOptions, Felt, Serializable, Word,
+};
 use miden_client_sqlite_store::SqliteStore;
 use miden_objects::{MAX_TX_EXECUTION_CYCLES, MIN_TX_EXECUTION_CYCLES};
 
@@ -37,10 +39,7 @@ fn commitment_from_hex(hex_commitment: &str) -> Result<Word, String> {
         .map_err(|err| format!("Failed to deserialize commitment word '{hex_commitment}': {err}"))
 }
 
-async fn create_miden_client(
-    data_dir: &Path,
-    endpoint: &Endpoint,
-) -> Result<Client<()>, String> {
+async fn create_miden_client(data_dir: &Path, endpoint: &Endpoint) -> Result<Client<()>, String> {
     let store_path = data_dir.join("miden-client.sqlite");
     let store = SqliteStore::new(store_path)
         .await
@@ -93,9 +92,9 @@ async fn main() -> ClientResult<()> {
 
     println!("Setup: Generating keys...");
 
-    let (client1_full_pubkey_hex, client1_commitment_hex, client1_secret_key) =
+    let (_client1_full_pubkey_hex, client1_commitment_hex, client1_secret_key) =
         falcon::generate_falcon_keypair(&keystore);
-    let (client2_full_pubkey_hex, client2_commitment_hex, client2_secret_key) =
+    let (_client2_full_pubkey_hex, client2_commitment_hex, client2_secret_key) =
         falcon::generate_falcon_keypair(&keystore);
 
     println!("  ✓ Client 1 commitment: {}...", &client1_commitment_hex);
@@ -177,9 +176,9 @@ async fn main() -> ClientResult<()> {
 
     let auth_config = AuthConfig {
         auth_type: Some(AuthType::MidenFalconRpo(MidenFalconRpoAuth {
-            cosigner_pubkeys: vec![
-                client1_full_pubkey_hex.clone(),
-                client2_full_pubkey_hex.clone(),
+            cosigner_commitments: vec![
+                client1_commitment_hex.clone(),
+                client2_commitment_hex.clone(),
             ],
         })),
     };
@@ -256,10 +255,14 @@ async fn main() -> ClientResult<()> {
         let (_new_cosigner_full_pubkey_hex, new_cosigner_commitment_hex, _new_cosigner_secret_key) =
             falcon::generate_falcon_keypair(&keystore);
 
-        let signer_commitments = match [&client1_commitment_hex, &client2_commitment_hex, &new_cosigner_commitment_hex]
-            .into_iter()
-            .map(|hex_commitment| commitment_from_hex(hex_commitment))
-            .collect::<Result<Vec<_>, _>>()
+        let signer_commitments = match [
+            &client1_commitment_hex,
+            &client2_commitment_hex,
+            &new_cosigner_commitment_hex,
+        ]
+        .into_iter()
+        .map(|hex_commitment| commitment_from_hex(hex_commitment))
+        .collect::<Result<Vec<_>, _>>()
         {
             Ok(commitments) => commitments,
             Err(err) => {
@@ -268,12 +271,7 @@ async fn main() -> ClientResult<()> {
             }
         };
 
-        let salt = Word::from([
-            Felt::new(42),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
-        ]);
+        let salt = Word::from([Felt::new(42), Felt::new(0), Felt::new(0), Felt::new(0)]);
 
         let (tx_request, _config_hash) = match multisig::build_update_signers_transaction_request(
             3,
@@ -290,7 +288,7 @@ async fn main() -> ClientResult<()> {
 
         let tx_summary = match miden_client.new_transaction(account.id(), tx_request).await {
             Err(ClientError::TransactionExecutorError(
-                miden_client::transaction::TransactionExecutorError::Unauthorized(tx_summary)
+                miden_client::transaction::TransactionExecutorError::Unauthorized(tx_summary),
             )) => {
                 println!("  ✓ Transaction summary created");
                 tx_summary
@@ -373,8 +371,10 @@ async fn main() -> ClientResult<()> {
                     }
                 };
 
-                let cosigner1_signature = AccountSignature::from(client1_secret_key.sign(tx_message));
-                let cosigner2_signature = AccountSignature::from(client2_secret_key.sign(tx_message));
+                let cosigner1_signature =
+                    AccountSignature::from(client1_secret_key.sign(tx_message));
+                let cosigner2_signature =
+                    AccountSignature::from(client2_secret_key.sign(tx_message));
 
                 let mut signature_advice = Vec::new();
                 signature_advice.push(multisig::build_signature_advice_entry(
@@ -393,20 +393,24 @@ async fn main() -> ClientResult<()> {
                     &cosigner2_signature,
                 ));
 
-                let (final_tx_request, _final_config_hash) = match multisig::build_update_signers_transaction_request(
-                    3,
-                    &signer_commitments,
-                    salt,
-                    signature_advice,
-                ) {
-                    Ok(req) => req,
-                    Err(err) => {
-                        println!("  ✗ Failed to build final transaction request: {}", err);
-                        return Ok(());
-                    }
-                };
+                let (final_tx_request, _final_config_hash) =
+                    match multisig::build_update_signers_transaction_request(
+                        3,
+                        &signer_commitments,
+                        salt,
+                        signature_advice,
+                    ) {
+                        Ok(req) => req,
+                        Err(err) => {
+                            println!("  ✗ Failed to build final transaction request: {}", err);
+                            return Ok(());
+                        }
+                    };
 
-                let tx_result = match miden_client.new_transaction(account.id(), final_tx_request).await {
+                let tx_result = match miden_client
+                    .new_transaction(account.id(), final_tx_request)
+                    .await
+                {
                     Ok(result) => result,
                     Err(e) => {
                         println!("  ✗ Execution failed: {}", e);
@@ -414,7 +418,10 @@ async fn main() -> ClientResult<()> {
                     }
                 };
 
-                println!("  ✓ Transaction executed (nonce: {})", tx_result.account_delta().nonce_delta().as_int());
+                println!(
+                    "  ✓ Transaction executed (nonce: {})",
+                    tx_result.account_delta().nonce_delta().as_int()
+                );
             }
             Ok(false) => {
                 println!("  ✗ Invalid PSM signature");

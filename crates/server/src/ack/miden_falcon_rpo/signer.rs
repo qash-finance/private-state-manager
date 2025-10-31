@@ -7,7 +7,7 @@ use miden_objects::{
     transaction::TransactionSummary,
     utils::Serializable,
 };
-use private_state_manager_shared::{hex::IntoHex, FromJson};
+use private_state_manager_shared::{FromJson, hex::IntoHex};
 use rand_chacha::ChaCha20Rng;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,8 +49,9 @@ impl MidenFalconRpoSigner {
     }
 
     pub(crate) fn ack_delta(&self, mut delta: DeltaObject) -> crate::ack::Result<DeltaObject> {
-        let tx_summary = TransactionSummary::from_json(&delta.delta_payload)
-            .map_err(|e| PsmError::InvalidDelta(format!("Failed to deserialize TransactionSummary: {e}")))?;
+        let tx_summary = TransactionSummary::from_json(&delta.delta_payload).map_err(|e| {
+            PsmError::InvalidDelta(format!("Failed to deserialize TransactionSummary: {e}"))
+        })?;
 
         let tx_commitment = tx_summary.to_commitment();
         let signature = self.sign_with_server_key(tx_commitment)?;

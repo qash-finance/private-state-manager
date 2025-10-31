@@ -143,7 +143,7 @@ pub fn create_multisig_psm_account(
     // Create account with both clients as cosigners
     AccountBuilder::new(init_seed)
         .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)  // Use Public mode like the test
+        .storage_mode(AccountStorageMode::Public) // Use Public mode like the test
         .with_auth_component(auth_component)
         .with_component(BasicWallet)
         .build()
@@ -219,8 +219,7 @@ where
     I: IntoIterator<Item = (Word, Vec<Felt>)>,
 {
     let (config_hash, config_values) = build_multisig_config_advice(threshold, signer_commitments);
-    let script = build_update_signers_script()
-        .map_err(|err| MultisigError::Assembly(err))?;
+    let script = build_update_signers_script().map_err(|err| MultisigError::Assembly(err))?;
 
     let request = TransactionRequestBuilder::new()
         .custom_script(script)

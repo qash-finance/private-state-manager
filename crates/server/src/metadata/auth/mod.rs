@@ -13,8 +13,7 @@ pub use credentials::{AuthHeader, Credentials, ExtractCredentials};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum Auth {
     /// Miden Falcon RPO signature scheme
-    /// Contains list of authorized cosigner public keys
-    MidenFalconRpo { cosigner_pubkeys: Vec<String> },
+    MidenFalconRpo { cosigner_commitments: Vec<String> },
 }
 
 impl Auth {
@@ -25,18 +24,18 @@ impl Auth {
     /// * `credentials` - The credentials to verify
     pub fn verify(&self, account_id: &str, credentials: &Credentials) -> Result<(), String> {
         match self {
-            Auth::MidenFalconRpo { cosigner_pubkeys } => {
-                let (pubkey, signature) = credentials
+            Auth::MidenFalconRpo {
+                cosigner_commitments,
+            } => {
+                let (_pubkey, signature) = credentials
                     .as_signature()
                     .ok_or_else(|| "MidenFalconRpo requires signature credentials".to_string())?;
 
-                // Check authorization - pubkey must be in cosigner list
-                if !cosigner_pubkeys.contains(&pubkey.to_string()) {
-                    return Err(format!("Public key '{pubkey}' is not authorized"));
-                }
-
-                // Verify cryptographic signature
-                miden_falcon_rpo::verify_request_signature(account_id, pubkey, signature)
+                miden_falcon_rpo::verify_request_signature(
+                    account_id,
+                    cosigner_commitments,
+                    signature,
+                )
             }
         }
     }
@@ -50,7 +49,7 @@ impl TryFrom<crate::api::grpc::state_manager::AuthConfig> for Auth {
     ) -> Result<Self, Self::Error> {
         match auth_config.auth_type {
             Some(auth_config::AuthType::MidenFalconRpo(miden_auth)) => Ok(Auth::MidenFalconRpo {
-                cosigner_pubkeys: miden_auth.cosigner_pubkeys,
+                cosigner_commitments: miden_auth.cosigner_commitments,
             }),
             None => Err("Auth type not specified".to_string()),
         }

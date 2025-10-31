@@ -2,15 +2,17 @@ use miden_client::ClientError;
 use miden_objects::account::Signature as AccountSignature;
 use miden_objects::crypto::dsa::rpo_falcon512::Signature as RpoFalconSignature;
 use miden_objects::{Felt, Word};
-use private_state_manager_client::{verify_commitment_signature, AuthConfig, MidenFalconRpoAuth, ToJson};
+use private_state_manager_client::{
+    verify_commitment_signature, AuthConfig, MidenFalconRpoAuth, ToJson,
+};
 use private_state_manager_shared::hex::FromHex;
 use rand::RngCore;
 use rustyline::DefaultEditor;
 
 use crate::display::{
-    print_section, print_success, print_waiting, print_keypair_generated,
-    print_account_info, print_storage_overview, print_connection_status, print_full_hex,
-    print_info, shorten_hex,
+    print_account_info, print_connection_status, print_full_hex, print_info,
+    print_keypair_generated, print_section, print_storage_overview, print_success, print_waiting,
+    shorten_hex,
 };
 use crate::falcon::generate_falcon_keypair;
 use crate::helpers::{add_account_and_sync, commitment_from_hex};
@@ -51,17 +53,20 @@ pub async fn action_create_account(
     }
 
     let mut cosigner_commitments = Vec::new();
-    let mut cosigner_pubkeys = Vec::new();
 
     let user_commitment = state.get_commitment_hex()?;
     let user_pubkey = state.get_pubkey_hex()?;
 
     cosigner_commitments.push(user_commitment.to_string());
-    cosigner_pubkeys.push(user_pubkey.to_string());
 
     println!("\nYour public key: {}", shorten_hex(user_pubkey));
-    println!("Your commitment (derived): {}", shorten_hex(user_commitment));
-    println!("\nEnter public keys for other cosigners (commitments will be derived automatically):");
+    println!(
+        "Your commitment (derived): {}",
+        shorten_hex(user_commitment)
+    );
+    println!(
+        "\nEnter public keys for other cosigners (commitments will be derived automatically):"
+    );
 
     use crate::falcon::pubkey_to_commitment;
 
@@ -78,13 +83,13 @@ pub async fn action_create_account(
         println!("    Derived commitment: {}", shorten_hex(&commitment));
 
         cosigner_commitments.push(commitment);
-        cosigner_pubkeys.push(pubkey);
     }
 
     let psm_client = state.get_psm_client_mut()?;
     print_waiting("Fetching PSM server public key");
 
-    let psm_pubkey_hex = psm_client.get_pubkey()
+    let psm_pubkey_hex = psm_client
+        .get_pubkey()
         .await
         .map_err(|e| format!("Failed to get PSM pubkey: {}", e))?;
 
@@ -97,12 +102,8 @@ pub async fn action_create_account(
     rng.fill_bytes(&mut init_seed);
 
     let cosigner_refs: Vec<&str> = cosigner_commitments.iter().map(|s| s.as_str()).collect();
-    let account = create_multisig_psm_account(
-        threshold,
-        &cosigner_refs,
-        &psm_pubkey_hex,
-        init_seed,
-    );
+    let account =
+        create_multisig_psm_account(threshold, &cosigner_refs, &psm_pubkey_hex, init_seed);
 
     print_waiting("Adding account to Miden client");
 
@@ -111,10 +112,12 @@ pub async fn action_create_account(
 
     let account_id = account.id();
     state.set_account(account);
-    state.set_cosigner_pubkeys(cosigner_pubkeys);
     state.cosigner_commitments = cosigner_commitments;
 
-    print_success(&format!("Account created: {}", shorten_hex(&account_id.to_string())));
+    print_success(&format!(
+        "Account created: {}",
+        shorten_hex(&account_id.to_string())
+    ));
 
     Ok(())
 }
@@ -125,9 +128,9 @@ pub async fn action_configure_psm(state: &mut SessionState) -> Result<(), String
     let account = state.get_account()?;
     let account_id = account.id();
 
-    let cosigner_pubkeys = state.get_cosigner_pubkeys().to_vec();
-    if cosigner_pubkeys.is_empty() {
-        return Err("No cosigner public keys found. Create account first.".to_string());
+    let cosigner_commitments = state.cosigner_commitments.clone();
+    if cosigner_commitments.is_empty() {
+        return Err("No cosigner commitments found. Create account first.".to_string());
     }
 
     use base64::Engine;
@@ -136,11 +139,13 @@ pub async fn action_configure_psm(state: &mut SessionState) -> Result<(), String
     let account_base64 = base64::engine::general_purpose::STANDARD.encode(&account_bytes);
 
     let auth_config = AuthConfig {
-        auth_type: Some(private_state_manager_client::auth_config::AuthType::MidenFalconRpo(
-            MidenFalconRpoAuth {
-                cosigner_pubkeys,
-            },
-        )),
+        auth_type: Some(
+            private_state_manager_client::auth_config::AuthType::MidenFalconRpo(
+                MidenFalconRpoAuth {
+                    cosigner_commitments,
+                },
+            ),
+        ),
     };
 
     let initial_state = serde_json::json!({
@@ -177,8 +182,8 @@ pub async fn action_pull_from_psm(
     print_section("Pull Account from PSM");
 
     let account_id_hex = prompt_input(editor, "Enter account ID: ")?;
-    let account_id = AccountId::from_hex(&account_id_hex)
-        .map_err(|e| format!("Invalid account ID: {}", e))?;
+    let account_id =
+        AccountId::from_hex(&account_id_hex).map_err(|e| format!("Invalid account ID: {}", e))?;
 
     print_waiting("Configuring PSM authentication");
     state.configure_psm_auth()?;
@@ -186,13 +191,15 @@ pub async fn action_pull_from_psm(
     print_waiting("Fetching account from PSM");
 
     let psm_client = state.get_psm_client_mut()?;
-    let account_state_response = psm_client.get_state(&account_id)
+    let account_state_response = psm_client
+        .get_state(&account_id)
         .await
         .map_err(|e| format!("Failed to get account state: {}", e))?;
 
     print_waiting("Deserializing account data");
 
-    let state_json = account_state_response.state
+    let state_json = account_state_response
+        .state
         .ok_or_else(|| "No state returned from PSM".to_string())?
         .state_json;
 
@@ -243,13 +250,17 @@ pub async fn action_pull_deltas_from_psm(state: &mut SessionState) -> Result<(),
     print_waiting(&format!("Fetching deltas since nonce {}", current_nonce));
 
     let psm_client = state.get_psm_client_mut()?;
-    let delta_response = psm_client.get_delta_since(&account_id, current_nonce)
+    let delta_response = psm_client
+        .get_delta_since(&account_id, current_nonce)
         .await
         .map_err(|e| format!("Failed to get deltas: {}", e))?;
 
     if let Some(merged_delta) = delta_response.merged_delta {
         println!("\nReceived merged delta:");
-        println!("  Delta payload: {} bytes", merged_delta.delta_payload.len());
+        println!(
+            "  Delta payload: {} bytes",
+            merged_delta.delta_payload.len()
+        );
 
         print_success("Deltas pulled successfully");
         print_info("Note: Apply delta functionality not yet implemented");
@@ -283,18 +294,29 @@ pub async fn action_add_cosigner(
     let new_cosigner_commitment_hex = pubkey_to_commitment(&new_cosigner_pubkey_hex)?;
     let new_cosigner_commitment = commitment_from_hex(&new_cosigner_commitment_hex)?;
 
-    println!("  Derived commitment: {}", shorten_hex(&new_cosigner_commitment_hex));
+    println!(
+        "  Derived commitment: {}",
+        shorten_hex(&new_cosigner_commitment_hex)
+    );
 
     // Get current cosigner commitments from storage
     let storage = account.storage();
-    let config_word = storage.get_item(0)
+    let config_word = storage
+        .get_item(0)
         .map_err(|e| format!("Failed to get multisig config: {}", e))?;
 
     let current_threshold = config_word[0].as_int();
     let current_num_cosigners = config_word[1].as_int();
 
-    print_info(&format!("Current config: {}-of-{}", current_threshold, current_num_cosigners));
-    print_info(&format!("New config will be: {}-of-{}", current_threshold + 1, current_num_cosigners + 1));
+    print_info(&format!(
+        "Current config: {}-of-{}",
+        current_threshold, current_num_cosigners
+    ));
+    print_info(&format!(
+        "New config will be: {}-of-{}",
+        current_threshold + 1,
+        current_num_cosigners + 1
+    ));
 
     // Extract existing commitments from account storage (Slot 1)
     use crate::account_inspector::AccountInspector;
@@ -309,7 +331,10 @@ pub async fn action_add_cosigner(
         ));
     }
 
-    print_info(&format!("Extracted {} existing commitments from account storage", existing_commitments_hex.len()));
+    print_info(&format!(
+        "Extracted {} existing commitments from account storage",
+        existing_commitments_hex.len()
+    ));
 
     let mut signer_commitments: Vec<Word> = existing_commitments_hex
         .iter()
@@ -321,7 +346,9 @@ pub async fn action_add_cosigner(
 
     // Update stored commitments for future use
     state.cosigner_commitments = existing_commitments_hex.clone();
-    state.cosigner_commitments.push(new_cosigner_commitment_hex.clone());
+    state
+        .cosigner_commitments
+        .push(new_cosigner_commitment_hex.clone());
 
     let new_threshold = current_threshold + 1;
 
@@ -346,9 +373,12 @@ pub async fn action_add_cosigner(
     print_waiting("Simulating transaction to get summary");
 
     let miden_client = state.get_miden_client_mut()?;
-    let tx_summary = match miden_client.new_transaction(account_id, tx_request.clone()).await {
+    let tx_summary = match miden_client
+        .new_transaction(account_id, tx_request.clone())
+        .await
+    {
         Err(ClientError::TransactionExecutorError(
-            miden_client::transaction::TransactionExecutorError::Unauthorized(summary)
+            miden_client::transaction::TransactionExecutorError::Unauthorized(summary),
         )) => {
             print_success("Transaction summary created via simulation");
             summary
@@ -371,7 +401,8 @@ pub async fn action_add_cosigner(
 
     // Get PSM commitment for later
     let psm_client = state.get_psm_client_mut()?;
-    let psm_pubkey_hex = psm_client.get_pubkey()
+    let psm_pubkey_hex = psm_client
+        .get_pubkey()
         .await
         .map_err(|e| format!("Failed to get PSM pubkey: {}", e))?;
     let psm_commitment_hex = psm_pubkey_hex.clone();
@@ -386,8 +417,8 @@ pub async fn action_add_cosigner(
     let user_signature_hex = format!("0x{}", hex::encode(user_signature.to_bytes()));
 
     use crate::pending_tx::PendingTransaction;
-    use std::collections::HashMap;
     use miden_client::Serializable;
+    use std::collections::HashMap;
 
     let mut collected_signatures = HashMap::new();
     collected_signatures.insert(user_commitment_hex.to_string(), user_signature_hex.clone());
@@ -395,7 +426,8 @@ pub async fn action_add_cosigner(
     let salt_hex = format!("0x{}", hex::encode(salt.to_bytes()));
 
     // All commitments for the final transaction (including new cosigner)
-    let signer_commitments_hex: Vec<String> = signer_commitments.iter()
+    let signer_commitments_hex: Vec<String> = signer_commitments
+        .iter()
         .map(|w| format!("0x{}", hex::encode(w.to_bytes())))
         .collect();
 
@@ -419,18 +451,32 @@ pub async fn action_add_cosigner(
         collected_signatures,
     };
 
-    state.pending_tx_store.save(&pending_tx)
+    state
+        .pending_tx_store
+        .save(&pending_tx)
         .map_err(|e| format!("Failed to save pending transaction: {}", e))?;
 
     print_success("Transaction summary created and stored locally");
-    print_success(&format!("Automatically signed with your key ({})", shorten_hex(user_commitment_hex)));
-    print_full_hex("\nTransaction Summary Commitment", &tx_summary_commitment_hex);
+    print_success(&format!(
+        "Automatically signed with your key ({})",
+        shorten_hex(user_commitment_hex)
+    ));
+    print_full_hex(
+        "\nTransaction Summary Commitment",
+        &tx_summary_commitment_hex,
+    );
 
-    print_info(&format!("\nSignatures collected: 1/{}", current_num_cosigners));
+    print_info(&format!(
+        "\nSignatures collected: 1/{}",
+        current_num_cosigners
+    ));
     print_info("\nNext steps:");
     print_info("  1. Share the commitment above with other cosigners");
     print_info("  2. Other cosigners use option [7] 'Sign pending transaction'");
-    print_info(&format!("  3. Once you have {}/{} signatures, use option [8] 'Finalize pending transaction'", current_num_cosigners, current_num_cosigners));
+    print_info(&format!(
+        "  3. Once you have {}/{} signatures, use option [8] 'Finalize pending transaction'",
+        current_num_cosigners, current_num_cosigners
+    ));
 
     Ok(())
 }
@@ -439,16 +485,31 @@ pub async fn action_sign_transaction(state: &mut SessionState) -> Result<(), Str
     print_section("Sign Pending Transaction");
 
     // Load pending transaction
-    let pending_tx = state.pending_tx_store.load()
+    let pending_tx = state
+        .pending_tx_store
+        .load()
         .map_err(|e| format!("Failed to load pending transaction: {}", e))?;
 
-    print_full_hex("Transaction Summary Commitment", &pending_tx.tx_summary_commitment_hex);
+    print_full_hex(
+        "Transaction Summary Commitment",
+        &pending_tx.tx_summary_commitment_hex,
+    );
 
     // Check if already signed
     let user_commitment_hex = state.get_commitment_hex()?;
-    if pending_tx.collected_signatures.contains_key(user_commitment_hex) {
-        print_info(&format!("You have already signed this transaction (commitment: {})", shorten_hex(user_commitment_hex)));
-        print_info(&format!("Signatures collected: {}/{}", pending_tx.collected_signatures.len(), pending_tx.signers_required_hex.len()));
+    if pending_tx
+        .collected_signatures
+        .contains_key(user_commitment_hex)
+    {
+        print_info(&format!(
+            "You have already signed this transaction (commitment: {})",
+            shorten_hex(user_commitment_hex)
+        ));
+        print_info(&format!(
+            "Signatures collected: {}/{}",
+            pending_tx.collected_signatures.len(),
+            pending_tx.signers_required_hex.len()
+        ));
         return Ok(());
     }
 
@@ -465,18 +526,31 @@ pub async fn action_sign_transaction(state: &mut SessionState) -> Result<(), Str
     let user_signature_hex = format!("0x{}", hex::encode(user_signature.to_bytes()));
 
     // Add signature to pending transaction
-    state.pending_tx_store.add_signature(user_commitment_hex.to_string(), user_signature_hex)
+    state
+        .pending_tx_store
+        .add_signature(user_commitment_hex.to_string(), user_signature_hex)
         .map_err(|e| format!("Failed to add signature: {}", e))?;
 
-    print_success(&format!("Signed with your key ({})", shorten_hex(user_commitment_hex)));
+    print_success(&format!(
+        "Signed with your key ({})",
+        shorten_hex(user_commitment_hex)
+    ));
 
     // Reload to show updated count
-    let updated_pending_tx = state.pending_tx_store.load()
+    let updated_pending_tx = state
+        .pending_tx_store
+        .load()
         .map_err(|e| format!("Failed to reload pending transaction: {}", e))?;
 
-    print_info(&format!("Signatures collected: {}/{}", updated_pending_tx.collected_signatures.len(), updated_pending_tx.signers_required_hex.len()));
+    print_info(&format!(
+        "Signatures collected: {}/{}",
+        updated_pending_tx.collected_signatures.len(),
+        updated_pending_tx.signers_required_hex.len()
+    ));
 
-    if updated_pending_tx.collected_signatures.len() >= updated_pending_tx.signers_required_hex.len() {
+    if updated_pending_tx.collected_signatures.len()
+        >= updated_pending_tx.signers_required_hex.len()
+    {
         print_success("\n✓ All signatures collected!");
         print_info("The proposer can now use option [8] 'Finalize pending transaction'");
     }
@@ -490,10 +564,16 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     print_section("Finalize Pending Transaction");
 
     // Load pending transaction
-    let pending_tx = state.pending_tx_store.load()
+    let pending_tx = state
+        .pending_tx_store
+        .load()
         .map_err(|e| format!("Failed to load pending transaction: {}", e))?;
 
-    print_info(&format!("Signatures collected: {}/{}", pending_tx.collected_signatures.len(), pending_tx.signers_required_hex.len()));
+    print_info(&format!(
+        "Signatures collected: {}/{}",
+        pending_tx.collected_signatures.len(),
+        pending_tx.signers_required_hex.len()
+    ));
 
     // Check if we have all signatures from cosigners
     if pending_tx.collected_signatures.len() < pending_tx.signers_required_hex.len() {
@@ -514,18 +594,20 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     let account_id = account.id();
 
     // Parse the tx_summary JSON string back to a serde_json::Value
-    let tx_summary_payload: serde_json::Value = serde_json::from_str(&pending_tx.tx_summary_json)
-        .map_err(|e| format!("Failed to parse tx summary JSON: {}", e))?;
+    let tx_summary_payload: serde_json::Value =
+        serde_json::from_str(&pending_tx.tx_summary_json)
+            .map_err(|e| format!("Failed to parse tx summary JSON: {}", e))?;
 
     let psm_client = state.get_psm_client_mut()?;
-    let push_response = psm_client.push_delta(
-        &account_id,
-        pending_tx.current_nonce,
-        pending_tx.prev_commitment.clone(),
-        tx_summary_payload,
-    )
-    .await
-    .map_err(|e| format!("Failed to push delta to PSM: {}", e))?;
+    let push_response = psm_client
+        .push_delta(
+            &account_id,
+            pending_tx.current_nonce,
+            pending_tx.prev_commitment.clone(),
+            tx_summary_payload,
+        )
+        .await
+        .map_err(|e| format!("Failed to push delta to PSM: {}", e))?;
 
     print_success(&format!("Delta pushed to PSM: {}", push_response.message));
 
@@ -548,7 +630,8 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     let tx_summary_commitment_hex = &pending_tx.tx_summary_commitment_hex;
 
     // Add PSM signature
-    let psm_pubkey_hex = psm_client.get_pubkey()
+    let psm_pubkey_hex = psm_client
+        .get_pubkey()
         .await
         .map_err(|e| format!("Failed to get PSM pubkey: {}", e))?;
 
@@ -559,8 +642,12 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     };
 
     // Verify PSM signature
-    verify_commitment_signature(tx_summary_commitment_hex, &psm_pubkey_hex, &ack_sig_with_prefix)
-        .map_err(|e| format!("PSM signature verification failed: {}", e))?;
+    verify_commitment_signature(
+        tx_summary_commitment_hex,
+        &psm_pubkey_hex,
+        &ack_sig_with_prefix,
+    )
+    .map_err(|e| format!("PSM signature verification failed: {}", e))?;
 
     let ack_signature = RpoFalconSignature::from_hex(&ack_sig_with_prefix)
         .map_err(|e| format!("Failed to parse PSM signature: {}", e))?;
@@ -574,8 +661,16 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
 
     // Add all collected cosigner signatures (only from signers_required, not including new cosigner)
     for (i, commitment_hex) in pending_tx.signers_required_hex.iter().enumerate() {
-        let sig_hex = pending_tx.collected_signatures.get(commitment_hex)
-            .ok_or_else(|| format!("Missing signature for cosigner {} (commitment: {})", i + 1, shorten_hex(commitment_hex)))?;
+        let sig_hex = pending_tx
+            .collected_signatures
+            .get(commitment_hex)
+            .ok_or_else(|| {
+                format!(
+                    "Missing signature for cosigner {} (commitment: {})",
+                    i + 1,
+                    shorten_hex(commitment_hex)
+                )
+            })?;
 
         let sig = RpoFalconSignature::from_hex(sig_hex)
             .map_err(|e| format!("Invalid signature from cosigner {}: {}", i + 1, e))?;
@@ -588,8 +683,11 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
         ));
     }
 
-    print_success(&format!("Built signature advice with {} signatures (PSM + {} cosigners)",
-        signature_advice.len(), pending_tx.signers_required_hex.len()));
+    print_success(&format!(
+        "Built signature advice with {} signatures (PSM + {} cosigners)",
+        signature_advice.len(),
+        pending_tx.signers_required_hex.len()
+    ));
 
     // Step 3: Build final transaction and execute on-chain
     print_waiting("Building final transaction request");
@@ -609,20 +707,30 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     print_waiting("Executing transaction on-chain");
 
     let miden_client = state.get_miden_client_mut()?;
-    let tx_result = miden_client.new_transaction(account_id, final_tx_request).await
+    let tx_result = miden_client
+        .new_transaction(account_id, final_tx_request)
+        .await
         .map_err(|e| format!("Transaction execution failed: {}", e))?;
 
     let new_nonce = tx_result.account_delta().nonce_delta().as_int();
 
-    print_success(&format!("✓ Transaction finalized! New nonce: {}", new_nonce));
-    print_info(&format!("New configuration: {}-of-{}", pending_tx.new_threshold, pending_tx.signer_commitments_hex.len()));
+    print_success(&format!(
+        "✓ Transaction finalized! New nonce: {}",
+        new_nonce
+    ));
+    print_info(&format!(
+        "New configuration: {}-of-{}",
+        pending_tx.new_threshold,
+        pending_tx.signer_commitments_hex.len()
+    ));
 
     // Step 4: Update PSM auth configuration with new cosigner list
     print_waiting("Updating PSM authentication configuration");
 
     // First, get current public keys from PSM metadata
     let psm_client = state.get_psm_client_mut()?;
-    let state_response = psm_client.get_state(&account_id)
+    let state_response = psm_client
+        .get_state(&account_id)
         .await
         .map_err(|e| format!("Failed to get PSM state: {}", e))?;
 
@@ -632,8 +740,9 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     // and match them with the public keys we have
 
     // Parse the updated account state from PSM
-    let state_json: serde_json::Value = serde_json::from_str(&state_response.state.unwrap().state_json)
-        .map_err(|e| format!("Failed to parse state JSON: {}", e))?;
+    let state_json: serde_json::Value =
+        serde_json::from_str(&state_response.state.unwrap().state_json)
+            .map_err(|e| format!("Failed to parse state JSON: {}", e))?;
 
     // Extract updated commitments from storage slot 1
     use crate::account_inspector::AccountInspector;
@@ -647,8 +756,12 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     // For a production system, we should retrieve this from PSM metadata or store it locally
     // For the demo, we'll note that configure_auth will fail if we don't have all pubkeys
 
-    print_info(&format!("Note: This is a demo limitation - we only have the new cosigner's public key"));
-    print_info(&format!("In production, retrieve all public keys from PSM metadata or local storage"));
+    print_info(&format!(
+        "Note: This is a demo limitation - we only have the new cosigner's public key"
+    ));
+    print_info(&format!(
+        "In production, retrieve all public keys from PSM metadata or local storage"
+    ));
     print_info(&format!("Skipping PSM auth config update for now"));
 
     // TODO: Implement proper public key retrieval from PSM or local storage
@@ -670,7 +783,9 @@ pub async fn action_finalize_pending_transaction(state: &mut SessionState) -> Re
     // print_success("PSM authentication configuration updated successfully");
 
     // Clear pending transaction
-    state.pending_tx_store.clear()
+    state
+        .pending_tx_store
+        .clear()
         .map_err(|e| format!("Failed to clear pending transaction: {}", e))?;
 
     print_info("Pending transaction cleared");
@@ -693,7 +808,10 @@ pub async fn action_show_status(state: &SessionState) -> Result<(), String> {
 
     if state.has_account() {
         let account_id = state.get_account_id()?;
-        println!("\n  Current Account: {}", shorten_hex(&account_id.to_string()));
+        println!(
+            "\n  Current Account: {}",
+            shorten_hex(&account_id.to_string())
+        );
     } else {
         println!("\n  No account loaded");
     }

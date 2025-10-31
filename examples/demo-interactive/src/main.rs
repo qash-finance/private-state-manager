@@ -12,20 +12,19 @@ use miden_client::rpc::Endpoint;
 use rustyline::DefaultEditor;
 
 use actions::{
-    action_generate_keypair, action_create_account, action_configure_psm,
-    action_pull_from_psm, action_pull_deltas_from_psm, action_add_cosigner,
-    action_sign_transaction, action_finalize_pending_transaction,
-    action_show_account, action_show_status,
+    action_add_cosigner, action_configure_psm, action_create_account,
+    action_finalize_pending_transaction, action_generate_keypair, action_pull_deltas_from_psm,
+    action_pull_from_psm, action_show_account, action_show_status, action_sign_transaction,
 };
-use display::{print_banner, print_section, print_success, print_error, print_waiting};
-use menu::{parse_menu_choice, MenuAction, handle_invalid_choice};
+use display::{print_banner, print_error, print_section, print_success, print_waiting};
+use menu::{handle_invalid_choice, parse_menu_choice, MenuAction};
 use state::SessionState;
 
 async fn startup() -> Result<SessionState, String> {
     print_banner();
 
-    let mut editor = DefaultEditor::new()
-        .map_err(|e| format!("Failed to create input editor: {}", e))?;
+    let mut editor =
+        DefaultEditor::new().map_err(|e| format!("Failed to create input editor: {}", e))?;
 
     print_section("Configuration");
 
@@ -64,8 +63,7 @@ async fn startup() -> Result<SessionState, String> {
 
         let (host, port) = if rest.contains(':') {
             let parts: Vec<&str> = rest.split(':').collect();
-            let port = parts[1].parse::<u16>()
-                .map_err(|_| "Invalid port number")?;
+            let port = parts[1].parse::<u16>().map_err(|_| "Invalid port number")?;
             (parts[0].to_string(), Some(port))
         } else {
             (rest.to_string(), None)
@@ -75,10 +73,18 @@ async fn startup() -> Result<SessionState, String> {
     };
 
     println!("\n  PSM Server: {}", psm_endpoint);
-    println!("  Miden Node: {}://{}{}",
-        if matches!(miden_endpoint.port(), Some(443)) { "https" } else { "http" },
+    println!(
+        "  Miden Node: {}://{}{}",
+        if matches!(miden_endpoint.port(), Some(443)) {
+            "https"
+        } else {
+            "http"
+        },
         miden_endpoint.host(),
-        miden_endpoint.port().map(|p| format!(":{}", p)).unwrap_or_default()
+        miden_endpoint
+            .port()
+            .map(|p| format!(":{}", p))
+            .unwrap_or_default()
     );
 
     let mut state = SessionState::new(psm_endpoint, miden_endpoint)?;
@@ -98,20 +104,20 @@ async fn handle_action(action: MenuAction, state: &mut SessionState) -> Result<(
     match action {
         MenuAction::GenerateKeypair => action_generate_keypair(state).await,
         MenuAction::CreateAccount => {
-            let mut editor = DefaultEditor::new()
-                .map_err(|e| format!("Failed to create editor: {}", e))?;
+            let mut editor =
+                DefaultEditor::new().map_err(|e| format!("Failed to create editor: {}", e))?;
             action_create_account(state, &mut editor).await
         }
         MenuAction::ConfigurePsm => action_configure_psm(state).await,
         MenuAction::PullFromPsm => {
-            let mut editor = DefaultEditor::new()
-                .map_err(|e| format!("Failed to create editor: {}", e))?;
+            let mut editor =
+                DefaultEditor::new().map_err(|e| format!("Failed to create editor: {}", e))?;
             action_pull_from_psm(state, &mut editor).await
         }
         MenuAction::PullDeltasFromPsm => action_pull_deltas_from_psm(state).await,
         MenuAction::AddCosigner => {
-            let mut editor = DefaultEditor::new()
-                .map_err(|e| format!("Failed to create editor: {}", e))?;
+            let mut editor =
+                DefaultEditor::new().map_err(|e| format!("Failed to create editor: {}", e))?;
             action_add_cosigner(state, &mut editor).await
         }
         MenuAction::SignTransaction => action_sign_transaction(state).await,
@@ -135,8 +141,7 @@ async fn main() {
         }
     };
 
-    let mut editor = DefaultEditor::new()
-        .expect("Failed to create editor");
+    let mut editor = DefaultEditor::new().expect("Failed to create editor");
 
     loop {
         menu::print_menu(&state);
