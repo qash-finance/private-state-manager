@@ -180,6 +180,6 @@ pub struct PubkeyResponse {
 }
 
 pub async fn get_pubkey(State(state): State<AppState>) -> (StatusCode, Json<PubkeyResponse>) {
-    let pubkey = state.ack.pubkey();
+    let pubkey = state.ack.commitment();
     (StatusCode::OK, Json(PubkeyResponse { pubkey }))
 }

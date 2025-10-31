@@ -14,10 +14,17 @@ pub enum Acknowledger {
 }
 
 impl Acknowledger {
-    /// Get the server's public key as a hex string
+    /// Get the server's public key as a hex string (deprecated - use commitment() instead)
     pub fn pubkey(&self) -> String {
         match self {
             Acknowledger::FilesystemMidenFalconRpo(signer) => signer.pubkey_hex(),
+        }
+    }
+
+    /// Get the server's public key commitment as a hex string
+    pub fn commitment(&self) -> String {
+        match self {
+            Acknowledger::FilesystemMidenFalconRpo(signer) => signer.commitment_hex(),
         }
     }
 

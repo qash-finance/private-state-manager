@@ -2,7 +2,6 @@ mod falcon;
 mod multisig;
 
 use miden_client::account::Account;
-use miden_client::crypto::rpo_falcon512::PublicKey;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::testing::MockChainBuilder;
 use miden_client::transaction::TransactionExecutorError;
@@ -69,25 +68,20 @@ async fn main() -> ClientResult<()> {
         }
     };
 
-    let server_ack_pubkey = match client1.get_pubkey().await {
-        Ok(pubkey) => {
+    let server_commitment_hex = match client1.get_pubkey().await {
+        Ok(commitment) => {
             println!("  ✓ Connected to PSM server");
-            pubkey
+            println!("  ✓ Server commitment: {}...", &commitment[..18]);
+            commitment
         }
         Err(e) => {
-            println!("  ✗ Failed to get server pubkey: {}", e);
+            println!("  ✗ Failed to get server commitment: {}", e);
             return Ok(());
         }
     };
 
-    let server_pubkey_bytes =
-        hex::decode(&server_ack_pubkey[2..]).expect("Failed to decode server public key");
-    let server_pubkey = PublicKey::read_from_bytes(&server_pubkey_bytes)
-        .expect("Failed to deserialize server public key");
-    let server_commitment = server_pubkey.to_commitment();
-    let server_commitment_hex = format!("0x{}", hex::encode(server_commitment.to_bytes()));
-
-    println!("  ✓ Server commitment: {}...", &server_commitment_hex);
+    let server_commitment =
+        commitment_from_hex(&server_commitment_hex).expect("Failed to parse server commitment");
     println!();
 
     println!("Step 2: Creating multisig PSM account...");
@@ -321,7 +315,7 @@ async fn main() -> ClientResult<()> {
 
         match verify_commitment_signature(
             &tx_summary_commitment_hex,
-            &server_ack_pubkey,
+            &server_commitment_hex,
             &ack_sig_with_prefix,
         ) {
             Ok(true) => {

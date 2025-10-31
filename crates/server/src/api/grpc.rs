@@ -211,7 +211,7 @@ impl StateManager for StateManagerService {
         &self,
         _request: Request<GetPubkeyRequest>,
     ) -> Result<Response<GetPubkeyResponse>, Status> {
-        let pubkey = self.app_state.ack.pubkey();
+        let pubkey = self.app_state.ack.commitment();
         Ok(Response::new(GetPubkeyResponse { pubkey }))
     }
 }

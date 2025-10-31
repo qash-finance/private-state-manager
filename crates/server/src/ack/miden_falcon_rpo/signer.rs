@@ -48,6 +48,11 @@ impl MidenFalconRpoSigner {
         self.pubkey().into_hex()
     }
 
+    pub(crate) fn commitment_hex(&self) -> String {
+        let commitment = self.pubkey().to_commitment();
+        format!("0x{}", hex::encode(commitment.to_bytes()))
+    }
+
     pub(crate) fn ack_delta(&self, mut delta: DeltaObject) -> crate::ack::Result<DeltaObject> {
         let tx_summary = TransactionSummary::from_json(&delta.delta_payload).map_err(|e| {
             PsmError::InvalidDelta(format!("Failed to deserialize TransactionSummary: {e}"))

@@ -1,7 +1,7 @@
 use miden_objects::account::AccountId;
 use miden_objects::crypto::dsa::rpo_falcon512::{PublicKey, SecretKey, Signature};
 use miden_objects::crypto::hash::rpo::Rpo256;
-use miden_objects::utils::Deserializable;
+use miden_objects::utils::{Deserializable, Serializable};
 use miden_objects::{Felt, FieldElement, Word};
 use private_state_manager_shared::hex::{FromHex, IntoHex};
 
@@ -49,15 +49,28 @@ impl IntoWord for AccountId {
     }
 }
 
+/// Verify a signature using commitment-based authentication
 pub fn verify_commitment_signature(
     commitment_hex: &str,
-    server_pubkey_hex: &str,
+    server_commitment_hex: &str,
     signature_hex: &str,
 ) -> Result<bool, String> {
     let message = commitment_hex.hex_into_word()?;
-    let pubkey = PublicKey::from_hex(server_pubkey_hex)?;
     let signature = Signature::from_hex(signature_hex)?;
 
+    // Extract the public key from the signature
+    let pubkey = signature.public_key();
+
+    // Compute the commitment of the extracted public key
+    let sig_pubkey_commitment = pubkey.to_commitment();
+    let sig_commitment_hex = format!("0x{}", hex::encode(sig_pubkey_commitment.to_bytes()));
+
+    // Check if the computed commitment matches the expected server commitment
+    if sig_commitment_hex != server_commitment_hex {
+        return Ok(false);
+    }
+
+    // Verify the signature cryptographically
     Ok(pubkey.verify(message, &signature))
 }
 
