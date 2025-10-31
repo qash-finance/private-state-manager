@@ -1,17 +1,14 @@
 mod falcon;
 mod multisig;
 
-use std::path::Path;
-use std::sync::Arc;
-
+use miden_client::testing::MockChainBuilder;
+use miden_client::transaction::TransactionExecutorError;
 use miden_client::account::Account;
 use miden_client::crypto::rpo_falcon512::PublicKey;
-use miden_client::crypto::RpoRandomCoin;
 use miden_client::keystore::FilesystemKeyStore;
-use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
-use miden_client::{Client, ClientError, Deserializable, ExecutionOptions, Felt, Serializable, Word};
-use miden_client_sqlite_store::SqliteStore;
-use miden_objects::{MAX_TX_EXECUTION_CYCLES, MIN_TX_EXECUTION_CYCLES};
+use miden_client::{Deserializable, Felt, Serializable, Word};
+use miden_client::vm::{AdviceInputs, AdviceMap};
+
 
 use miden_objects::account::Signature as AccountSignature;
 use miden_objects::crypto::dsa::rpo_falcon512::Signature as RawFalconSignature;
@@ -28,7 +25,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use tempfile::TempDir;
 
-fn commitment_from_hex(hex_commitment: &str) -> Result<Word, String> {
+/// Converts a hex-encoded public key commitment (with or without 0x prefix) into a `Word`.
+pub fn commitment_from_hex(hex_commitment: &str) -> Result<Word, String> {
     let trimmed = hex_commitment.strip_prefix("0x").unwrap_or(hex_commitment);
     let bytes = hex::decode(trimmed)
         .map_err(|err| format!("Failed to decode commitment hex '{hex_commitment}': {err}"))?;
@@ -37,54 +35,9 @@ fn commitment_from_hex(hex_commitment: &str) -> Result<Word, String> {
         .map_err(|err| format!("Failed to deserialize commitment word '{hex_commitment}': {err}"))
 }
 
-async fn create_miden_client(
-    data_dir: &Path,
-    endpoint: &Endpoint,
-) -> Result<Client<()>, String> {
-    let store_path = data_dir.join("miden-client.sqlite");
-    let store = SqliteStore::new(store_path)
-        .await
-        .map_err(|err| format!("Failed to open SQLite store: {err}"))?;
-    let store = Arc::new(store);
-
-    let rng = Box::new(RpoRandomCoin::new(Word::default()));
-    let exec_options = ExecutionOptions::new(
-        Some(MAX_TX_EXECUTION_CYCLES),
-        MIN_TX_EXECUTION_CYCLES,
-        false,
-        true,
-    )
-    .map_err(|err| format!("Failed to build execution options: {err}"))?;
-
-    let grpc_client = GrpcClient::new(endpoint, 10_000);
-    let rpc_client: Arc<dyn NodeRpcClient> = Arc::new(grpc_client);
-
-    Client::new(
-        rpc_client,
-        rng,
-        store,
-        None,
-        exec_options,
-        Some(20),
-        Some(256),
-        None,
-    )
-    .await
-    .map_err(|err| format!("Failed to create Miden client: {err}"))
-}
-
-async fn add_account_and_sync(
-    client: &mut Client<()>,
-    account: &Account,
-) -> Result<(), ClientError> {
-    client.add_account(account, false).await?;
-    client.sync_state().await?;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> ClientResult<()> {
-    println!("=== PSM Multi-Client E2E Flow ===\n");
+    println!("=== PSM Multi-Client E2E Flow (MockChain) ===\n");
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let rng = ChaCha20Rng::from_seed([42u8; 32]);
@@ -102,22 +55,22 @@ async fn main() -> ClientResult<()> {
     println!("  ✓ Client 2 commitment: {}...", &client2_commitment_hex);
     println!();
 
-    println!("Step 1: Connect to PSM and Miden node...");
+    println!("Step 1: Connect to PSM and get server's public key...");
 
     let client1_signer = FalconRpoSigner::new(client1_secret_key.clone());
     let client1_auth = Auth::FalconRpoSigner(client1_signer);
 
     let psm_endpoint = "http://localhost:50051".to_string();
-    let mut psm_client1 = match PsmClient::connect(psm_endpoint.clone()).await {
+    let mut client1 = match PsmClient::connect(psm_endpoint.clone()).await {
         Ok(client) => client.with_auth(client1_auth),
         Err(e) => {
-            println!("  ✗ Failed to connect to PSM: {}", e);
+            println!("  ✗ Failed to connect: {}", e);
             println!("  Hint: Start PSM server with: cargo run --package private-state-manager-server --bin server");
             return Ok(());
         }
     };
 
-    let server_ack_pubkey = match psm_client1.get_pubkey().await {
+    let server_ack_pubkey = match client1.get_pubkey().await {
         Ok(pubkey) => {
             println!("  ✓ Connected to PSM server");
             pubkey
@@ -136,20 +89,6 @@ async fn main() -> ClientResult<()> {
     let server_commitment_hex = format!("0x{}", hex::encode(server_commitment.to_bytes()));
 
     println!("  ✓ Server commitment: {}...", &server_commitment_hex);
-
-    let miden_endpoint = Endpoint::new("http".to_string(), "localhost".to_string(), Some(57291));
-
-    let mut miden_client = match create_miden_client(temp_dir.path(), &miden_endpoint).await {
-        Ok(client) => {
-            println!("  ✓ Connected to Miden node");
-            client
-        }
-        Err(e) => {
-            println!("  ✗ Failed to create Miden client: {}", e);
-            println!("  Hint: Start Miden node on port 57291");
-            return Ok(());
-        }
-    };
     println!();
 
     println!("Step 2: Creating multisig PSM account...");
@@ -165,12 +104,6 @@ async fn main() -> ClientResult<()> {
     let account_id = account.id();
     println!("  ✓ Account ID: {}", account_id);
     println!("  ✓ Multisig: 2-of-2 with PSM");
-
-    if let Err(e) = add_account_and_sync(&mut miden_client, &account).await {
-        println!("  ✗ Failed to add account to Miden client: {}", e);
-        return Ok(());
-    }
-    println!("  ✓ Account synced with Miden node");
     println!();
 
     println!("Step 3: Client 1 - Configure account in PSM...");
@@ -193,7 +126,7 @@ async fn main() -> ClientResult<()> {
         "account_id": account_id.to_string(),
     });
 
-    match psm_client1
+    match client1
         .configure(&account_id, auth_config, initial_state, "Filesystem")
         .await
     {
@@ -212,12 +145,12 @@ async fn main() -> ClientResult<()> {
     let client2_signer = FalconRpoSigner::new(client2_secret_key.clone());
     let client2_auth = Auth::FalconRpoSigner(client2_signer);
 
-    let mut psm_client2 = PsmClient::connect(psm_endpoint.clone())
+    let mut client2 = PsmClient::connect(psm_endpoint.clone())
         .await
         .expect("Failed to connect")
         .with_auth(client2_auth);
 
-    let retrieved_account = match psm_client2.get_state(&account_id).await {
+    let retrieved_account = match client2.get_state(&account_id).await {
         Ok(response) => {
             println!("  ✓ {}", response.message);
             if let Some(state) = response.state {
@@ -275,32 +208,64 @@ async fn main() -> ClientResult<()> {
             Felt::new(0),
         ]);
 
-        let (tx_request, _config_hash) = match multisig::build_update_signers_transaction_request(
-            3,
-            &signer_commitments,
-            salt,
-            vec![],
-        ) {
-            Ok(req) => req,
+        let (config_hash, config_values) = multisig::build_multisig_config_advice(3, &signer_commitments);
+
+        let tx_script = match multisig::build_update_signers_script() {
+            Ok(script) => script,
             Err(err) => {
-                println!("  ✗ Failed to build transaction request: {}", err);
+                println!("  ✗ Failed to build transaction script: {}", err);
                 return Ok(());
             }
         };
 
-        let tx_summary = match miden_client.new_transaction(account.id(), tx_request).await {
-            Err(ClientError::TransactionExecutorError(
-                miden_client::transaction::TransactionExecutorError::Unauthorized(tx_summary)
-            )) => {
+        let mock_chain = match MockChainBuilder::with_accounts([account.clone()]) {
+            Ok(builder) => builder.build().unwrap(),
+            Err(err) => {
+                println!("  ✗ Failed to create MockChain: {}", err);
+                return Ok(());
+            }
+        };
+
+        let mut advice_map = AdviceMap::default();
+        advice_map.insert(config_hash, config_values.clone());
+        let advice_inputs = AdviceInputs {
+            map: advice_map,
+            ..Default::default()
+        };
+
+        let tx_context_init = match mock_chain
+            .build_tx_context(account.id(), &[], &[])
+        {
+            Ok(builder) => match builder
+                .tx_script(tx_script.clone())
+                .tx_script_args(config_hash)
+                .extend_advice_inputs(advice_inputs.clone())
+                .auth_args(salt)
+                .build()
+            {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    println!("  ✗ Failed to build transaction context: {}", err);
+                    return Ok(());
+                }
+            },
+            Err(err) => {
+                println!("  ✗ Failed to create transaction context: {}", err);
+                return Ok(());
+            }
+        };
+
+        let tx_summary = match tx_context_init.execute().await {
+            Err(TransactionExecutorError::Unauthorized(tx_effects)) => {
                 println!("  ✓ Transaction summary created");
-                tx_summary
+                tx_effects
             }
             Ok(_) => {
                 println!("  ✗ Expected Unauthorized error but transaction succeeded");
                 return Ok(());
             }
-            Err(e) => {
-                println!("  ✗ Simulation failed: {}", e);
+            Err(err) => {
+                println!("  ✗ Simulation failed: {:?}", err);
                 return Ok(());
             }
         };
@@ -311,7 +276,7 @@ async fn main() -> ClientResult<()> {
         let tx_summary_json = tx_summary.to_json();
         let prev_commitment = format!("0x{}", hex::encode(account.commitment().as_bytes()));
 
-        let (_new_commitment, ack_sig) = match psm_client2
+        let (_new_commitment, ack_sig) = match client2
             .push_delta(
                 &account_id,
                 account.nonce().as_int(),
@@ -393,23 +358,43 @@ async fn main() -> ClientResult<()> {
                     &cosigner2_signature,
                 ));
 
-                let (final_tx_request, _final_config_hash) = match multisig::build_update_signers_transaction_request(
-                    3,
-                    &signer_commitments,
-                    salt,
-                    signature_advice,
-                ) {
-                    Ok(req) => req,
-                    Err(err) => {
-                        println!("  ✗ Failed to build final transaction request: {}", err);
-                        return Ok(());
-                    }
+                let mut final_advice_map = AdviceMap::default();
+                final_advice_map.insert(config_hash, config_values);
+                for (key, value) in signature_advice {
+                    final_advice_map.insert(key, value);
+                }
+                let final_advice_inputs = AdviceInputs {
+                    map: final_advice_map,
+                    ..Default::default()
                 };
 
-                let tx_result = match miden_client.new_transaction(account.id(), final_tx_request).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        println!("  ✗ Execution failed: {}", e);
+                let tx_result = match mock_chain
+                    .build_tx_context(account.id(), &[], &[])
+                {
+                    Ok(builder) => match builder
+                        .tx_script(tx_script)
+                        .tx_script_args(config_hash)
+                        .add_signature(server_commitment.into(), tx_message, ack_signature)
+                        .add_signature(signer_commitments[0].into(), tx_message, cosigner1_signature)
+                        .add_signature(signer_commitments[1].into(), tx_message, cosigner2_signature)
+                        .extend_advice_inputs(final_advice_inputs)
+                        .auth_args(salt)
+                        .build()
+                    {
+                        Ok(ctx) => match ctx.execute().await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                println!("  ✗ Execution failed: {:?}", e);
+                                return Ok(());
+                            }
+                        },
+                        Err(err) => {
+                            println!("  ✗ Build failed: {}", err);
+                            return Ok(());
+                        }
+                    },
+                    Err(err) => {
+                        println!("  ✗ Context creation failed: {}", err);
                         return Ok(());
                     }
                 };

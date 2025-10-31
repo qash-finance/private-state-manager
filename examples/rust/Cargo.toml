@@ -7,6 +7,10 @@ edition = "2021"
 name = "main"
 path = "src/main.rs"
 
+[[bin]]
+name = "main_mockchain"
+path = "src/main_mockchain.rs"
+
 [dependencies]
 private-state-manager-client = { path = "../../crates/client" }
 private-state-manager-shared = { path = "../../crates/shared" }
