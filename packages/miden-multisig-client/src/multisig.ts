@@ -5,7 +5,7 @@
  * for proposal management.
  */
 
-import { PsmHttpClient, type DeltaObject, type DeltaStatus, type FalconSignature, type Signer, type StorageType, type AuthConfig, type StateObject } from '@openzeppelin/psm-client';
+import { PsmHttpClient, type DeltaObject, type DeltaStatus, type FalconSignature, type Signer, type StorageType, type AuthConfig, type StateObject, type ProposalMetadata as PsmProposalMetadata } from '@openzeppelin/psm-client';
 import type {
   ConsumableNote,
   ExportedProposal,
@@ -40,7 +40,6 @@ import {
 } from './utils/encoding.js';
 import { buildSignatureAdviceEntry, signatureHexToBytes } from './utils/signature.js';
 import { computeCommitmentFromTxSummary, accountIdToHex } from './multisig/helpers.js';
-import { fromPsmMetadata, toPsmMetadata } from './multisig/metadata.js';
 
 /**
  * Result of fetching account state from PSM.
@@ -48,42 +47,21 @@ import { fromPsmMetadata, toPsmMetadata } from './multisig/metadata.js';
 export interface AccountState {
   /** Account ID */
   accountId: string;
-  /** Current commitment (state hash) */
+  /** Current commitment */
   commitment: string;
   /** Raw state data (base64-encoded serialized account) */
   stateDataBase64: string;
-  /** When the account was created on PSM */
   createdAt: string;
-  /** When the account was last updated on PSM */
   updatedAt: string;
 }
 
 /**
  * Represents a multisig account with PSM integration.
- *
- * @example
- * ```typescript
- * // Create via MultisigClient
- * const multisig = await client.create(config, signer);
- *
- * // Register on PSM
- * await multisig.registerOnPsm();
- *
- * // Work with proposals
- * const proposals = await multisig.syncProposals();
- * ```
  */
 export class Multisig {
-  /** The Miden SDK Account */
   readonly account: Account | null;
-
-  /** Number of signatures required */
   readonly threshold: number;
-
-  /** All signer commitments */
   readonly signerCommitments: string[];
-
-  /** PSM server public key commitment */
   readonly psmCommitment: string;
 
   private readonly psm: PsmHttpClient;
@@ -126,11 +104,11 @@ export class Multisig {
     const state: StateObject = await this.psm.getState(this._accountId);
 
     return {
-      accountId: state.account_id,
+      accountId: state.accountId,
       commitment: state.commitment,
-      stateDataBase64: state.state_json.data,
-      createdAt: state.created_at,
-      updatedAt: state.updated_at,
+      stateDataBase64: state.stateJson.data,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
     };
   }
 
@@ -140,8 +118,7 @@ export class Multisig {
    * The initial state must be the serialized Account bytes (base64-encoded).
    * If not provided, the account's serialize() method is used.
    *
-   * @param initialStateBase64 - Optional base64-encoded serialized Account.
-   *                             If not provided, uses this.account.serialize().
+   * @param initialStateBase64 - Optional base64-encoded serialized Account.¡
    */
   async registerOnPsm(initialStateBase64?: string): Promise<void> {
     if (!this.account && !initialStateBase64) {
@@ -153,9 +130,7 @@ export class Multisig {
     if (initialStateBase64) {
       stateData = initialStateBase64;
     } else {
-      // Account is guaranteed to exist due to the check above
       const accountBytes: Uint8Array = this.account!.serialize();
-      // Convert Uint8Array to base64
       stateData = uint8ArrayToBase64(accountBytes);
     }
 
@@ -166,10 +141,10 @@ export class Multisig {
     };
 
     const response = await this.psm.configure({
-      account_id: this._accountId,
+      accountId: this._accountId,
       auth,
-      initial_state: { data: stateData, account_id: this._accountId },
-      storage_type: 'Filesystem' as StorageType,
+      initialState: { data: stateData, accountId: this._accountId },
+      storageType: 'Filesystem' as StorageType,
     });
 
     if (!response.success) {
@@ -179,30 +154,24 @@ export class Multisig {
 
   /**
    * Sync proposals from the PSM server.
-   * Computes proposal IDs client-side by deserializing the tx_summary and computing its commitment.
-   * Reads metadata from PSM if available, or preserves local metadata for proposals that already exist.
    */
   async syncProposals(): Promise<Proposal[]> {
     const deltas = await this.psm.getDeltaProposals(this._accountId);
 
     for (const delta of deltas) {
-      // Compute proposal ID (commitment) client-side from tx_summary
-      // This matches the Rust client behavior - we don't rely on server returning new_commitment
-      const proposalId = computeCommitmentFromTxSummary(delta.delta_payload.tx_summary.data);
+      const proposalId = computeCommitmentFromTxSummary(delta.deltaPayload.txSummary.data);
       const existingProposal = this.proposals.get(proposalId);
 
-      // Prefer existing local metadata if available (we trust our own create calls)
-      // Fall back to PSM metadata for proposals created by other signers
       const resolvedMetadata =
         existingProposal?.metadata ??
-        (delta.delta_payload.metadata
-          ? (fromPsmMetadata(delta.delta_payload.metadata) as ProposalMetadata) ?? (delta.delta_payload.metadata as ProposalMetadata)
+        (delta.deltaPayload.metadata
+          ? this.fromPsmMetadata(delta.deltaPayload.metadata)
           : undefined);
       if (!resolvedMetadata) {
         throw new Error('Missing proposal metadata from PSM');
       }
 
-      const proposal = this.deltaToProposal(delta, proposalId, resolvedMetadata);
+      const proposal = this.deltaToProposal(delta, proposalId, resolvedMetadata, existingProposal?.signatures);
 
       this.proposals.set(proposal.id, proposal);
     }
@@ -211,7 +180,7 @@ export class Multisig {
   }
 
   /**
-   * List all known proposals (call syncProposals first for latest).
+   * List all known proposals
    */
   listProposals(): Proposal[] {
     return Array.from(this.proposals.values());
@@ -225,14 +194,15 @@ export class Multisig {
    * @param metadata - Optional metadata for execution (target config, salt, etc.)
    */
   async createProposal(nonce: number, txSummaryBase64: string, metadata: ProposalMetadata): Promise<Proposal> {
-    const psmMetadata = toPsmMetadata(metadata);
+    const psmMetadata = this.buildPsmMetadata(metadata);
+
     const response = await this.psm.pushDeltaProposal({
-      account_id: this._accountId,
+      accountId: this._accountId,
       nonce,
-      delta_payload: {
-        tx_summary: { data: txSummaryBase64 },
+      deltaPayload: {
+        txSummary: { data: txSummaryBase64 },
         signatures: [],
-        metadata: psmMetadata as any,
+        metadata: psmMetadata,
       },
     });
 
@@ -243,7 +213,7 @@ export class Multisig {
   }
 
   /**
-   * Create an "add signer" proposal by executing the update_signers script to summary.
+   * Create an "add signer" proposal.
    *
    * @param webClient - Initialized Miden WebClient
    * @param newCommitment - Commitment of the new signer (hex)
@@ -294,7 +264,6 @@ export class Multisig {
     nonce?: number,
     newThreshold?: number,
   ): Promise<Proposal> {
-    // Validate signer exists
     const normalizedRemove = signerToRemove.toLowerCase();
     const signerExists = this.signerCommitments.some(
       (c) => c.toLowerCase() === normalizedRemove
@@ -303,7 +272,6 @@ export class Multisig {
       throw new Error(`Signer ${signerToRemove} is not in the current signer list`);
     }
 
-    // Filter out the signer
     const targetSignerCommitments = this.signerCommitments.filter(
       (c) => c.toLowerCase() !== normalizedRemove
     );
@@ -312,10 +280,8 @@ export class Multisig {
       throw new Error('Cannot remove the last signer');
     }
 
-    // Auto-adjust threshold if needed
     const targetThreshold = newThreshold ?? Math.min(this.threshold, targetSignerCommitments.length);
 
-    // Validate threshold
     if (targetThreshold < 1 || targetThreshold > targetSignerCommitments.length) {
       throw new Error(
         `Invalid threshold ${targetThreshold}. Must be between 1 and ${targetSignerCommitments.length}`
@@ -344,7 +310,7 @@ export class Multisig {
   }
 
   /**
-   * Create a "change threshold" proposal without modifying signers.
+   * Create a "change threshold" proposal.
    *
    * @param webClient - Initialized Miden WebClient
    * @param newThreshold - The new threshold value
@@ -355,7 +321,6 @@ export class Multisig {
     newThreshold: number,
     nonce?: number,
   ): Promise<Proposal> {
-    // Validate threshold
     if (newThreshold < 1 || newThreshold > this.signerCommitments.length) {
       throw new Error(
         `Invalid threshold ${newThreshold}. Must be between 1 and ${this.signerCommitments.length}`
@@ -554,10 +519,8 @@ export class Multisig {
    * @param proposalId - The proposal commitment/ID (this is also what gets signed)
    */
   async signProposal(proposalId: string): Promise<Proposal> {
-    // Get existing proposal to preserve metadata
     const existingProposal = this.proposals.get(proposalId);
 
-    // The proposal ID is the tx_summary commitment - this is what we sign
     const signatureHex = this.signer.signCommitment(proposalId);
 
     const signature: FalconSignature = {
@@ -566,14 +529,13 @@ export class Multisig {
     };
 
     const delta = await this.psm.signDeltaProposal({
-      account_id: this._accountId,
+      accountId: this._accountId,
       commitment: proposalId,
       signature,
     });
 
-    const proposal = this.deltaToProposal(delta, proposalId);
+    const proposal = this.deltaToProposal(delta, proposalId, undefined, existingProposal?.signatures);
 
-    // Preserve metadata from existing proposal (e.g., target config for signer updates)
     if (existingProposal?.metadata) {
       proposal.metadata = existingProposal.metadata;
     }
@@ -585,11 +547,6 @@ export class Multisig {
 
   /**
    * Execute a proposal that has enough signatures.
-   *
-   * This performs the full on-chain execution flow:
-   * 1. Push delta to PSM to get acknowledgment signature (except for switch_psm)
-   * 2. Build advice map with all cosigner signatures + PSM ack
-   * 3. Execute, prove, submit, and apply the transaction
    *
    * @param proposalId - The proposal commitment/ID
    * @param webClient - Initialized Miden WebClient for transaction execution
@@ -609,60 +566,57 @@ export class Multisig {
 
     const deltas = await this.psm.getDeltaProposals(this._accountId);
     const delta = deltas.find(
-      (d) => computeCommitmentFromTxSummary(d.delta_payload.tx_summary.data) === proposalId
+      (d) => computeCommitmentFromTxSummary(d.deltaPayload.txSummary.data) === proposalId
     );
 
     if (!delta) {
       throw new Error(`Proposal not found on server: ${proposalId}`);
     }
 
-    const executionDelta = {
-      ...delta,
-      delta_payload: delta.delta_payload.tx_summary,
-    };
-
-    const pushResult = await this.psm.pushDelta(executionDelta);
-    const ackSigHex = pushResult.ack_sig;
-    if (!ackSigHex) {
-      throw new Error('PSM did not return acknowledgment signature');
-    }
-
-    // Deserialize the tx_summary to get the salt and commitment
-    // Store as hex and recreate Word objects when needed (WASM objects get consumed)
-    const txSummaryBytes = base64ToUint8Array(delta.delta_payload.tx_summary.data);
+    const txSummaryBytes = base64ToUint8Array(delta.deltaPayload.txSummary.data);
     const txSummary = TransactionSummary.deserialize(txSummaryBytes);
     const saltHex = txSummary.salt().toHex();
     const txCommitmentHex = txSummary.toCommitment().toHex();
 
-    // Build advice map with all signatures
     const adviceMap = new AdviceMap();
 
-    if (delta.status.status === 'pending') {
-      for (const cosignerSig of delta.status.cosigner_sigs) {
-        const signerCommitment = Word.fromHex(normalizeHexWord(cosignerSig.signer_id));
-        const sigBytes = signatureHexToBytes(cosignerSig.signature.signature);
-        const signature = Signature.deserialize(sigBytes);
-        const txCommitment = Word.fromHex(normalizeHexWord(txCommitmentHex));
-        const { key, values } = buildSignatureAdviceEntry(
-          signerCommitment,
-          txCommitment,
-          signature
-        );
-        adviceMap.insert(key, new FeltArray(values));
-      }
+    for (const cosignerSig of proposal.signatures) {
+      const signerCommitment = Word.fromHex(normalizeHexWord(cosignerSig.signerId));
+      const sigBytes = signatureHexToBytes(cosignerSig.signature.signature);
+      const signature = Signature.deserialize(sigBytes);
+      const txCommitment = Word.fromHex(normalizeHexWord(txCommitmentHex));
+      const { key, values } = buildSignatureAdviceEntry(
+        signerCommitment,
+        txCommitment,
+        signature
+      );
+      adviceMap.insert(key, new FeltArray(values));
     }
 
-    // Add PSM ack signature
-    const psmCommitment = Word.fromHex(normalizeHexWord(this.psmCommitment));
-    const ackSigBytes = signatureHexToBytes(ackSigHex);
-    const ackSignature = Signature.deserialize(ackSigBytes);
-    const txCommitmentForAck = Word.fromHex(normalizeHexWord(txCommitmentHex));
-    const { key: ackKey, values: ackValues } = buildSignatureAdviceEntry(
-      psmCommitment,
-      txCommitmentForAck,
-      ackSignature
-    );
-    adviceMap.insert(ackKey, new FeltArray(ackValues));
+    const isSwitchPsm = proposal.metadata?.proposalType === 'switch_psm';
+    if (!isSwitchPsm) {
+      const executionDelta = {
+        ...delta,
+        deltaPayload: delta.deltaPayload.txSummary,
+      };
+
+      const pushResult = await this.psm.pushDelta(executionDelta);
+      const ackSigHex = pushResult.ackSig;
+      if (!ackSigHex) {
+        throw new Error('PSM did not return acknowledgment signature');
+      }
+
+      const psmCommitment = Word.fromHex(normalizeHexWord(this.psmCommitment));
+      const ackSigBytes = signatureHexToBytes(ackSigHex);
+      const ackSignature = Signature.deserialize(ackSigBytes);
+      const txCommitmentForAck = Word.fromHex(normalizeHexWord(txCommitmentHex));
+      const { key: ackKey, values: ackValues } = buildSignatureAdviceEntry(
+        psmCommitment,
+        txCommitmentForAck,
+        ackSignature
+      );
+      adviceMap.insert(ackKey, new FeltArray(ackValues));
+    }
 
     const metadata = proposal.metadata;
     if (!metadata) {
@@ -723,27 +677,21 @@ export class Multisig {
       }
     }
 
-    // Execute, prove, submit, apply
     const accountId = AccountId.fromHex(this._accountId);
     const result = await webClient.executeTransaction(accountId, finalRequest);
     const proven = await webClient.proveTransaction(result, null);
     const submissionHeight = await webClient.submitProvenTransaction(proven, result);
     await webClient.applyTransaction(result, submissionHeight);
-    // Note: We don't call syncState() here because applyTransaction already updated
-    // local state. Calling syncState immediately after would fail with "account nonce
-    // is too low" since the network hasn't finalized the transaction yet.
 
     proposal.status = { type: 'finalized' };
   }
 
   /**
-   * Export a proposal for offline signing (fetches from PSM).
-   * @deprecated Use exportProposalToJson for offline/side-channel sharing
+   * Export a proposal for offline signing
    */
   async exportProposal(proposalId: string): Promise<ExportedProposal> {
     const deltas = await this.psm.getDeltaProposals(this._accountId);
-    // Find delta by computing commitment from tx_summary (client-side)
-    const delta = deltas.find((d) => computeCommitmentFromTxSummary(d.delta_payload.tx_summary.data) === proposalId);
+    const delta = deltas.find((d) => computeCommitmentFromTxSummary(d.deltaPayload.txSummary.data) === proposalId);
 
     if (!delta) {
       throw new Error(`Proposal not found: ${proposalId}`);
@@ -751,25 +699,23 @@ export class Multisig {
 
     const signatures =
       delta.status.status === 'pending'
-        ? delta.status.cosigner_sigs.map((s) => ({
-            commitment: s.signer_id,
+        ? delta.status.cosignerSigs.map((s) => ({
+            commitment: s.signerId,
             signatureHex: s.signature.signature,
           }))
         : [];
 
     return {
-      accountId: delta.account_id,
+      accountId: delta.accountId,
       nonce: delta.nonce,
       commitment: proposalId,
-      txSummaryBase64: delta.delta_payload.tx_summary.data,
+      txSummaryBase64: delta.deltaPayload.txSummary.data,
       signatures,
     };
   }
 
   /**
    * Export a proposal to JSON for side-channel sharing.
-   * This exports from local cache and includes metadata, so PSM is not required.
-   * Useful when switching PSM providers and coordination via PSM is unavailable.
    *
    * @param proposalId - The proposal commitment/ID
    * @returns JSON string that can be shared and imported by other signers
@@ -798,8 +744,6 @@ export class Multisig {
 
   /**
    * Import a proposal from JSON (exported via exportProposalToJson).
-   * This adds the proposal to local cache for signing/execution.
-   * Useful when receiving proposals via side-channel when PSM is unavailable.
    *
    * @param json - JSON string from exportProposalToJson
    * @returns The imported proposal
@@ -807,7 +751,6 @@ export class Multisig {
   importProposal(json: string): Proposal {
     const exported: ExportedProposal = JSON.parse(json);
 
-    // Validate the imported proposal
     if (!exported.accountId || !exported.txSummaryBase64 || !exported.commitment) {
       throw new Error('Invalid proposal JSON: missing required fields');
     }
@@ -816,13 +759,11 @@ export class Multisig {
       throw new Error(`Proposal is for a different account: ${exported.accountId}`);
     }
 
-    // Verify the commitment matches the tx_summary
     const computedCommitment = computeCommitmentFromTxSummary(exported.txSummaryBase64);
     if (computedCommitment !== exported.commitment) {
       throw new Error('Invalid proposal: commitment does not match tx_summary');
     }
 
-    // Convert to Proposal
     const signaturesCollected = exported.signatures.length;
     const signaturesRequired = this.threshold;
     const status: ProposalStatus = signaturesCollected >= signaturesRequired
@@ -854,15 +795,13 @@ export class Multisig {
       },
     };
 
-    // Add to local cache
     this.proposals.set(proposal.id, proposal);
 
     return proposal;
   }
 
   /**
-   * Sign an imported proposal and return updated JSON for sharing.
-   * Use this when PSM is unavailable and coordination happens via side-channel.
+   * Sign an imported proposal and return updated JSON for sharing..
    *
    * @param proposalId - The proposal commitment/ID
    * @returns Updated JSON string with the new signature included
@@ -908,41 +847,138 @@ export class Multisig {
     return this.exportProposalToJson(proposalId);
   }
 
-  private deltaToProposal(delta: DeltaObject, proposalId: string, metadata?: ProposalMetadata): Proposal {
+  private deltaToProposal(
+    delta: DeltaObject,
+    proposalId: string,
+    metadata?: ProposalMetadata,
+    existingSignatures?: ProposalSignatureEntry[],
+  ): Proposal {
     const status = this.deltaStatusToProposalStatus(delta.status);
 
-    const signatures: ProposalSignatureEntry[] =
+    const signaturesFromStatus =
       delta.status.status === 'pending'
-        ? delta.status.cosigner_sigs.map((s) => ({
-            signerId: s.signer_id,
+        ? delta.status.cosignerSigs.map((s) => ({
+            signerId: s.signerId,
             signature: s.signature,
             timestamp: s.timestamp,
           }))
         : [];
 
+    const signaturesMap = new Map<string, ProposalSignatureEntry>();
+    for (const sig of existingSignatures ?? []) {
+      signaturesMap.set(sig.signerId, sig);
+    }
+    for (const sig of signaturesFromStatus) {
+      signaturesMap.set(sig.signerId, sig);
+    }
+    const signatures = Array.from(signaturesMap.values());
+
     const resolvedMetadata: ProposalMetadata | undefined =
       metadata ??
-      (delta.delta_payload.metadata ? (fromPsmMetadata(delta.delta_payload.metadata) as ProposalMetadata) : undefined);
+      (delta.deltaPayload.metadata ? this.fromPsmMetadata(delta.deltaPayload.metadata) : undefined);
     if (!resolvedMetadata) {
       throw new Error('Missing proposal metadata');
     }
     return {
       id: proposalId,
-      accountId: delta.account_id,
+      accountId: delta.accountId,
       nonce: delta.nonce,
       status,
-      txSummary: delta.delta_payload.tx_summary.data,
+      txSummary: delta.deltaPayload.txSummary.data,
       signatures,
       metadata: resolvedMetadata,
     };
   }
 
+  private buildPsmMetadata(metadata: ProposalMetadata): PsmProposalMetadata {
+    const base: PsmProposalMetadata = {
+      proposalType: metadata.proposalType,
+      description: metadata.description,
+      salt: metadata.saltHex,
+    };
+
+    switch (metadata.proposalType) {
+      case 'consume_notes':
+        return {
+          ...base,
+          noteIds: metadata.noteIds,
+        };
+      case 'p2id':
+        return {
+          ...base,
+          recipientId: metadata.recipientId,
+          faucetId: metadata.faucetId,
+          amount: metadata.amount,
+        };
+      case 'switch_psm':
+        return {
+          ...base,
+          targetThreshold: metadata.targetThreshold,
+          signerCommitments: metadata.targetSignerCommitments,
+          newPsmPubkey: metadata.newPsmPubkey,
+          newPsmEndpoint: metadata.newPsmEndpoint,
+        };
+      case 'add_signer':
+      case 'remove_signer':
+      case 'change_threshold':
+        return {
+          ...base,
+          targetThreshold: metadata.targetThreshold,
+          signerCommitments: metadata.targetSignerCommitments,
+        };
+    }
+  }
+
+  private fromPsmMetadata(psm: PsmProposalMetadata): ProposalMetadata | undefined {
+    if (!psm.proposalType) return undefined;
+    const base = {
+      description: psm.description ?? '',
+      saltHex: psm.salt,
+    };
+
+    switch (psm.proposalType) {
+      case 'p2id':
+        return {
+          ...base,
+          proposalType: 'p2id',
+          recipientId: psm.recipientId ?? '',
+          faucetId: psm.faucetId ?? '',
+          amount: psm.amount ?? '0',
+        };
+      case 'consume_notes':
+        return {
+          ...base,
+          proposalType: 'consume_notes',
+          noteIds: psm.noteIds ?? [],
+        };
+      case 'switch_psm':
+        return {
+          ...base,
+          proposalType: 'switch_psm',
+          newPsmPubkey: psm.newPsmPubkey ?? '',
+          newPsmEndpoint: psm.newPsmEndpoint,
+          targetThreshold: psm.targetThreshold,
+          targetSignerCommitments: psm.signerCommitments,
+        };
+      case 'add_signer':
+      case 'remove_signer':
+      case 'change_threshold':
+        return {
+          ...base,
+          proposalType: psm.proposalType,
+          targetThreshold: psm.targetThreshold ?? 0,
+          targetSignerCommitments: psm.signerCommitments ?? [],
+        };
+      default:
+        return undefined;
+    }
+  }
+
   private deltaStatusToProposalStatus(status: DeltaStatus): ProposalStatus {
     switch (status.status) {
       case 'pending': {
-        const signaturesCollected = status.cosigner_sigs.length;
+        const signaturesCollected = status.cosignerSigs.length;
         const signaturesRequired = this.threshold;
-        // If we have enough signatures, the proposal is ready for execution
         if (signaturesCollected >= signaturesRequired) {
           return { type: 'ready' };
         }
@@ -950,7 +986,7 @@ export class Multisig {
           type: 'pending',
           signaturesCollected,
           signaturesRequired,
-          signers: status.cosigner_sigs.map((s) => s.signer_id),
+          signers: status.cosignerSigs.map((s) => s.signerId),
         };
       }
       case 'candidate':

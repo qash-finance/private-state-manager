@@ -1,7 +1,4 @@
 //! Shared execution logic for proposal finalization.
-//!
-//! This module contains helper functions used by both `execute_proposal` (online)
-//! and `execute_imported_proposal` (offline) to avoid code duplication.
 
 use std::collections::HashSet;
 
@@ -49,7 +46,6 @@ pub fn collect_signature_advice(
     let mut added_signers: HashSet<String> = HashSet::new();
 
     for sig_input in signatures {
-        // Only include signatures from required signers (case-insensitive)
         if !required_commitments
             .iter()
             .any(|c| c.eq_ignore_ascii_case(&sig_input.signer_commitment))
@@ -81,9 +77,6 @@ pub fn collect_signature_advice(
 }
 
 /// Builds the final transaction request based on transaction type.
-///
-/// This centralizes the logic for creating transaction requests from proposals,
-/// handling all transaction types uniformly.
 pub fn build_final_transaction_request(
     transaction_type: &TransactionType,
     account: &Account,
@@ -149,6 +142,8 @@ pub fn build_final_transaction_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_client::Serializable;
+    use miden_objects::crypto::dsa::rpo_falcon512::SecretKey;
 
     #[test]
     fn test_collect_signature_advice_filters_by_required() {
@@ -191,5 +186,26 @@ mod tests {
         // Will error on first sig parse since it's not a valid Falcon sig,
         // but the dedup logic is what we're testing
         assert!(result.is_err()); // Error on invalid sig, but only one attempt
+    }
+
+    #[test]
+    fn test_collect_signature_advice_with_valid_signature() {
+        let secret_key = SecretKey::new();
+        let public_key = secret_key.public_key();
+        let commitment = public_key.to_commitment();
+        let commitment_hex = format!("0x{}", hex::encode(commitment.to_bytes()));
+
+        let msg = Word::default();
+        let signature = secret_key.sign(msg);
+        let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
+
+        let required: HashSet<String> = [commitment_hex.clone()].into_iter().collect();
+        let signatures = vec![SignatureInput {
+            signer_commitment: commitment_hex,
+            signature_hex,
+        }];
+
+        let advice = collect_signature_advice(signatures, &required, msg).expect("valid advice");
+        assert_eq!(advice.len(), 1);
     }
 }

@@ -9,24 +9,17 @@ use miden_client::{Deserializable, Serializable};
 use miden_confidential_contracts::multisig_psm::{MultisigPsmBuilder, MultisigPsmConfig};
 use miden_objects::Word;
 use miden_objects::account::AccountId;
-use private_state_manager_client::{AuthConfig, MidenFalconRpoAuth, auth_config::AuthType};
+use private_state_manager_client::{
+    AuthConfig, ClientError as PsmClientError, MidenFalconRpoAuth, TryIntoTxSummary,
+    auth_config::AuthType,
+};
 
 use super::MultisigClient;
 use crate::account::MultisigAccount;
 use crate::error::{MultisigError, Result};
-use crate::sync::sync_miden_state;
 
 impl MultisigClient {
     /// Creates a new multisig account.
-    ///
-    /// This will:
-    /// 1. Fetch the PSM server's public key commitment
-    /// 2. Create the multisig account using miden-confidential-contracts
-    /// 3. Add the account to the local miden-client
-    /// 4. Store the account in the client
-    ///
-    /// Note: After creation, you should call `push_account` to register
-    /// the account with the PSM server.
     pub async fn create_account(
         &mut self,
         threshold: u32,
@@ -55,10 +48,7 @@ impl MultisigClient {
             .map_err(|e| MultisigError::MidenClient(format!("failed to build account: {}", e)))?;
 
         // Add to miden-client
-        self.miden_client
-            .add_account(&account, false)
-            .await
-            .map_err(|e| MultisigError::MidenClient(format!("failed to add account: {}", e)))?;
+        self.add_or_update_account(&account, false).await?;
 
         // Wrap in MultisigAccount and store
         let multisig_account = MultisigAccount::new(account, &self.psm_endpoint);
@@ -78,12 +68,10 @@ impl MultisigClient {
             .await
             .map_err(|e| MultisigError::PsmServer(format!("failed to get state: {}", e)))?;
 
-        // Extract state JSON from response
         let state_obj = state_response
             .state
             .ok_or_else(|| MultisigError::PsmServer("no state returned from PSM".to_string()))?;
 
-        // Parse the state JSON to get the base64-encoded account
         let state_value: serde_json::Value = serde_json::from_str(&state_obj.state_json)?;
 
         let account_base64 = state_value["data"]
@@ -98,13 +86,8 @@ impl MultisigClient {
             MultisigError::MidenClient(format!("failed to deserialize account: {}", e))
         })?;
 
-        // Add to miden-client
-        self.miden_client
-            .add_account(&account, true) // true = imported
-            .await
-            .map_err(|e| MultisigError::MidenClient(format!("failed to add account: {}", e)))?;
+        self.add_or_update_account(&account, true).await?;
 
-        // Wrap and store
         let multisig_account = MultisigAccount::new(account, &self.psm_endpoint);
         self.account = Some(multisig_account);
 
@@ -112,19 +95,14 @@ impl MultisigClient {
     }
 
     /// Pushes the current account to PSM for initial registration.
-    ///
-    /// This should be called after `create_account` to register the account
-    /// with the PSM server so other cosigners can pull it.
     pub async fn push_account(&mut self) -> Result<()> {
         let account = self
             .account
             .as_ref()
             .ok_or_else(|| MultisigError::MissingConfig("no account loaded".to_string()))?;
 
-        // Use authenticated client for PSM configuration
         let mut psm_client = self.create_authenticated_psm_client().await?;
 
-        // Serialize account to base64 (matching the demo pattern)
         let account_bytes = account.inner().to_bytes();
         let account_base64 = base64::engine::general_purpose::STANDARD.encode(&account_bytes);
 
@@ -133,7 +111,6 @@ impl MultisigClient {
             "account_id": account.id().to_string(),
         });
 
-        // Build auth config with cosigner commitments
         let cosigner_commitments = account.cosigner_commitments_hex();
         let auth_config = AuthConfig {
             auth_type: Some(AuthType::MidenFalconRpo(MidenFalconRpoAuth {
@@ -153,55 +130,100 @@ impl MultisigClient {
     }
 
     /// Syncs state with the Miden network.
-    ///
-    /// If sync panics due to corrupted local state (a known issue in miden-client v0.12.x
-    /// with partial MMR data), this method will automatically reset the local database
-    /// and retry once. Regular sync errors (network, timeout, etc.) are propagated without
-    /// resetting.
     pub async fn sync(&mut self) -> Result<()> {
-        match sync_miden_state(&mut self.miden_client).await {
-            Ok(()) => Ok(()),
-            Err(MultisigError::SyncPanicked(msg)) => {
-                // WORKAROUND: miden-client v0.12.x can panic on sync when the local
-                // MMR state becomes inconsistent (e.g., "if there is an odd element, a merge
-                // is required" panic in partial_mmr.rs). This can happen after certain
-                // transaction patterns. We recover by clearing the local state and re-syncing.
-                //
-                // This is safe because:
-                // 1. On-chain state is the source of truth
-                // 2. Account data can be re-fetched from the network
-                // 3. The account itself is not stored in the SQLite DB (we keep it in memory)
-                //
-                // Only panics trigger recovery - regular errors (network, timeout) are
-                // propagated so the caller can handle them appropriately.
-                //
-                // TODO: Remove this workaround when miden-client is updated with a fix.
-                eprintln!(
-                    "Sync panicked ({}), attempting recovery by resetting local state...",
-                    msg
-                );
-                self.reset_miden_client().await?;
-                sync_miden_state(&mut self.miden_client).await
-            }
-            Err(e) => Err(e), // Propagate regular errors without reset
+        self.get_deltas().await?;
+
+        self.miden_client
+            .sync_state()
+            .await
+            .map_err(|e| MultisigError::MidenClient(format!("failed to sync state: {:#?}", e)))?;
+
+        // Refresh cached account (commitment/nonce/etc.) from the miden-client store
+        if let Some(current) = self.account.take() {
+            let account_id = current.id();
+            let account_record = self
+                .miden_client
+                .get_account(account_id)
+                .await
+                .map_err(|e| {
+                    MultisigError::MidenClient(format!("failed to get updated account: {}", e))
+                })?
+                .ok_or_else(|| {
+                    MultisigError::MissingConfig("account not found after sync".to_string())
+                })?;
+            let refreshed = MultisigAccount::new(account_record.into(), &self.psm_endpoint);
+            self.account = Some(refreshed);
         }
+
+        Ok(())
+    }
+
+    /// Fetches deltas from PSM since the current local nonce and applies them to the local account.
+    pub async fn get_deltas(&mut self) -> Result<()> {
+        let account = self.require_account()?.clone();
+        let account_id = account.id();
+        let current_nonce = account.nonce();
+
+        let mut psm_client = self.create_authenticated_psm_client().await?;
+        let response = match psm_client.get_delta_since(&account_id, current_nonce).await {
+            Ok(resp) => resp,
+            Err(PsmClientError::ServerError(msg)) if msg.contains("not found") => {
+                // No new deltas since current nonce - this is not an error
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(MultisigError::PsmServer(format!(
+                    "failed to pull deltas from PSM: {}",
+                    e
+                )));
+            }
+        };
+
+        let merged_delta = response
+            .merged_delta
+            .ok_or_else(|| MultisigError::PsmServer("no merged_delta in response".to_string()))?;
+
+        let tx_summary = merged_delta.try_into_tx_summary().map_err(|e| {
+            MultisigError::MidenClient(format!("failed to parse delta payload: {}", e))
+        })?;
+
+        let account_delta = tx_summary.account_delta();
+
+        let updated_account: Account = if account_delta.is_full_state() {
+            Account::try_from(account_delta).map_err(|e| {
+                MultisigError::MidenClient(format!(
+                    "failed to convert full state delta to account: {}",
+                    e
+                ))
+            })?
+        } else {
+            let mut acc: Account = account.into_inner();
+            acc.apply_delta(account_delta).map_err(|e| {
+                MultisigError::MidenClient(format!("failed to apply delta to account: {}", e))
+            })?;
+            acc
+        };
+
+        self.add_or_update_account(&updated_account, true).await?;
+
+        let multisig_account = MultisigAccount::new(updated_account, &self.psm_endpoint);
+        self.account = Some(multisig_account);
+
+        Ok(())
     }
 
     /// Syncs account state from PSM and updates the local cache.
     pub async fn sync_account(&mut self) -> Result<()> {
-        let account_id = self.require_account()?.id();
-        self.pull_account(account_id).await?;
-        Ok(())
+        if self.account().is_some() {
+            self.sync().await
+        } else {
+            let account_id = self.require_account()?.id();
+            self.pull_account(account_id).await?;
+            Ok(())
+        }
     }
 
     /// Registers the current account on the PSM server.
-    ///
-    /// This is useful after:
-    /// - Switching to a new PSM endpoint
-    /// - Re-registering an account that was removed from PSM
-    /// - Initial account setup (alternative to the automatic registration in `create_account`)
-    ///
-    /// The account must already be loaded locally via `create_account` or `pull_account`.
     ///
     /// # Example
     ///
@@ -215,16 +237,6 @@ impl MultisigClient {
     }
 
     /// Changes the PSM endpoint and optionally registers the account on the new server.
-    ///
-    /// Use this when:
-    /// - The PSM server has moved to a new address (same server, new URL)
-    /// - You want to switch to a different PSM provider without on-chain changes
-    ///
-    /// **Note:** This does NOT update the on-chain PSM public key. For that, use
-    /// `propose_transaction(TransactionType::SwitchPsm { ... })` which will:
-    /// 1. Update the PSM public key on-chain
-    /// 2. Execute the transaction
-    /// 3. Automatically register on the new PSM
     ///
     /// # Arguments
     ///
