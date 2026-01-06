@@ -41,10 +41,7 @@ Create a 1-of-3 multisig account, propose a transfer, collect signatures, and ex
 
 ```typescript
 import { WebClient, SecretKey } from '@demox-labs/miden-sdk';
-import { MultisigClient, FalconSigner, setMasmBaseUrl } from '@openzeppelin/miden-multisig-client';
-
-// Configure MASM files location (required for account creation)
-setMasmBaseUrl('/masm');
+import { MultisigClient, FalconSigner } from '@openzeppelin/miden-multisig-client';
 
 // 1. Setup clients
 const midenClient = await WebClient.createClient('https://rpc.testnet.miden.io:443');
@@ -69,7 +66,6 @@ console.log('Account created:', multisig.accountId);
 
 // 4. Create a transfer proposal
 const proposal = await multisig.createP2idProposal(
-  midenClient,
   recipientAccountId,
   faucetAccountId,
   1000n  // amount
@@ -81,7 +77,7 @@ console.log('Proposal created:', proposal.id);
 await multisig.signProposal(proposal.id);
 
 // 6. Execute when threshold is met
-await multisig.executeProposal(proposal.id, midenClient);
+await multisig.executeProposal(proposal.id);
 
 console.log('Transfer executed!');
 ```
@@ -206,13 +202,8 @@ import {
   Multisig,
   FalconSigner,
   AccountInspector,
-  setMasmBaseUrl,
   type MultisigConfig,
 } from '@openzeppelin/miden-multisig-client';
-
-// Configure MASM files location (required for account creation)
-// Point to where multisig.masm and psm.masm are served
-setMasmBaseUrl('/masm');  // Or absolute URL like 'https://example.com/masm'
 
 // Initialize web client (connects to Miden node)
 const webClient = await WebClient.createClient('https://rpc.testnet.miden.io:443');
@@ -225,25 +216,6 @@ const signer = new FalconSigner(secretKey);
 const client = new MultisigClient(webClient, {
   psmEndpoint: 'http://localhost:3000'
 });
-```
-
-### MASM Configuration
-
-The TypeScript SDK needs access to MASM files for account creation. Configure the base URL:
-
-```typescript
-import { setMasmBaseUrl, getMasmBaseUrl } from '@openzeppelin/miden-multisig-client';
-
-// Set base URL for MASM files
-setMasmBaseUrl('/public/masm');
-
-// Or use embedded MASM (for bundlers that support raw imports)
-import { setEmbeddedMultisigMasm, setEmbeddedPsmMasm } from '@openzeppelin/miden-multisig-client';
-import multisigMasm from './masm/multisig.masm?raw';
-import psmMasm from './masm/psm.masm?raw';
-
-setEmbeddedMultisigMasm(multisigMasm);
-setEmbeddedPsmMasm(psmMasm);
 ```
 
 ### Creating Accounts
@@ -297,7 +269,6 @@ console.log('Vault balances:', detected.vaultBalances);
 
 ```typescript
 const proposal = await multisig.createP2idProposal(
-  webClient,
   recipientAccountId,    // Recipient's account ID
   faucetAccountId,       // Faucet (token) ID
   1000n                  // Amount to send
@@ -308,20 +279,19 @@ const proposal = await multisig.createP2idProposal(
 
 ```typescript
 // Get consumable notes
-const notes = await multisig.getConsumableNotes(webClient);
+const notes = await multisig.getConsumableNotes();
 
 // Create proposal to consume them
 const noteIds = notes.map(n => n.id);
-const proposal = await multisig.createConsumeNotesProposal(webClient, noteIds);
+const proposal = await multisig.createConsumeNotesProposal(noteIds);
 ```
 
 #### Add Signer
 
 ```typescript
 const proposal = await multisig.createAddSignerProposal(
-  webClient,
   newSignerCommitment,   // New signer's public key commitment
-  undefined,             // Optional description
+  undefined,             // Optional nonce
   newThreshold           // Optional new threshold
 );
 ```
@@ -330,9 +300,8 @@ const proposal = await multisig.createAddSignerProposal(
 
 ```typescript
 const proposal = await multisig.createRemoveSignerProposal(
-  webClient,
   signerToRemove,        // Signer's commitment to remove
-  undefined,             // Optional description
+  undefined,             // Optional nonce
   newThreshold           // Optional new threshold
 );
 ```
@@ -341,7 +310,6 @@ const proposal = await multisig.createRemoveSignerProposal(
 
 ```typescript
 const proposal = await multisig.createChangeThresholdProposal(
-  webClient,
   newThreshold           // New threshold value
 );
 ```
@@ -350,7 +318,6 @@ const proposal = await multisig.createChangeThresholdProposal(
 
 ```typescript
 const proposal = await multisig.createSwitchPsmProposal(
-  webClient,
   newPsmEndpoint,        // New PSM server URL
   newPsmCommitment       // New PSM server's public key
 );
@@ -375,7 +342,7 @@ const signed = await multisig.signProposal(proposalId);
 
 // Execute when ready
 if (signed.status.type === 'ready') {
-  await multisig.executeProposal(proposalId, webClient);
+  await multisig.executeProposal(proposalId);
 }
 ```
 
@@ -392,7 +359,7 @@ const signedJson = multisig.signProposalOffline(proposalId);
 
 // Back on online machine: import signed proposal
 const signedProposal = multisig.importProposal(signedJson);
-await multisig.executeProposal(signedProposal.id, webClient);
+await multisig.executeProposal(signedProposal.id);
 ```
 
 ### API Reference
@@ -416,18 +383,18 @@ await multisig.executeProposal(signedProposal.id, webClient);
 | `registerOnPsm()` | Register new account with PSM |
 | `syncProposals()` | Sync proposals from PSM |
 | `listProposals()` | Get cached proposals |
-| `createP2idProposal(...)` | Create transfer proposal |
-| `createConsumeNotesProposal(...)` | Create note consumption proposal |
-| `createAddSignerProposal(...)` | Create add signer proposal |
-| `createRemoveSignerProposal(...)` | Create remove signer proposal |
-| `createChangeThresholdProposal(...)` | Create threshold change proposal |
-| `createSwitchPsmProposal(...)` | Create PSM switch proposal |
+| `createP2idProposal(recipient, faucet, amount, nonce?)` | Create transfer proposal |
+| `createConsumeNotesProposal(noteIds, nonce?)` | Create note consumption proposal |
+| `createAddSignerProposal(commitment, nonce?, threshold?)` | Create add signer proposal |
+| `createRemoveSignerProposal(commitment, nonce?, threshold?)` | Create remove signer proposal |
+| `createChangeThresholdProposal(threshold, nonce?)` | Create threshold change proposal |
+| `createSwitchPsmProposal(endpoint, pubkey, nonce?)` | Create PSM switch proposal |
 | `signProposal(id)` | Sign a proposal |
-| `executeProposal(id, webClient)` | Execute ready proposal |
+| `executeProposal(id)` | Execute ready proposal |
 | `exportProposalToJson(id)` | Export for offline signing |
 | `importProposal(json)` | Import offline proposal |
 | `signProposalOffline(id)` | Sign imported proposal offline |
-| `getConsumableNotes(webClient)` | Get notes that can be consumed |
+| `getConsumableNotes()` | Get notes that can be consumed |
 
 #### FalconSigner
 
@@ -708,7 +675,6 @@ await treasury.registerOnPsm();
 
 // CEO proposes payment to vendor
 const payment = await treasury.createP2idProposal(
-  webClient,
   vendorAccountId,
   usdcFaucetId,
   50000n
@@ -720,7 +686,7 @@ await cfoMultisig.syncProposals();
 await cfoMultisig.signProposal(payment.id);
 
 // Payment executes (threshold met: CEO + CFO = 2)
-await treasury.executeProposal(payment.id, webClient);
+await treasury.executeProposal(payment.id);
 ```
 
 ### Use Case 2: Secure Operations (3-of-5)
@@ -751,7 +717,7 @@ Claiming tokens sent to the multisig.
 
 ```typescript
 // Check for incoming notes
-const notes = await multisig.getConsumableNotes(webClient);
+const notes = await multisig.getConsumableNotes();
 
 console.log('Pending notes:');
 for (const note of notes) {
@@ -764,10 +730,10 @@ for (const note of notes) {
 
 // Create proposal to consume all notes
 const noteIds = notes.map(n => n.id);
-const proposal = await multisig.createConsumeNotesProposal(webClient, noteIds);
+const proposal = await multisig.createConsumeNotesProposal(noteIds);
 
 // After threshold signatures...
-await multisig.executeProposal(proposal.id, webClient);
+await multisig.executeProposal(proposal.id);
 
 console.log('Notes consumed, funds now in vault');
 ```
