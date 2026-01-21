@@ -1,18 +1,19 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::state_object::StateObject;
-use crate::storage::filesystem::FilesystemService;
-
 pub mod filesystem;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "postgres")]
+pub use postgres::run_migrations;
 
 /// Storage backend type with configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum StorageType {
     Filesystem,
+    Postgres,
 }
 
 impl Default for StorageType {
@@ -25,6 +26,7 @@ impl std::fmt::Display for StorageType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageType::Filesystem => write!(f, "Filesystem"),
+            StorageType::Postgres => write!(f, "Postgres"),
         }
     }
 }
@@ -87,37 +89,4 @@ pub trait StorageBackend: Send + Sync {
         nonce: u64,
         status: DeltaStatus,
     ) -> Result<(), String>;
-}
-
-/// Storage registry that maps storage types to their backend implementations
-#[derive(Clone)]
-pub struct StorageRegistry {
-    backends: Arc<HashMap<StorageType, Arc<dyn StorageBackend>>>,
-}
-
-impl StorageRegistry {
-    pub fn new(backends: HashMap<StorageType, Arc<dyn StorageBackend>>) -> Self {
-        Self {
-            backends: Arc::new(backends),
-        }
-    }
-
-    pub async fn with_filesystem(storage_path: std::path::PathBuf) -> Result<Self, String> {
-        let fs_storage = FilesystemService::new(storage_path).await?;
-
-        let mut backends = HashMap::new();
-        backends.insert(
-            StorageType::Filesystem,
-            Arc::new(fs_storage) as Arc<dyn StorageBackend>,
-        );
-
-        Ok(Self::new(backends))
-    }
-
-    pub fn get(&self, storage_type: &StorageType) -> Result<Arc<dyn StorageBackend>, String> {
-        self.backends
-            .get(storage_type)
-            .cloned()
-            .ok_or_else(|| format!("No storage backend registered for type: {storage_type}"))
-    }
 }

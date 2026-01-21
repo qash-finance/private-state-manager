@@ -3,14 +3,12 @@ use crate::metadata::AccountMetadata;
 use crate::metadata::auth::{Auth, Credentials};
 use crate::state::AppState;
 use crate::state_object::StateObject;
-use crate::storage::StorageType;
 
 #[derive(Debug, Clone)]
 pub struct ConfigureAccountParams {
     pub account_id: String,
     pub auth: Auth,
     pub initial_state: serde_json::Value,
-    pub storage_type: StorageType,
     pub credential: Credentials,
 }
 
@@ -87,12 +85,8 @@ pub async fn configure_account(
         updated_at: now,
     };
 
-    let storage_backend = state
+    state
         .storage
-        .get(&params.storage_type)
-        .map_err(PsmError::ConfigurationError)?;
-
-    storage_backend
         .submit_state(&account_state)
         .await
         .map_err(|e| {
@@ -108,7 +102,6 @@ pub async fn configure_account(
     let metadata_entry = AccountMetadata {
         account_id: params.account_id.clone(),
         auth: params.auth,
-        storage_type: params.storage_type,
         created_at: account_state.created_at.clone(),
         updated_at: account_state.updated_at.clone(),
         has_pending_candidate: false,
@@ -133,9 +126,8 @@ pub async fn configure_account(
 mod tests {
     use super::*;
     use crate::ack::{Acknowledger, MidenFalconRpoSigner};
-    use crate::storage::{StorageBackend, StorageRegistry};
+    use crate::storage::StorageBackend;
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -144,11 +136,7 @@ mod tests {
         storage_backend: MockStorageBackend,
         metadata_store: MockMetadataStore,
     ) -> AppState {
-        let mut backends = HashMap::new();
-        backends.insert(
-            StorageType::Filesystem,
-            Arc::new(storage_backend) as Arc<dyn StorageBackend>,
-        );
+        let storage = Arc::new(storage_backend) as Arc<dyn StorageBackend>;
 
         let keystore_dir =
             std::env::temp_dir().join(format!("test_keystore_{}", uuid::Uuid::new_v4()));
@@ -157,7 +145,7 @@ mod tests {
         let ack = Acknowledger::FilesystemMidenFalconRpo(signer);
 
         AppState {
-            storage: StorageRegistry::new(backends),
+            storage,
             metadata: Arc::new(metadata_store),
             network_client: Arc::new(Mutex::new(network_client)),
             ack,
@@ -195,7 +183,6 @@ mod tests {
                 cosigner_commitments: vec![commitment_hex],
             },
             initial_state,
-            storage_type: StorageType::Filesystem,
             credential,
         };
 
@@ -226,7 +213,6 @@ mod tests {
             auth: Auth::MidenFalconRpo {
                 cosigner_commitments: vec![commitment_hex.clone()],
             },
-            storage_type: StorageType::Filesystem,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             has_pending_candidate: false,
@@ -246,7 +232,6 @@ mod tests {
                 cosigner_commitments: vec![commitment_hex],
             },
             initial_state: serde_json::json!({"balance": 100}),
-            storage_type: StorageType::Filesystem,
             credential,
         };
 
@@ -283,7 +268,6 @@ mod tests {
                 cosigner_commitments: vec![commitment_hex],
             },
             initial_state: serde_json::json!({"balance": 100}),
-            storage_type: StorageType::Filesystem,
             credential,
         };
 

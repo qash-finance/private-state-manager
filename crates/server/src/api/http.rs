@@ -6,7 +6,6 @@ use crate::services::{
 };
 use crate::state::AppState;
 use crate::state_object::StateObject;
-use crate::storage::StorageType;
 use axum::{Json, extract::Query, extract::State, http::StatusCode};
 use private_state_manager_shared::ProposalSignature;
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,6 @@ pub struct ConfigureRequest {
     pub account_id: String,
     pub auth: Auth,
     pub initial_state: serde_json::Value,
-    pub storage_type: StorageType,
 }
 
 impl From<ConfigureRequest> for ConfigureAccountParams {
@@ -25,7 +23,6 @@ impl From<ConfigureRequest> for ConfigureAccountParams {
             account_id: req.account_id,
             auth: req.auth,
             initial_state: req.initial_state,
-            storage_type: req.storage_type,
             // Credential will be set from AuthHeader
             credential: Credentials::signature(String::new(), String::new()),
         }
@@ -304,7 +301,6 @@ mod tests {
     use crate::delta_object::DeltaStatus;
     use crate::metadata::AccountMetadata;
     use crate::state_object::StateObject;
-    use crate::storage::StorageType as StorageTypeEnum;
     use crate::testing::fixtures;
     use crate::testing::helpers::{create_test_app_state_with_mocks, generate_falcon_signature};
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
@@ -339,7 +335,6 @@ mod tests {
             auth: Auth::MidenFalconRpo {
                 cosigner_commitments,
             },
-            storage_type: StorageTypeEnum::Filesystem,
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
             has_pending_candidate: false,
@@ -401,7 +396,6 @@ mod tests {
                 cosigner_commitments: vec![commitment],
             },
             initial_state: account_json,
-            storage_type: StorageType::Filesystem,
         };
 
         let credentials = Credentials::signature(pubkey, signature);

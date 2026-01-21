@@ -4,7 +4,6 @@ use crate::services::{
     self, ConfigureAccountParams, GetDeltaParams, GetStateParams, PushDeltaParams,
 };
 use crate::state::AppState;
-use crate::storage::StorageType;
 use tonic::{Request, Response, Status};
 
 // Include the generated protobuf code
@@ -44,10 +43,6 @@ impl StateManager for StateManagerService {
         let auth = Auth::try_from(auth_config)
             .map_err(|e| Status::invalid_argument(format!("Invalid auth config: {e}")))?;
 
-        // Parse storage_type
-        let storage_type: StorageType = serde_json::from_str(&format!("\"{}\"", req.storage_type))
-            .map_err(|e| Status::invalid_argument(format!("Invalid storage type: {e}")))?;
-
         // Parse initial_state JSON
         let initial_state: serde_json::Value = serde_json::from_str(&req.initial_state)
             .map_err(|e| Status::invalid_argument(format!("Invalid initial_state JSON: {e}")))?;
@@ -56,7 +51,6 @@ impl StateManager for StateManagerService {
             account_id: req.account_id.clone(),
             auth,
             initial_state,
-            storage_type,
             credential,
         };
 
@@ -421,7 +415,6 @@ mod tests {
     use crate::metadata::AccountMetadata;
     use crate::metadata::auth::Auth;
     use crate::state_object::StateObject;
-    use crate::storage::StorageType;
     use crate::testing::fixtures;
     use crate::testing::helpers::{create_test_app_state_with_mocks, generate_falcon_signature};
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
@@ -457,7 +450,6 @@ mod tests {
             auth: Auth::MidenFalconRpo {
                 cosigner_commitments,
             },
-            storage_type: StorageType::Filesystem,
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
             has_pending_candidate: false,
@@ -526,7 +518,6 @@ mod tests {
                 )),
             }),
             initial_state: serde_json::to_string(&account_json).unwrap(),
-            storage_type: "Filesystem".to_string(),
         };
 
         let request = create_request_with_auth(request, &pubkey, &signature);

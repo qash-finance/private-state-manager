@@ -3,17 +3,16 @@ use serde::{Deserialize, Serialize};
 
 pub mod auth;
 pub mod filesystem;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 pub use auth::{Auth, AuthHeader, Credentials, ExtractCredentials};
-
-use crate::storage::StorageType;
 
 /// Metadata for a single account
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AccountMetadata {
     pub account_id: String,
     pub auth: Auth,
-    pub storage_type: StorageType,
     pub created_at: String,
     pub updated_at: String,
     pub has_pending_candidate: bool,
