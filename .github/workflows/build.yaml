@@ -1,8 +1,6 @@
 name: Build and Push to AR
 
 on:
-  push:
-    branches: [develop, main]
   workflow_dispatch:
     inputs:
       environment:
@@ -29,33 +27,15 @@ env:
 
 jobs:
   build:
-    name: Build (${{ inputs.environment || github.ref_name == 'main' && 'production' || 'staging' }})
+    name: Build (${{ inputs.environment }})
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.build.outputs.image }}
       short_sha: ${{ steps.sha.outputs.short_sha }}
-      environment: ${{ steps.resolve.outputs.environment }}
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Resolve environment
-        id: resolve
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
-            echo "dockerfile=${{ inputs.dockerfile || 'Dockerfile' }}" >> $GITHUB_OUTPUT
-            echo "context=${{ inputs.context || '.' }}" >> $GITHUB_OUTPUT
-          else
-            if [ "${{ github.ref_name }}" = "main" ]; then
-              echo "environment=production" >> $GITHUB_OUTPUT
-            else
-              echo "environment=staging" >> $GITHUB_OUTPUT
-            fi
-            echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
-            echo "context=." >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -63,7 +43,7 @@ jobs:
       - name: Resolve environment config
         id: env
         run: |
-          if [ "${{ steps.resolve.outputs.environment }}" = "staging" ]; then
+          if [ "${{ inputs.environment }}" = "staging" ]; then
             echo "project_id=staging-apps-482206" >> $GITHUB_OUTPUT
             echo "project_number=871482515924" >> $GITHUB_OUTPUT
             echo "wif_pool=wif-staging-apps-pool" >> $GITHUB_OUTPUT
@@ -95,9 +75,9 @@ jobs:
         run: |
           docker build \
             --platform linux/amd64 \
-            -f ${{ steps.resolve.outputs.dockerfile }} \
+            -f ${{ inputs.dockerfile }} \
             -t $IMAGE \
-            ${{ steps.resolve.outputs.context }}
+            ${{ inputs.context }}
           docker push $IMAGE
           docker tag $IMAGE ${IMAGE%:*}:latest
           docker push ${IMAGE%:*}:latest
@@ -109,7 +89,7 @@ jobs:
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            :white_check_mark: *[${{ steps.resolve.outputs.environment }}] Build Successful*
+            :white_check_mark: *[${{ inputs.environment }}] Build Successful*
             Service: `psm` | Image: `${{ steps.sha.outputs.short_sha }}`
             Repo: ${{ github.repository }} | Branch: ${{ github.ref_name }}
             By: ${{ github.actor }} | ${{ github.event.head_commit.url }}
@@ -122,7 +102,7 @@ jobs:
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
-            :x: *[${{ steps.resolve.outputs.environment }}] Build Failed*
+            :x: *[${{ inputs.environment }}] Build Failed*
             Service: `psm` | Branch: ${{ github.ref_name }}
             Repo: ${{ github.repository }}
             By: ${{ github.actor }} | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -134,6 +114,6 @@ jobs:
     needs: build
     uses: ./.github/workflows/deploy.yaml
     with:
-      environment: ${{ needs.build.outputs.environment }}
+      environment: ${{ inputs.environment }}
       image: ${{ needs.build.outputs.image }}
     secrets: inherit
