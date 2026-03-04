@@ -1,6 +1,14 @@
 name: Deploy to Cloud Run
 
 on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       environment:
@@ -11,26 +19,27 @@ on:
           - staging
           - production
       service_name:
-        description: "Cloud Run service to deploy"
-        required: true
+        description: "Which service to deploy (leave empty for all)"
+        required: false
         type: choice
         options:
-          - psm-server
-          - psm-grpc
+          - ""
+          - server
+          - grpc
       image:
         description: "Full image URI (leave empty for latest)"
         required: false
 
 env:
   REGION: asia-southeast1
-  AR_REPO: psm
-  IMAGE_NAME: psm-server
-  CICD_SA: gh-psm-sa
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.service_name }} (${{ inputs.environment }})
+    name: Deploy ${{ matrix.service }} (${{ inputs.environment }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ${{ inputs.service_name && fromJson(format('["{0}"]', inputs.service_name)) || fromJson('["server","grpc"]') }}
     permissions:
       contents: read
       id-token: write
@@ -43,11 +52,19 @@ jobs:
             echo "project_number=871482515924" >> $GITHUB_OUTPUT
             echo "wif_pool=wif-staging-apps-pool" >> $GITHUB_OUTPUT
             echo "wif_provider=wif-staging-apps-provider" >> $GITHUB_OUTPUT
+            echo "ar_repo=psm" >> $GITHUB_OUTPUT
+            echo "image_name=psm-server" >> $GITHUB_OUTPUT
+            echo "cicd_sa=gh-psm-sa" >> $GITHUB_OUTPUT
+            echo "service_prefix=psm" >> $GITHUB_OUTPUT
           else
-            echo "project_id=psm-prod" >> $GITHUB_OUTPUT
-            echo "project_number=CHANGE-ME" >> $GITHUB_OUTPUT
-            echo "wif_pool=wif-deploy-pool" >> $GITHUB_OUTPUT
-            echo "wif_provider=wif-deploy-provider" >> $GITHUB_OUTPUT
+            echo "project_id=qash-psm-prod" >> $GITHUB_OUTPUT
+            echo "project_number=86269805006" >> $GITHUB_OUTPUT
+            echo "wif_pool=wif-qash-psm-prod-pool" >> $GITHUB_OUTPUT
+            echo "wif_provider=wif-qash-psm-prod-provider" >> $GITHUB_OUTPUT
+            echo "ar_repo=qash-psm" >> $GITHUB_OUTPUT
+            echo "image_name=qash-psm-server" >> $GITHUB_OUTPUT
+            echo "cicd_sa=gh-qash-psm-sa" >> $GITHUB_OUTPUT
+            echo "service_prefix=qash-psm" >> $GITHUB_OUTPUT
           fi
 
       - name: Resolve image URI
@@ -56,23 +73,24 @@ jobs:
           if [ -n "${{ inputs.image }}" ]; then
             echo "uri=${{ inputs.image }}" >> $GITHUB_OUTPUT
           else
-            echo "uri=${{ env.REGION }}-docker.pkg.dev/${{ steps.env.outputs.project_id }}/${{ env.AR_REPO }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+            echo "uri=${{ env.REGION }}-docker.pkg.dev/${{ steps.env.outputs.project_id }}/${{ steps.env.outputs.ar_repo }}/${{ steps.env.outputs.image_name }}:latest" >> $GITHUB_OUTPUT
           fi
 
       - uses: google-github-actions/auth@v3
         with:
           project_id: ${{ steps.env.outputs.project_id }}
           workload_identity_provider: "projects/${{ steps.env.outputs.project_number }}/locations/global/workloadIdentityPools/${{ steps.env.outputs.wif_pool }}/providers/${{ steps.env.outputs.wif_provider }}"
-          service_account: "${{ env.CICD_SA }}@${{ steps.env.outputs.project_id }}.iam.gserviceaccount.com"
+          service_account: "${{ steps.env.outputs.cicd_sa }}@${{ steps.env.outputs.project_id }}.iam.gserviceaccount.com"
 
       - name: Deploy to Cloud Run
         run: |
+          SERVICE="${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}"
           EXTRA_FLAGS=""
-          if [ "${{ inputs.service_name }}" = "psm-grpc" ]; then
+          if [ "${{ matrix.service }}" = "grpc" ]; then
             EXTRA_FLAGS="--use-http2"
           fi
 
-          gcloud run deploy ${{ inputs.service_name }} \
+          gcloud run deploy $SERVICE \
             --image ${{ steps.img.outputs.uri }} \
             --region ${{ env.REGION }} \
             --platform managed \
@@ -85,7 +103,7 @@ jobs:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
             :rocket: *[${{ inputs.environment }}] Deployed*
-            Service: `${{ inputs.service_name }}` | Image: `${{ steps.img.outputs.uri }}`
+            Service: `${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}` | Image: `${{ steps.img.outputs.uri }}`
             Repo: ${{ github.repository }} | Branch: ${{ github.ref_name }}
             By: ${{ github.actor }}
         env:
@@ -98,7 +116,7 @@ jobs:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
             :x: *[${{ inputs.environment }}] Deploy Failed*
-            Service: `${{ inputs.service_name }}` | Branch: ${{ github.ref_name }}
+            Service: `${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}` | Branch: ${{ github.ref_name }}
             Repo: ${{ github.repository }}
             By: ${{ github.actor }} | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
