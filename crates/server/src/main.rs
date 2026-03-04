@@ -33,8 +33,8 @@ async fn main() {
 
     ServerBuilder::new()
         .with_logging(LoggingConfig::default())
-        .network(NetworkType::MidenDevnet)
-        .with_canonicalization(None)
+        .network(NetworkType::MidenTestnet)
+        .with_canonicalization(Some(CanonicalizationConfig::new(10, 24)))
         .with_rate_limit(RateLimitConfig::from_env())
         .with_body_limit(BodyLimitConfig::from_env())
         .storage(storage_backend)
