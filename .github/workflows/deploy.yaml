@@ -94,6 +94,7 @@ jobs:
             --image ${{ steps.img.outputs.uri }} \
             --region ${{ env.REGION }} \
             --platform managed \
+            --update-env-vars GUARDIAN_NETWORK_TYPE=MidenTestnet \
             $EXTRA_FLAGS
 
       - name: Notify Success

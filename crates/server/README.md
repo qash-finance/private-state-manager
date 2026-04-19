@@ -1,4 +1,4 @@
-# Private State Manager Server
+# Guardian Server
 
 Server for managing private account states and deltas.
 
@@ -18,19 +18,22 @@ let builder = ServerBuilder::new()
 
 ### Environment Variables
 
-- `POSTGRES_PASSWORD` - PostgreSQL password (required for Postgres storage/metadata)
-- `DATABASE_URL` - PostgreSQL connection URL (required for Postgres storage/metadata, e.g., `postgres://psm:${POSTGRES_PASSWORD}@localhost:5432/psm`)
-- `PSM_KEYSTORE_PATH` - Keystore path for cryptographic keys (default: `/var/psm/keystore`)
+- `DATABASE_URL` - PostgreSQL connection URL (required for Postgres storage/metadata, e.g., `postgres://guardian:guardian_dev_password@localhost:5432/guardian`)
+- `GUARDIAN_ENV` - Runtime environment (`prod` uses Secrets Manager-backed ack bootstrap, anything else uses filesystem ack keys)
+- `GUARDIAN_KEYSTORE_PATH` - Keystore path for cryptographic keys (default: `/var/guardian/keystore`)
+- `AWS_REGION` - AWS region used to fetch production ack keys from Secrets Manager
 - `RUST_LOG` - Logging level (default: `info`)
 
 #### Rate Limiting
 
-- `PSM_RATE_BURST_PER_SEC` - Maximum requests per second (burst limit, default: `10`)
-- `PSM_RATE_PER_MIN` - Maximum requests per minute (sustained limit, default: `60`)
+- `GUARDIAN_RATE_LIMIT_ENABLED` - Enable or disable HTTP rate limiting entirely (default: `true`)
+- `GUARDIAN_RATE_BURST_PER_SEC` - Maximum requests per second (burst limit, default: `10`)
+- `GUARDIAN_RATE_PER_MIN` - Maximum requests per minute (sustained limit, default: `60`)
 
 #### Request Size Limits
 
-- `PSM_MAX_REQUEST_BYTES` - Maximum request body size in bytes (default: `1048576` = 1 MB)
+- `GUARDIAN_MAX_REQUEST_BYTES` - Maximum request body size in bytes (default: `1048576` = 1 MB)
+- `GUARDIAN_MAX_PENDING_PROPOSALS_PER_ACCOUNT` - Maximum pending delta proposals per account (default: `20`)
 
 Requests exceeding this limit receive a 413 Payload Too Large response.
 
@@ -50,10 +53,11 @@ The server uses a single storage backend per instance: `Filesystem` by default, 
 use server::storage::filesystem::FilesystemService;
 use std::path::PathBuf;
 
-let storage = FilesystemService::new(PathBuf::from("/var/psm/storage")).await?;
+let storage = FilesystemService::new(PathBuf::from("/var/guardian/storage")).await?;
 ```
 
 Filesystem is the default when the binary is built without the `postgres` feature.
+It is also the default ack-key mode for local runs, using `GUARDIAN_KEYSTORE_PATH`.
 
 #### Postgres Storage
 
@@ -64,15 +68,33 @@ Migrations run automatically at startup (the server runs migrations on boot).
 ```rust
 use server::storage::postgres::PostgresService;
 
-let database_url = "postgres://psm:psm_dev_password@localhost:5432/psm";
+let database_url = "postgres://guardian:guardian_dev_password@localhost:5432/guardian";
 
 let storage = PostgresService::new(&database_url).await?;
 ```
 
 ```bash
-DATABASE_URL=postgres://psm:psm_dev_password@localhost:5432/psm \
-cargo run --features postgres --package private-state-manager-server
+DATABASE_URL=postgres://guardian:guardian_dev_password@localhost:5432/guardian \
+cargo run --features postgres --package guardian-server
 ```
+
+### Ack Key Backends
+
+Local runs and non-prod environments default to filesystem-backed ack keys under `GUARDIAN_KEYSTORE_PATH`.
+
+Production ECS runs bootstrap the filesystem keystore from Secrets Manager when:
+
+```bash
+GUARDIAN_ENV=prod
+AWS_REGION=us-east-1
+```
+
+On startup, the server fetches these two fixed Secrets Manager entries once, imports them into `GUARDIAN_KEYSTORE_PATH`, and then uses the normal filesystem keystore for signing:
+
+- `guardian-prod/server/ack-falcon-secret-key`
+- `guardian-prod/server/ack-ecdsa-secret-key`
+
+Local and `dev` deployments stay on the filesystem-only path.
 
 ### Metadata Store
 
@@ -85,7 +107,7 @@ use server::metadata::filesystem::FilesystemMetadataStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-let metadata = FilesystemMetadataStore::new(PathBuf::from("/var/psm/metadata")).await?;
+let metadata = FilesystemMetadataStore::new(PathBuf::from("/var/guardian/metadata")).await?;
 
 let builder = ServerBuilder::new()
     .metadata(Arc::new(metadata));
@@ -97,7 +119,7 @@ let builder = ServerBuilder::new()
 use server::metadata::postgres::PostgresMetadataStore;
 use std::sync::Arc;
 
-let database_url = "postgres://psm:psm_dev_password@localhost:5432/psm";
+let database_url = "postgres://guardian:guardian_dev_password@localhost:5432/guardian";
 
 let metadata = PostgresMetadataStore::new(&database_url).await?;
 
@@ -123,7 +145,7 @@ Or use the `RUST_LOG` environment variable to override:
 
 ```bash
 # Debug level for entire server
-RUST_LOG=debug cargo run --package private-state-manager-server
+RUST_LOG=debug cargo run --package guardian-server
 
 # Trace only canonicalization jobs
 RUST_LOG=server::jobs::canonicalization=trace cargo run
@@ -141,7 +163,10 @@ The HTTP API includes built-in rate limiting to protect against abuse. Rate limi
 - **IP-based limits**: All requests are tracked by client IP address
 - **Enhanced keying**: When `x-pubkey` header or `account_id` query parameter is present, limits are applied per IP+account/signer combination
 - **Two windows**: Burst (per second) and sustained (per minute) limits are enforced independently
-- **Proxy support**: Respects `X-Forwarded-For` and `X-Real-IP` headers for proxied requests
+- **Ingress assumption**: GUARDIAN prefers `X-Forwarded-For`, then `X-Real-IP`, then the socket peer IP. Deployments should restrict direct access so only the ingress proxy/load balancer can reach the server
+- **Disable switch**: `GUARDIAN_RATE_LIMIT_ENABLED=false` bypasses HTTP rate limiting entirely
+
+If `GUARDIAN_RATE_LIMIT_ENABLED=false`, the HTTP server skips rate limiting regardless of the other rate-limit settings.
 
 #### Response When Limited
 
@@ -169,7 +194,7 @@ ServerBuilder::new()
     .with_body_limit(BodyLimitConfig::new(5 * 1024 * 1024))  // 5 MB
     // ...
 
-// Load from environment (PSM_RATE_BURST_PER_SEC, PSM_RATE_PER_MIN, PSM_MAX_REQUEST_BYTES)
+// Load from environment (GUARDIAN_RATE_LIMIT_ENABLED, GUARDIAN_RATE_BURST_PER_SEC, GUARDIAN_RATE_PER_MIN, GUARDIAN_MAX_REQUEST_BYTES)
 ServerBuilder::new()
     .with_rate_limit(RateLimitConfig::from_env())
     .with_body_limit(BodyLimitConfig::from_env())
@@ -188,11 +213,12 @@ ServerBuilder::new()
 - **GET** `/delta/since?account_id=<id>&nonce=<n>` - Retrieve the delta since a given nonce
 - **POST** `/delta/proposal` - Create a delta proposal for multi-party signing
 - **POST** `/delta/proposal/sign` - Add a signature to an existing delta proposal
-- **GET** `/delta/proposals?account_id=<id>` - List pending delta proposals for an account
+- **GET** `/delta/proposal?account_id=<id>` - List pending delta proposals for an account
+- **GET** `/delta/proposal/single?account_id=<id>&commitment=<c>` - Retrieve a pending proposal by commitment
 
 #### gRPC API (Port 50051)
 
-All methods are available through the `state_manager.StateManager` service:
+All methods are available through the `guardian.Guardian` service:
 - `Configure(ConfigureRequest) -> ConfigureResponse`
 - `PushDelta(PushDeltaRequest) -> PushDeltaResponse`
 - `GetDelta(GetDeltaRequest) -> GetDeltaResponse`
@@ -202,25 +228,29 @@ All methods are available through the `state_manager.StateManager` service:
 - `PushDeltaProposal(PushDeltaProposalRequest) -> PushDeltaProposalResponse`
 - `SignDeltaProposal(SignDeltaProposalRequest) -> SignDeltaProposalResponse`
 - `GetDeltaProposals(GetDeltaProposalsRequest) -> GetDeltaProposalsResponse`
+- `GetDeltaProposal(GetDeltaProposalRequest) -> GetDeltaProposalResponse`
 
-See `proto/state_manager.proto` for the complete protocol buffer definitions.
+See `proto/guardian.proto` for the complete protocol buffer definitions.
 
 
 ## Running with Docker Compose
 
-The project includes a `docker-compose.yml` with a Postgres service for local development:
+The project includes a root [docker-compose.yml](/Users/marcos/repos/guardian/docker-compose.yml) for a filesystem-backed local server:
 
 ```bash
-# Start the server with Postgres
-docker-compose up -d
+# Start the local server
+docker compose up -d
 
-# The services expose:
+# The service exposes:
 # - Server HTTP: localhost:3000
 # - Server gRPC: localhost:50051
-# - Postgres: localhost:5432 (user: psm, password: psm_dev_password, db: psm)
 ```
 
-The Postgres service uses a health check and the server waits for it to be ready before starting.
+If you need a local Postgres container, use [docker-compose.postgres.yml](/Users/marcos/repos/guardian/docker-compose.postgres.yml):
+
+```bash
+POSTGRES_PASSWORD=guardian_dev_password docker compose -f docker-compose.postgres.yml up -d
+```
 
 ## Benchmarking
 
@@ -241,7 +271,7 @@ Quick commands:
 ./crates/server/bench/scripts/run_matrix.sh
 ```
 
-For benchmark runs that need env-driven `PSM_NETWORK_TYPE` and `PSM_CANONICALIZATION_*`, use the runtime code switch documented in `crates/server/bench/README.md` under `Benchmark Runtime Code Switch (Main Branch)`.
+For benchmark runs that need env-driven `GUARDIAN_NETWORK_TYPE` and `GUARDIAN_CANONICALIZATION_*`, use the runtime code switch documented in `crates/server/bench/README.md` under `Benchmark Runtime Code Switch (Main Branch)`.
 
 ## Testing
 
@@ -254,17 +284,17 @@ cargo test
 Run specific integration tests:
 
 ```bash
-cargo test --package private-state-manager-server --test e2e_http_auth_test -- --test-threads=1
+cargo test --package guardian-server --test e2e_http_auth_test -- --test-threads=1
 ```
 
 Feature-gated test groups:
 
 ```bash
 # Integration tests (requires network/mocks as applicable)
-cargo test -p private-state-manager-server --features integration
+cargo test -p guardian-server --features integration
 
 # End-to-end tests
-cargo test -p private-state-manager-server --features e2e
+cargo test -p guardian-server --features e2e
 ```
 
 ### Reproducible Builds
@@ -315,7 +345,7 @@ Update the digests in `Dockerfile` to maintain reproducibility. Then verify that
 
 ### Building gRPC Clients
 
-Use the proto file at `proto/state_manager.proto` to generate client code:
+Use the proto file at `proto/guardian.proto` to generate client code:
 - **Rust**: `tonic` and `prost`
 - **Python**: `grpcio` and `grpcio-tools`
 - **Go**: Official `protoc` compiler with Go plugins

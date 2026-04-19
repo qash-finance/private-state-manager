@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ack::AckRegistry;
-use crate::api::grpc::StateManagerService;
+use crate::api::grpc::GuardianService;
 use crate::metadata::auth::Auth;
 use crate::metadata::filesystem::FilesystemMetadataStore;
 use crate::network::NetworkClient;
@@ -12,16 +12,19 @@ use crate::storage::filesystem::FilesystemService;
 use crate::testing::mocks::MockNetworkClient;
 use async_trait::async_trait;
 use chrono::Utc;
+use guardian_shared::auth_request_message::AuthRequestMessage;
+use guardian_shared::auth_request_payload::AuthRequestPayload;
+use guardian_shared::hex::IntoHex;
+use guardian_shared::{FromJson, ToJson};
 use miden_protocol::account::{AccountDelta, AccountId, AccountStorageDelta, AccountVaultDelta};
-use miden_protocol::crypto::dsa::falcon512_rpo::SecretKey;
-use miden_protocol::crypto::hash::rpo::Rpo256;
-use miden_protocol::transaction::{InputNotes, OutputNotes, TransactionSummary};
-use miden_protocol::utils::Serializable;
-use miden_protocol::{Felt, FieldElement, Word, ZERO};
-use private_state_manager_shared::hex::IntoHex;
-use private_state_manager_shared::{FromJson, ToJson};
+use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SecretKey as EcdsaSecretKey;
+use miden_protocol::crypto::dsa::falcon512_poseidon2::SecretKey;
+use miden_protocol::transaction::{InputNotes, RawOutputNotes, TransactionSummary};
+use miden_protocol::utils::serde::Serializable;
+use miden_protocol::{Felt, Word, ZERO};
+use prost::Message;
 
-pub use crate::api::grpc::state_manager::*;
+pub use crate::api::grpc::guardian::*;
 pub use tonic::{Request, metadata::MetadataValue};
 
 pub struct IntegrationMockNetworkClient {
@@ -54,7 +57,7 @@ impl NetworkClient for IntegrationMockNetworkClient {
         let account = Account::from_json(state_json)
             .map_err(|e| format!("Failed to deserialize account: {e}"))?;
 
-        let local_commitment = account.commitment();
+        let local_commitment = account.to_commitment();
         let local_commitment_hex = format!("0x{}", hex::encode(local_commitment.as_bytes()));
 
         Ok(local_commitment_hex)
@@ -70,7 +73,7 @@ impl NetworkClient for IntegrationMockNetworkClient {
         let account = Account::from_json(state_json)
             .map_err(|e| format!("Failed to deserialize account: {e}"))?;
 
-        let local_commitment = account.commitment();
+        let local_commitment = account.to_commitment();
         let local_commitment_hex = format!("0x{}", hex::encode(local_commitment.as_bytes()));
 
         if let Some(on_chain_commitment) = self.initial_commitments.get(account_id) {
@@ -137,6 +140,14 @@ impl NetworkClient for IntegrationMockNetworkClient {
         Ok(())
     }
 
+    fn validate_guardian_commitment(
+        &self,
+        _state_json: &serde_json::Value,
+        _expected_guardian_commitment: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn should_update_auth(
         &mut self,
         state_json: &serde_json::Value,
@@ -150,11 +161,11 @@ impl NetworkClient for IntegrationMockNetworkClient {
 
 pub async fn create_test_app_state() -> AppState {
     let storage_dir =
-        std::env::temp_dir().join(format!("psm_test_storage_{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("guardian_test_storage_{}", uuid::Uuid::new_v4()));
     let metadata_dir =
-        std::env::temp_dir().join(format!("psm_test_metadata_{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("guardian_test_metadata_{}", uuid::Uuid::new_v4()));
     let keystore_dir =
-        std::env::temp_dir().join(format!("psm_test_keystore_{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("guardian_test_keystore_{}", uuid::Uuid::new_v4()));
 
     std::fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
     std::fs::create_dir_all(&metadata_dir).expect("Failed to create metadata directory");
@@ -170,7 +181,9 @@ pub async fn create_test_app_state() -> AppState {
     let storage_backend: Arc<dyn StorageBackend> = Arc::new(storage);
 
     let mock_client = MockNetworkClient::new();
-    let ack = AckRegistry::new(keystore_dir).expect("Failed to create ack registry");
+    let ack = AckRegistry::new(keystore_dir)
+        .await
+        .expect("Failed to create signer registry");
 
     AppState {
         storage: storage_backend,
@@ -182,8 +195,8 @@ pub async fn create_test_app_state() -> AppState {
     }
 }
 
-pub fn create_grpc_service(state: AppState) -> StateManagerService {
-    StateManagerService { app_state: state }
+pub fn create_grpc_service(state: AppState) -> GuardianService {
+    GuardianService { app_state: state }
 }
 
 pub fn create_request_with_auth<T>(
@@ -211,6 +224,16 @@ pub fn create_request_with_auth<T>(
     request
 }
 
+pub fn create_signed_request_with_auth<T: Message>(
+    payload: T,
+    account_id_hex: &str,
+    signer: &TestSigner,
+) -> Request<T> {
+    let request_payload = AuthRequestPayload::from_protobuf_message(&payload);
+    let (sig, timestamp) = signer.sign_request(account_id_hex, &request_payload);
+    create_request_with_auth(payload, &signer.pubkey_hex, &sig, timestamp)
+}
+
 pub fn create_miden_falcon_rpo_auth(cosigner_commitments: Vec<String>) -> AuthConfig {
     AuthConfig {
         auth_type: Some(auth_config::AuthType::MidenFalconRpo(MidenFalconRpoAuth {
@@ -235,6 +258,10 @@ pub fn create_router(state: AppState) -> axum::Router {
         .route(
             "/get_delta_proposals",
             axum::routing::get(http::get_delta_proposals),
+        )
+        .route(
+            "/get_delta_proposal",
+            axum::routing::get(http::get_delta_proposal),
         )
         .route(
             "/sign_delta_proposal",
@@ -299,7 +326,7 @@ pub fn create_test_delta_payload(account_id_hex: &str) -> serde_json::Value {
     let tx_summary = TransactionSummary::new(
         delta,
         InputNotes::new(Vec::new()).unwrap(),
-        OutputNotes::new(Vec::new()).unwrap(),
+        RawOutputNotes::new(Vec::new()).unwrap(),
         Word::from([ZERO; 4]), // Salt
     );
 
@@ -347,22 +374,135 @@ impl TestSigner {
         self.sign_with_timestamp(account_id_hex, timestamp)
     }
 
+    /// Sign an account ID and request payload with an auto-incrementing timestamp.
+    /// Ensures each call returns a timestamp greater than the previous one.
+    /// Returns (signature_hex, timestamp_ms)
+    pub fn sign_request(
+        &self,
+        account_id_hex: &str,
+        request_payload: &AuthRequestPayload,
+    ) -> (String, i64) {
+        let current = Utc::now().timestamp_millis();
+        let last = self.last_timestamp.get();
+        let timestamp = if current <= last { last + 1 } else { current };
+        self.last_timestamp.set(timestamp);
+        self.sign_with_timestamp_and_request(account_id_hex, timestamp, request_payload)
+    }
+
+    pub fn sign_json_payload<T: serde::Serialize>(
+        &self,
+        account_id_hex: &str,
+        request_payload: &T,
+    ) -> (String, i64) {
+        let request_payload = AuthRequestPayload::from_json_serializable(request_payload)
+            .expect("Valid JSON payload");
+        self.sign_request(account_id_hex, &request_payload)
+    }
+
     /// Sign an account ID with a specific timestamp
     /// Returns (signature_hex, timestamp)
     pub fn sign_with_timestamp(&self, account_id_hex: &str, timestamp: i64) -> (String, i64) {
-        let account_id = AccountId::from_hex(account_id_hex).expect("Valid account ID");
-        let account_id_felts: [Felt; 2] = account_id.into();
+        self.sign_with_timestamp_and_request(
+            account_id_hex,
+            timestamp,
+            &AuthRequestPayload::empty(),
+        )
+    }
 
-        let timestamp_felt = Felt::new(timestamp as u64);
-        let message_elements = vec![
-            account_id_felts[0],
-            account_id_felts[1],
-            timestamp_felt,
-            Felt::ZERO,
-        ];
+    /// Sign an account ID and request payload with a specific timestamp.
+    /// Returns (signature_hex, timestamp)
+    pub fn sign_with_timestamp_and_request(
+        &self,
+        account_id_hex: &str,
+        timestamp: i64,
+        request_payload: &AuthRequestPayload,
+    ) -> (String, i64) {
+        let message = AuthRequestMessage::from_account_id_hex(
+            account_id_hex,
+            timestamp,
+            request_payload.clone(),
+        )
+        .expect("Valid account ID")
+        .to_word();
 
-        let digest = Rpo256::hash_elements(&message_elements);
-        let message: Word = digest;
+        let signature = self.secret_key.sign(message);
+        let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
+
+        (signature_hex, timestamp)
+    }
+}
+
+pub struct TestEcdsaSigner {
+    secret_key: EcdsaSecretKey,
+    pub pubkey_hex: String,
+    pub commitment_hex: String,
+    last_timestamp: std::cell::Cell<i64>,
+}
+
+impl Default for TestEcdsaSigner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestEcdsaSigner {
+    pub fn new() -> Self {
+        let secret_key = EcdsaSecretKey::new();
+        let public_key = secret_key.public_key();
+        let commitment = public_key.to_commitment();
+        let commitment_hex = format!("0x{}", hex::encode(commitment.to_bytes()));
+        let pubkey_hex = format!("0x{}", hex::encode(public_key.to_bytes()));
+        Self {
+            secret_key,
+            pubkey_hex,
+            commitment_hex,
+            last_timestamp: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn sign_request(
+        &self,
+        account_id_hex: &str,
+        request_payload: &AuthRequestPayload,
+    ) -> (String, i64) {
+        let current = Utc::now().timestamp_millis();
+        let last = self.last_timestamp.get();
+        let timestamp = if current <= last { last + 1 } else { current };
+        self.last_timestamp.set(timestamp);
+        self.sign_with_timestamp_and_request(account_id_hex, timestamp, request_payload)
+    }
+
+    pub fn sign_json_payload<T: serde::Serialize>(
+        &self,
+        account_id_hex: &str,
+        request_payload: &T,
+    ) -> (String, i64) {
+        let request_payload = AuthRequestPayload::from_json_serializable(request_payload)
+            .expect("Valid JSON payload");
+        self.sign_request(account_id_hex, &request_payload)
+    }
+
+    pub fn sign_with_timestamp(&self, account_id_hex: &str, timestamp: i64) -> (String, i64) {
+        self.sign_with_timestamp_and_request(
+            account_id_hex,
+            timestamp,
+            &AuthRequestPayload::empty(),
+        )
+    }
+
+    pub fn sign_with_timestamp_and_request(
+        &self,
+        account_id_hex: &str,
+        timestamp: i64,
+        request_payload: &AuthRequestPayload,
+    ) -> (String, i64) {
+        let message = AuthRequestMessage::from_account_id_hex(
+            account_id_hex,
+            timestamp,
+            request_payload.clone(),
+        )
+        .expect("Valid account ID")
+        .to_word();
 
         let signature = self.secret_key.sign(message);
         let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
@@ -393,9 +533,31 @@ pub fn generate_falcon_signature(account_id_hex: &str) -> (String, String, Strin
     generate_falcon_signature_with_timestamp(account_id_hex, timestamp)
 }
 
+/// Generates an ECDSA signature for replay-resistant authentication.
+/// Returns (pubkey_hex, commitment_hex, signature_hex, timestamp)
+pub fn generate_ecdsa_signature_with_timestamp(
+    account_id_hex: &str,
+    timestamp: i64,
+) -> (String, String, String, i64) {
+    let signer = TestEcdsaSigner::new();
+    let (signature_hex, timestamp) = signer.sign_with_timestamp(account_id_hex, timestamp);
+    (
+        signer.pubkey_hex,
+        signer.commitment_hex,
+        signature_hex,
+        timestamp,
+    )
+}
+
+/// Convenience function that generates an ECDSA signature with current timestamp (milliseconds)
+pub fn generate_ecdsa_signature(account_id_hex: &str) -> (String, String, String, i64) {
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    generate_ecdsa_signature_with_timestamp(account_id_hex, timestamp)
+}
+
 pub fn pubkey_hex_to_commitment_hex(pubkey_hex: &str) -> String {
-    use miden_protocol::crypto::dsa::falcon512_rpo::PublicKey;
-    use miden_protocol::utils::{Deserializable, Serializable};
+    use miden_protocol::crypto::dsa::falcon512_poseidon2::PublicKey;
+    use miden_protocol::utils::serde::{Deserializable, Serializable};
 
     let pubkey_hex = pubkey_hex.strip_prefix("0x").unwrap_or(pubkey_hex);
     let pubkey_bytes = hex::decode(pubkey_hex).expect("Valid public key hex");
@@ -420,12 +582,13 @@ pub fn create_test_app_state_with_mocks(
     metadata: Arc<dyn crate::metadata::MetadataStore>,
 ) -> AppState {
     let keystore_dir =
-        std::env::temp_dir().join(format!("psm_test_keystore_{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("guardian_test_keystore_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&keystore_dir).expect("Failed to create keystore directory");
 
     let storage_backend: Arc<dyn StorageBackend> = storage;
 
-    let ack = AckRegistry::new(keystore_dir).expect("Failed to create ack registry");
+    let ack = futures::executor::block_on(AckRegistry::new(keystore_dir))
+        .expect("Failed to create signer registry");
 
     AppState {
         storage: storage_backend,

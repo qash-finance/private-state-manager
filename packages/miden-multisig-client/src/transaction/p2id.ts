@@ -1,26 +1,32 @@
 import type { TransactionRequest, Word } from '@miden-sdk/miden-sdk';
 import {
   AccountId,
-  Felt,
   FeltArray,
   FungibleAsset,
   MidenArrays,
   Note,
   NoteAssets,
-  NoteInputs,
   NoteMetadata,
   NoteRecipient,
   NoteScript,
+  NoteStorage,
   NoteTag,
   NoteType,
-  OutputNote,
-  Rpo256,
+  Poseidon2,
   TransactionRequestBuilder,
   Word as WordType,
 } from '@miden-sdk/miden-sdk';
 import { randomWord } from '../utils/random.js';
 import { normalizeHexWord } from '../utils/encoding.js';
 import type { SignatureOptions } from './options.js';
+
+export function deriveP2idSerialNumber(salt: Word): Word {
+  const zeroWord = WordType.fromHex(`0x${'00'.repeat(32)}`);
+  return Poseidon2.hashElements(new FeltArray([
+    ...salt.toFelts(),
+    ...zeroWord.toFelts(),
+  ]));
+}
 
 function buildP2idNote(
   sender: AccountId,
@@ -30,18 +36,15 @@ function buildP2idNote(
   saltHex: string,
 ): Note {
   const salt = WordType.fromHex(normalizeHexWord(saltHex));
-  const serialNum = Rpo256.hashElements(new FeltArray([
-    ...salt.toFelts(),
-    new Felt(0n),
-  ]));
+  const serialNum = deriveP2idSerialNumber(salt);
 
   const noteScript = NoteScript.p2id();
-  const noteInputs = new NoteInputs(new FeltArray([
+  const noteStorage = new NoteStorage(new FeltArray([
     recipient.suffix(),
     recipient.prefix(),
   ]));
 
-  const noteRecipient = new NoteRecipient(serialNum, noteScript, noteInputs);
+  const noteRecipient = new NoteRecipient(serialNum, noteScript, noteStorage);
   const noteTag = NoteTag.withAccountTarget(recipient);
 
   const noteMetadata = new NoteMetadata(
@@ -77,8 +80,7 @@ export function buildP2idTransactionRequest(
     authSaltHex,
   );
 
-  const outputNote = OutputNote.full(note);
-  const outputNotes = new MidenArrays.OutputNoteArray([outputNote]);
+  const outputNotes = new MidenArrays.NoteArray([note]);
 
   const authSaltForBuilder = WordType.fromHex(normalizeHexWord(authSaltHex));
 
@@ -97,4 +99,3 @@ export function buildP2idTransactionRequest(
     salt: authSaltForReturn,
   };
 }
-

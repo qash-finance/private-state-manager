@@ -1,37 +1,61 @@
-import type { SignatureScheme } from '@openzeppelin/psm-client';
-
-export const PROCEDURE_ROOTS_FALCON = {
-  update_signers: '0x53d0ad381a193de0cf6af3730141e498274103dfc3b8c8e7367bd49d4a66c72b',
-  auth_tx: '0x474c613b38001cc36d68557e9d881495d6a461a9027033445c7672c586509026',
-  update_psm: '0xb103236807e5bf09c27efc2c5287ca8b03ab9efc1d852b62ebd31f5f1927ec26',
-  verify_psm: '0x30727fc23c6105a678fea8b4c1920f35fa85c03f16a0cf98372c8f56701f8a87',
-  send_asset: '0x0e406b067ed2bcd7de745ca6517f519fd1a9be245f913347ac673ca1db30c1d6',
-  receive_asset: '0x6f4bdbdc4b13d7ed933d590d88ac9dfb98020c9e917697845b5e169395b76a01',
+/**
+ * Static mapping of procedure names to their deterministic roots.
+ *
+ * These values use the Miden SDK `Word.toHex()` / `Word.fromHex()` encoding, which is the
+ * representation used by the TypeScript client when writing and reading storage map keys.
+ *
+ * Source of truth:
+ * `cargo run --quiet --example procedure_roots -p miden-multisig-client -- --json`
+ *
+ * Note: the Rust example also prints `rust_hex` values for `procedures.rs`. Those are a different
+ * human-readable encoding and should not be copied into this table.
+ */
+export const PROCEDURE_ROOTS = {
+  update_signers: '0x3d382ad461f9914c487c6fe908991d088eb54ecbd4aa8560ef79c66c3746bf19',
+  update_procedure_threshold: '0x1f43e9d56ceff5d547ffdcb89896fb38cae0be1b74d9235ed2b4aa525df85f8d',
+  auth_tx: '0x415530d7169f849d7219e810065f9119bba9af2c55070de0bf4f082a1c0aea5c',
+  update_guardian: '0xc8ea876f1837e5cd1d6031becdbd40ce262ecd55930d65400f6890a37149d80c',
+  verify_guardian: '0x9bc6e7b25c8dbaa29d6ad41e354a545dd0a4bac7f3a521bb5195ba101f0213cc',
+  send_asset: '0x6d30df4312a2c44ec842db1bee227cc045396ca91e2c47d756dcb607f2bf5f89',
+  receive_asset: '0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb',
 } as const;
 
-export const PROCEDURE_ROOTS_ECDSA = {
-  update_signers: '0x930f9ea86d33c7b3b2d23c4e9ac2492add461359344ed25b1acd38f3713dd79c',
-  auth_tx: '0x2bc7664a9dd47b36e7c8b8c3df03412798e4410173f36acfe03d191a38add053',
-  update_psm: '0x26ec27195f1fd3eb622b851dfc9eab038bca87522cfc7ec209bfe507682303b1',
-  verify_psm: '0xbeb9e08a83eca030968f2f137b5673136f21bc16c82fd408c2ce2495ccbdcd15',
-  send_asset: '0xd6c130dba13c67ac4733915f24bea9d19f517f51a65c74ded7bcd27e066b400e',
-  receive_asset: '0x016ab79593165e5b849776919e0c0298fb9dac880d593d93edd7134bdcdb4b6f',
-} as const;
+/**
+ * Valid procedure names that can be used for threshold overrides.
+ */
+export type ProcedureName = keyof typeof PROCEDURE_ROOTS;
 
-export const PROCEDURE_ROOTS = PROCEDURE_ROOTS_FALCON;
-
-export type ProcedureName = keyof typeof PROCEDURE_ROOTS_FALCON;
-
-export function getProcedureRoot(name: ProcedureName, scheme: SignatureScheme = 'falcon'): string {
-  const roots = scheme === 'ecdsa' ? PROCEDURE_ROOTS_ECDSA : PROCEDURE_ROOTS_FALCON;
-  return roots[name];
+/**
+ * Get the procedure root for a given procedure name.
+ *
+ * @param name - The procedure name
+ * @returns The procedure root as a hex string in SDK `Word.toHex()` format
+ *
+ * @example
+ * ```typescript
+ * const root = getProcedureRoot('send_asset');
+ * // '0x6d30df4312a2c44ec842db1bee227cc045396ca91e2c47d756dcb607f2bf5f89'
+ * ```
+ */
+export function getProcedureRoot(name: ProcedureName): string {
+  return PROCEDURE_ROOTS[name];
 }
 
+/**
+ * Check if a string is a valid procedure name.
+ *
+ * @param name - The string to check
+ * @returns true if the string is a valid procedure name
+ */
 export function isProcedureName(name: string): name is ProcedureName {
-  return name in PROCEDURE_ROOTS_FALCON;
+  return name in PROCEDURE_ROOTS;
 }
 
-export function getProcedureNames(scheme: SignatureScheme = 'falcon'): ProcedureName[] {
-  const roots = scheme === 'ecdsa' ? PROCEDURE_ROOTS_ECDSA : PROCEDURE_ROOTS_FALCON;
-  return Object.keys(roots) as ProcedureName[];
+/**
+ * Get all available procedure names.
+ *
+ * @returns Array of all valid procedure names
+ */
+export function getProcedureNames(): ProcedureName[] {
+  return Object.keys(PROCEDURE_ROOTS) as ProcedureName[];
 }

@@ -1,7 +1,7 @@
 {
   "name": "@openzeppelin/miden-multisig-client",
-  "version": "0.13.0",
-  "description": "TypeScript SDK for Miden multisig accounts with PSM integration",
+  "version": "0.14.3",
+  "description": "TypeScript SDK for Miden multisig accounts with GUARDIAN integration",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -18,17 +18,19 @@
     "masm"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "typecheck": "tsc --noEmit",
+    "generate:masm": "node ./scripts/generate-masm.mjs",
+    "build": "npm run generate:masm && tsc",
+    "dev": "npm run generate:masm && tsc --watch",
+    "typecheck": "npm run generate:masm && tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "npm run generate:masm && vitest run",
+    "test:watch": "npm run generate:masm && vitest"
   },
   "dependencies": {
-    "@miden-sdk/miden-sdk": "^0.13.0",
+    "@noble/curves": "^1.9.7",
+    "@miden-sdk/miden-sdk": "0.14.3",
     "@noble/hashes": "^2.0.1",
-    "@openzeppelin/psm-client": "^0.13.0"
+    "@openzeppelin/guardian-client": "^0.14.3"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

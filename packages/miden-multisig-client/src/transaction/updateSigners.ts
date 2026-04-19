@@ -2,18 +2,24 @@ import {
   AdviceMap,
   Felt,
   FeltArray,
-  Rpo256,
+  type MidenClient,
+  Poseidon2,
   TransactionRequest,
   TransactionRequestBuilder,
   TransactionScript,
-  WebClient,
+  type WasmWebClient,
   Word,
   Word as WordType,
 } from '@miden-sdk/miden-sdk';
-import { MULTISIG_ECDSA_MASM, MULTISIG_MASM, PSM_ECDSA_MASM, PSM_MASM } from '../account/masm.js';
+import {
+  MULTISIG_ECDSA_MASM,
+  MULTISIG_MASM,
+} from '../account/masm/auth.js';
+import { compileTxScript } from '../raw-client.js';
 import { normalizeHexWord } from '../utils/encoding.js';
 import { randomWord } from '../utils/random.js';
 import type { SignatureOptions } from './options.js';
+import type { SignatureScheme } from '../types.js';
 
 function buildMultisigConfigAdvice(
   threshold: number,
@@ -31,50 +37,35 @@ function buildMultisigConfigAdvice(
     felts.push(...word.toFelts());
   }
   const payload = new FeltArray(felts);
-  const configHash = Rpo256.hashElements(payload);
+  const configHash = Poseidon2.hashElements(payload);
   return { configHash, payload };
 }
 
-function buildUpdateSignersFalconScript(webClient: WebClient): TransactionScript {
-  const libBuilder = webClient.createCodeBuilder();
-  const psmLib = libBuilder.buildLibrary('openzeppelin::psm', PSM_MASM);
-  libBuilder.linkStaticLibrary(psmLib);
-
-  const multisigLib = libBuilder.buildLibrary('auth::multisig', MULTISIG_MASM);
-  libBuilder.linkDynamicLibrary(multisigLib);
+async function buildUpdateSignersScript(
+  client: MidenClient | WasmWebClient,
+  signatureScheme: SignatureScheme,
+  midenRpcEndpoint?: string,
+): Promise<TransactionScript> {
+  const multisigMasm = signatureScheme === 'ecdsa' ? MULTISIG_ECDSA_MASM : MULTISIG_MASM;
 
   const scriptSource = `
-use auth::multisig
+use oz_multisig::multisig
 
 begin
     call.multisig::update_signers_and_threshold
 end
   `;
 
-  return libBuilder.compileTxScript(scriptSource);
-}
-
-function buildUpdateSignersEcdsaScript(webClient: WebClient): TransactionScript {
-  const libBuilder = webClient.createCodeBuilder();
-  const psmLib = libBuilder.buildLibrary('openzeppelin::psm_ecdsa', PSM_ECDSA_MASM);
-  libBuilder.linkStaticLibrary(psmLib);
-
-  const multisigLib = libBuilder.buildLibrary('auth::multisig', MULTISIG_ECDSA_MASM);
-  libBuilder.linkDynamicLibrary(multisigLib);
-
-  const scriptSource = `
-use auth::multisig
-
-begin
-    call.multisig::update_signers_and_threshold
-end
-  `;
-
-  return libBuilder.compileTxScript(scriptSource);
+  return compileTxScript(
+    client,
+    scriptSource,
+    [{ namespace: 'oz_multisig::multisig', code: multisigMasm }],
+    midenRpcEndpoint,
+  );
 }
 
 export async function buildUpdateSignersTransactionRequest(
-  webClient: WebClient,
+  client: MidenClient | WasmWebClient,
   threshold: number,
   signerCommitments: string[],
   options: SignatureOptions = {},
@@ -89,9 +80,11 @@ export async function buildUpdateSignersTransactionRequest(
   const advice = new AdviceMap();
   advice.insert(configHashForAdvice, payload);
 
-  const script = signatureScheme === 'ecdsa'
-    ? buildUpdateSignersEcdsaScript(webClient)
-    : buildUpdateSignersFalconScript(webClient);
+  const script = await buildUpdateSignersScript(
+    client,
+    signatureScheme,
+    options.midenRpcEndpoint,
+  );
 
   const authSaltHex = options.salt ? options.salt.toHex() : randomWord().toHex();
 

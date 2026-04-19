@@ -1,20 +1,18 @@
 # @openzeppelin/miden-multisig-client
 
-TypeScript SDK for private multisignature workflows on Miden. This package wraps the on-chain multisig contracts plus Private State Manager (PSM) coordination so you can:
+TypeScript SDK for private multisignature workflows on Miden. This package wraps the on-chain multisig contracts plus Guardian coordination so you can:
 
-- Create multisig accounts, register them with a PSM, and keep state off-chain
+- Create multisig accounts, register them with a GUARDIAN, and keep state off-chain
 - Propose, sign, and execute transactions with threshold enforcement
 - Export/import proposals as files for sharing using side channels
-- Integrate external wallets via the external signing API
-- Use Falcon or ECDSA signature schemes
 
-## How Private Multisigs & PSM Work
+## How Private Multisigs & GUARDIAN Work
 
-Miden multisig accounts store their authentication logic on-chain, but **their state (signers, metadata, proposals)** is kept private. PSM acts as a coordination server:
+Miden multisig accounts store their authentication logic on-chain, but **their state (signers, metadata, proposals)** is kept private. GUARDIAN acts as a coordination server:
 
-1. A proposer pushes a delta (transaction plan) to Private State Manager (PSM). PSM tracks who signed and emits an ack signature once the threshold is met.
-2. Cosigners fetch pending deltas, verify details locally, sign the transaction summary, and push signatures back to PSM.
-3. Once ready, any cosigner builds the final transaction using all cosigner signatures + the PSM ack, executes it on-chain.
+1. A proposer pushes a delta (transaction plan) to Guardian. GUARDIAN tracks who signed and emits an ack signature once the threshold is met.
+2. Cosigners fetch pending deltas, verify details locally, sign the transaction summary, and push signatures back to GUARDIAN.
+3. Once ready, any cosigner builds the final transaction using all cosigner signatures + the GUARDIAN ack, executes it on-chain.
 
 ## Installation
 
@@ -26,57 +24,53 @@ npm install @openzeppelin/miden-multisig-client @miden-sdk/miden-sdk
 
 ```typescript
 import { MultisigClient, FalconSigner } from '@openzeppelin/miden-multisig-client';
-import { WebClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
+import { AuthSecretKey, MidenClient } from '@miden-sdk/miden-sdk';
 
-// Initialize Miden WebClient
-const webClient = await WebClient.createClient('https://rpc.testnet.miden.io:443');
+const midenClient = await MidenClient.createDevnet();
 
-// Create a Falcon signer
+// Create a signer from your secret key
 const secretKey = AuthSecretKey.rpoFalconWithRNG(undefined);
 const signer = new FalconSigner(secretKey);
 
-// Create MultisigClient and fetch PSM info
-const client = new MultisigClient(webClient, {
-  psmEndpoint: 'http://localhost:3000',
+// Create MultisigClient
+const client = new MultisigClient(midenClient, {
+  guardianEndpoint: 'http://localhost:3000',
+  midenRpcEndpoint: 'https://rpc.devnet.miden.io',
 });
-const { psmCommitment } = await client.initialize();
-```
-
-### ECDSA Signer
-
-```typescript
-import { MultisigClient, EcdsaSigner } from '@openzeppelin/miden-multisig-client';
-import { AuthSecretKey } from '@miden-sdk/miden-sdk';
-
-const secretKey = AuthSecretKey.ecdsaWithRNG(undefined);
-const signer = new EcdsaSigner(secretKey);
-
-const client = new MultisigClient(webClient, { psmEndpoint: 'http://localhost:3000' });
-const { psmCommitment } = await client.initialize('ecdsa');
 ```
 
 ## Usage
+
+### Get GUARDIAN Public Key
+
+Before creating a multisig, get the GUARDIAN server's public key commitment:
+
+```typescript
+const guardianCommitment = await client.guardianClient.getPubkey();
+```
 
 ### Create a Multisig Account
 
 ```typescript
 const config = {
-  threshold: 2,
-  signerCommitments: [signer.commitment, otherSignerCommitment],
-  psmCommitment,
-  signatureScheme: 'falcon', // or 'ecdsa'
+  threshold: 2, // Require 2 signatures
+  signerCommitments: [
+    signer.commitment,      // Your commitment
+    otherSigner.commitment, // Cosigner's commitment
+  ],
+  guardianCommitment,
 };
 
 const multisig = await client.create(config, signer);
 console.log('Account ID:', multisig.accountId);
 ```
 
-### Register on PSM
+### Register on GUARDIAN
 
-After creating the account, register it on the PSM server:
+After creating the account, register it on the GUARDIAN server:
 
 ```typescript
-await multisig.registerOnPsm();
+await multisig.registerOnGuardian();
 ```
 
 ### Load an Existing Multisig
@@ -87,63 +81,57 @@ The configuration is automatically detected from the account's on-chain storage:
 const multisig = await client.load(accountId, signer);
 ```
 
-### Sync Everything
-
-Fetch proposals, state, consumable notes, and config in one call:
+### Fetch Account State
 
 ```typescript
-const { proposals, state, notes, config } = await multisig.syncAll();
-for (const p of proposals) {
-  console.log(`${p.id}: ${p.status.type}`);
-}
+const state = await multisig.fetchState();
+console.log('Commitment:', state.commitment);
+console.log('Created:', state.createdAt);
 ```
 
-### List Cached Proposals
-
-Returns cached proposals without making a network request:
+### Create a Proposal (Add Signer)
 
 ```typescript
-const proposals = multisig.listTransactionProposals();
-for (const p of proposals) {
-  if (p.status.type === 'pending') {
-    console.log(`Pending: ${p.status.signaturesCollected}/${p.status.signaturesRequired}`);
-  } else if (p.status.type === 'ready') {
-    console.log('Ready to execute!');
-  }
-}
-```
-
-### Create Proposals
-
-All create methods return `{ proposal, proposals }` — the new proposal plus an auto-synced full list:
-
-```typescript
-// Add a signer
-const { proposal, proposals } = await multisig.createAddSignerProposal(
-  newSignerCommitment,
-  { newThreshold: 3 },
+// Create a proposal to add a new signer
+const proposal = await multisig.createAddSignerProposal(
+  newSignerCommitment, // Commitment of signer to add
+  undefined,
+  3,
 );
-
-// Remove a signer
-await multisig.createRemoveSignerProposal(signerToRemove);
-
-// Change threshold
-await multisig.createChangeThresholdProposal(3);
-
-// Consume notes
-await multisig.createConsumeNotesProposal(noteIds);
-
-// Send payment (P2ID)
-await multisig.createSendProposal(recipientId, faucetId, amount);
-
-// Switch PSM provider
-await multisig.createSwitchPsmProposal(newEndpoint, newPubkey);
+console.log('Proposal ID:', proposal.id);
 ```
 
 ### Sign a Proposal
 
 ```typescript
-const proposals = await multisig.signTransactionProposal(proposal.commitment);
+const signedProposal = await multisig.signProposal(proposal.id);
+console.log('Signatures:', signedProposal.signatures.length);
+```
+
+### Sync Proposals
+
+Fetches proposals from the GUARDIAN server and updates local state:
+
+```typescript
+const proposals = await multisig.syncProposals();
+for (const p of proposals) {
+  console.log(`${p.id}: ${p.status}`);
+}
+```
+
+### Check Proposal Status
+
+Returns cached proposals without making a network request:
+
+```typescript
+const proposals = multisig.listProposals();
+for (const p of proposals) {
+  if (p.status === 'pending') {
+    console.log(`Pending signatures: ${p.signatures.length}`);
+  } else if (p.status === 'ready') {
+    console.log('Ready to execute!');
+  }
+}
 ```
 
 ### Execute a Proposal
@@ -151,68 +139,56 @@ const proposals = await multisig.signTransactionProposal(proposal.commitment);
 When a proposal has enough signatures:
 
 ```typescript
-if (proposal.status.type === 'ready') {
-  await multisig.executeTransactionProposal(proposal.commitment);
+if (proposal.status === 'ready') {
+  await multisig.executeProposal(proposal.id);
+  console.log('Transaction executed on-chain!');
 }
 ```
 
-### External Signing
-
-For wallet integrations where the signing key is external (e.g., a browser wallet):
+### Export Proposal for Offline Signing
 
 ```typescript
-// Fetch proposals
-const proposals = multisig.listTransactionProposals();
-
-// Sign the commitment externally
-const signature = await wallet.sign(proposals[0].commitment);
-
-// Submit the external signature
-await multisig.signTransactionProposalExternal({
-  commitment: proposals[0].commitment,
-  signature,
-  publicKey: wallet.publicKey,
-  scheme: 'ecdsa',
-});
+const exported = await multisig.exportProposal(proposal.id);
+// Send `exported` to offline signer
+console.log('TX Summary:', exported.txSummaryBase64);
+console.log('Commitment to sign:', exported.commitment);
 ```
 
-### Wallet Signers
+### Import and Sign a Proposal Offline
 
-For integrating with external wallets, use `ParaSigner` or `MidenWalletSigner`:
+Imported proposals are now validated against their transaction summary before they are cached or
+signed:
 
 ```typescript
-import { ParaSigner, MidenWalletSigner } from '@openzeppelin/miden-multisig-client';
-
-// Para wallet integration
-const signer = new ParaSigner(paraContext, walletId, commitment, publicKey);
-
-// Miden wallet integration
-const signer = new MidenWalletSigner(walletContext, commitment, 'ecdsa');
+const imported = await multisig.importProposal(jsonFromCosigner);
+const signedJson = await multisig.signProposalOffline(imported.id);
+console.log(signedJson);
 ```
 
-### Export/Import Proposals
+## Transaction Utilities
 
-Share proposals via side channels for offline signing:
+The package also exports utility functions for building transactions:
 
 ```typescript
-// Export
-const json = multisig.exportTransactionProposalToJson(proposal.commitment);
+import {
+  normalizeHexWord,
+  hexToUint8Array,
+  signatureHexToBytes,
+  buildSignatureAdviceEntry,
+} from '@openzeppelin/miden-multisig-client';
 
-// Sign offline and get updated JSON
-const signedJson = multisig.signTransactionProposalOffline(proposal.commitment);
+// Normalize hex for Word.fromHex (pads to 64 chars)
+const normalized = normalizeHexWord('abc123');
+// => '0x0000...abc123'
 
-// Import
-const { proposal, proposals } = multisig.importTransactionProposal(json);
+// Convert hex to bytes
+const bytes = hexToUint8Array('deadbeef');
+// => Uint8Array([0xde, 0xad, 0xbe, 0xef])
+
+// Add auth scheme prefix to signature
+const sigBytes = signatureHexToBytes(signatureHex);
+// => Uint8Array with the Falcon Poseidon2 auth prefix
 ```
-
-## Signers
-
-| Signer | Scheme | Use case |
-|--------|--------|----------|
-| `FalconSigner` | `falcon` | Local Falcon key (default) |
-| `EcdsaSigner` | `ecdsa` | Local ECDSA key |
-| `ParaSigner` | `ecdsa` | External wallet via Para protocol |
-| `MidenWalletSigner` | any | Miden wallet browser extension |
 
 ## Testing
 
