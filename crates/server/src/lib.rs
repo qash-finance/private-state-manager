@@ -1,4 +1,4 @@
-pub use private_state_manager_shared::{FromJson, ToJson};
+pub use guardian_shared::{FromJson, ToJson};
 
 pub mod ack;
 pub mod api;
@@ -19,6 +19,7 @@ pub mod network;
 pub mod services;
 pub mod state_object;
 pub mod storage;
+mod utils;
 
 #[cfg(test)]
 pub mod testing;

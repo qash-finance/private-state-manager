@@ -54,6 +54,17 @@ describe('MidenWalletSigner', () => {
       expect(signer.publicKey).toBe('0xcommitment');
     });
 
+    it('should use explicit publicKey when provided', () => {
+      const signer = new MidenWalletSigner(
+        mockWallet,
+        '0xcommitment',
+        'ecdsa',
+        undefined,
+        '0xwalletpubkey',
+      );
+      expect(signer.publicKey).toBe('0xwalletpubkey');
+    });
+
     it('should use localAuthSigner publicKey when provided', () => {
       const localSigner: Signer = {
         commitment: '0xlocal',
@@ -103,6 +114,42 @@ describe('MidenWalletSigner', () => {
       const signer = new MidenWalletSigner(mockWallet, '0xcommitment', 'ecdsa', localSigner);
       await signer.signCommitment('0x' + 'cc'.repeat(32));
       expect(mockWallet.signBytes).toHaveBeenCalled();
+    });
+  });
+
+  describe('signRequest', () => {
+    it('delegates to localAuthSigner when present', async () => {
+      const localSigner: Signer = {
+        commitment: '0xlocal',
+        publicKey: '0xlocalpubkey',
+        scheme: 'ecdsa',
+        signAccountIdWithTimestamp: vi.fn(),
+        signRequest: vi.fn().mockResolvedValue('0xlocalsig'),
+        signCommitment: vi.fn(),
+      };
+      const signer = new MidenWalletSigner(mockWallet, '0xcommitment', 'ecdsa', localSigner);
+
+      const result = await signer.signRequest(
+        '0x' + 'aa'.repeat(15),
+        1700000000,
+        { toBytes: () => new Uint8Array([1, 2, 3, 4]) } as never,
+      );
+
+      expect(result).toBe('0xlocalsig');
+      expect(localSigner.signRequest).toHaveBeenCalled();
+      expect(mockWallet.signBytes).not.toHaveBeenCalled();
+    });
+
+    it('uses request-bound auth digest for wallet-backed ECDSA signing', async () => {
+      const signer = new MidenWalletSigner(mockWallet, '0xcommitment', 'ecdsa');
+
+      await signer.signRequest(
+        '0x' + 'aa'.repeat(15),
+        1700000000,
+        { toBytes: () => new Uint8Array([1, 2, 3, 4]) } as never,
+      );
+
+      expect(mockWallet.signBytes).toHaveBeenCalledWith(expect.any(Uint8Array), 'word');
     });
   });
 

@@ -1,4 +1,4 @@
-# Private State Manager Specification
+# Guardian Specification
 
 Private state manager is a system that allows a device, or a group of devices, to backup and sync their state securely without trust assumptions about other participants or the server operator.
 
@@ -35,7 +35,7 @@ Example:
 
 ### Delta
 
-A delta is whatever changes you apply to that state in append-only operations. The change on the state is also validated against some network state and acknowledged (signed) by the private state manager.
+A delta is whatever changes you apply to that state in append-only operations. The change on the state is also validated against some network state and acknowledged (signed) by the Guardian.
 
 Example:
 ```json
@@ -55,7 +55,7 @@ Example:
 
 ### Account ID
 
-Is the unique identifier of an account holding a state, the private state manager can host multiple accounts and route authenticated requests to each.
+Is the unique identifier of an account holding a state, the Guardian can host multiple accounts and route authenticated requests to each.
 
 ### Delta Proposal
 
@@ -63,7 +63,7 @@ Multi-party accounts use delta proposals to coordinate before publishing a canon
 
 ### Commitment
 
-Is the commitment of the state, it's a hash, nonce, or any other identifier that serves as the unique identifier of the current state of the account. It's used to cerifify that the state is not forked or corrupted. Each new delta includes a prev_commitment field that references the commitment of the base state in which the delta is applied.
+Is the commitment of the state, it's a hash, nonce, or any other identifier that serves as the unique identifier of the current state of the account. It's used to certify that the state is not forked or corrupted. Each new delta includes a prev_commitment field that references the commitment of the base state in which the delta is applied.
 
 ### Nonce
 

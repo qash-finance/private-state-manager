@@ -1,10 +1,10 @@
 //! Note consumption transaction utilities.
 
-use miden_client::Client;
 use miden_client::transaction::{NoteArgs, TransactionRequest, TransactionRequestBuilder};
 use miden_protocol::note::{Note, NoteId};
 use miden_protocol::{Felt, Word};
 
+use crate::MidenSdkClient;
 use crate::error::{MultisigError, Result};
 
 /// Builds a transaction request to consume notes.
@@ -26,7 +26,7 @@ use crate::error::{MultisigError, Result};
 /// - Any note is not found in the local store
 /// - Any note cannot be converted to a full Note object (missing metadata)
 pub async fn build_consume_notes_transaction_request<I>(
-    client: &Client<()>,
+    client: &MidenSdkClient,
     note_ids: Vec<NoteId>,
     salt: Word,
     signature_advice: I,
@@ -40,6 +40,7 @@ where
         ));
     }
 
+    // Fetch full Note objects from the client's local store
     let mut notes: Vec<(Note, Option<NoteArgs>)> = Vec::new();
     for note_id in &note_ids {
         let input_note_record = client
@@ -53,6 +54,7 @@ where
                 ))
             })?;
 
+        // Convert InputNoteRecord to Note using TryInto
         let note: Note = input_note_record.try_into().map_err(|e| {
             MultisigError::InvalidConfig(format!("failed to convert note record to note: {:?}", e))
         })?;
@@ -60,10 +62,12 @@ where
         notes.push((note, None));
     }
 
+    // Build the transaction request with full Note objects
     let mut builder = TransactionRequestBuilder::new()
         .input_notes(notes)
         .auth_arg(salt);
 
+    // Add signature advice entries
     for (key, values) in signature_advice {
         builder = builder.extend_advice_map([(key, values)]);
     }

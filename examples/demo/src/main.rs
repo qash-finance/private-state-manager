@@ -9,7 +9,7 @@ use rustyline::DefaultEditor;
 
 use actions::{
     action_create_account, action_list_notes, action_proposal_management, action_show_account,
-    action_show_status, action_sync_account,
+    action_show_status, action_sync_account, action_verify_state_commitment,
 };
 use display::{
     print_banner, print_error, print_full_hex, print_section, print_success, print_waiting,
@@ -50,25 +50,23 @@ async fn startup(editor: &mut DefaultEditor) -> Result<SessionState, String> {
         }
     };
 
-    // PSM endpoint selection
-    println!("\n  Select PSM server:");
+    // GUARDIAN endpoint selection
+    println!("\n  Select GUARDIAN gRPC server:");
     println!("    [1] Local gRPC (http://localhost:50051)");
-    println!("    [2] Local HTTP (http://localhost:3000)");
-    println!("    [3] Custom URL");
+    println!("    [2] Custom gRPC URL");
     println!();
 
-    let psm_choice = prompt_input(editor, "PSM Server [1]: ")?;
-    let psm_endpoint = match psm_choice.trim() {
+    let guardian_choice = prompt_input(editor, "GUARDIAN Server [1]: ")?;
+    let guardian_endpoint = match guardian_choice.trim() {
         "" | "1" => "http://localhost:50051".to_string(),
-        "2" => "http://localhost:3000".to_string(),
-        "3" => prompt_input(editor, "Enter PSM Server URL: ")?,
+        "2" => prompt_input(editor, "Enter GUARDIAN gRPC URL: ")?,
         _ => {
             println!("  Invalid choice, using local gRPC");
             "http://localhost:50051".to_string()
         }
     };
 
-    println!("\n  PSM Server: {}", psm_endpoint);
+    println!("\n  GUARDIAN Server: {}", guardian_endpoint);
     println!(
         "  Miden Node: {}://{}{}",
         miden_endpoint.protocol(),
@@ -106,21 +104,18 @@ async fn startup(editor: &mut DefaultEditor) -> Result<SessionState, String> {
 
     let mut state = SessionState::new()?;
     state
-        .initialize_client(miden_endpoint, &psm_endpoint, signature_scheme)
+        .initialize_client(miden_endpoint, &guardian_endpoint, signature_scheme)
         .await?;
 
     let commitment_hex = state.user_commitment_hex()?;
 
     print_success("Client initialized!");
     println!("  Signature scheme: {}", state.signature_scheme_name());
-    match signature_scheme {
-        SignatureScheme::Ecdsa => {
-            println!("  Your commitment: {}", shorten_hex_32(&commitment_hex));
-            print_full_hex("  Your commitment (full)", &commitment_hex);
-        }
-        SignatureScheme::Falcon => {
-            print_full_hex("  Your commitment", &commitment_hex);
-        }
+    if state.is_ecdsa() {
+        println!("  Your commitment: {}", shorten_hex_32(&commitment_hex));
+        print_full_hex("  Your commitment (full)", &commitment_hex);
+    } else {
+        print_full_hex("  Your commitment", &commitment_hex);
     }
     println!("\n  Share this commitment with other cosigners to be added to multisig accounts.");
 
@@ -159,6 +154,7 @@ async fn handle_action(
     match action {
         MenuAction::CreateAccount => action_create_account(state, editor).await,
         MenuAction::SyncAccount => action_sync_account(state, editor).await,
+        MenuAction::VerifyStateCommitment => action_verify_state_commitment(state).await,
         MenuAction::ListNotes => action_list_notes(state).await,
         MenuAction::ProposalManagement => action_proposal_management(state, editor).await,
         MenuAction::ShowAccount => action_show_account(state).await,

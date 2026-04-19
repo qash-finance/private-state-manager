@@ -1,10 +1,20 @@
 use crate::builder::state::AppState;
 use crate::delta_object::{CosignerSignature, DeltaObject, DeltaStatus};
-use crate::error::{PsmError, Result};
+use crate::error::{GuardianError, Result};
 use crate::metadata::auth::Credentials;
 use crate::services::{normalize_payload, resolve_account};
-use private_state_manager_shared::DeltaSignature;
+use guardian_shared::DeltaSignature;
 use tracing::info;
+
+const DEFAULT_MAX_PENDING_PROPOSALS_PER_ACCOUNT: usize = 20;
+const MAX_PENDING_PROPOSALS_ENV_VAR: &str = "GUARDIAN_MAX_PENDING_PROPOSALS_PER_ACCOUNT";
+
+fn max_pending_proposals_per_account() -> usize {
+    std::env::var(MAX_PENDING_PROPOSALS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_PENDING_PROPOSALS_PER_ACCOUNT)
+}
 
 #[derive(Debug, Clone)]
 pub struct PushDeltaProposalParams {
@@ -35,12 +45,14 @@ pub async fn push_delta_proposal(
 
     let resolved = resolve_account(state, &account_id, &credentials).await?;
 
+    // Fetch current state to validate delta
     let current_state = resolved
         .storage
         .pull_state(&account_id)
         .await
-        .map_err(|_| PsmError::StateNotFound(account_id.clone()))?;
+        .map_err(|_| GuardianError::StateNotFound(account_id.clone()))?;
 
+    // Check for pending candidates before accepting new proposal
     let has_pending = resolved
         .storage
         .has_pending_candidate(&account_id)
@@ -51,16 +63,37 @@ pub async fn push_delta_proposal(
                 error = %e,
                 "Failed to check pending candidate in push_delta_proposal"
             );
-            PsmError::StorageError(format!("Failed to check pending candidate: {e}"))
+            GuardianError::StorageError(format!("Failed to check pending candidate: {e}"))
         })?;
 
     if has_pending {
-        return Err(PsmError::ConflictPendingDelta);
+        return Err(GuardianError::ConflictPendingDelta);
     }
 
+    let pending_proposals = resolved
+        .storage
+        .pull_pending_proposals(&account_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                account_id = %account_id,
+                error = %e,
+                "Failed to load pending proposals in push_delta_proposal"
+            );
+            GuardianError::StorageError(format!("Failed to load pending proposals: {e}"))
+        })?;
+
+    let max_pending_proposals = max_pending_proposals_per_account();
+    if pending_proposals.len() >= max_pending_proposals {
+        return Err(GuardianError::PendingProposalsLimit {
+            limit: max_pending_proposals,
+        });
+    }
+
+    // Extract tx_summary and signatures from delta_payload
     let tx_summary = delta_payload
         .get("tx_summary")
-        .ok_or_else(|| PsmError::InvalidDelta("Missing 'tx_summary' field".to_string()))?;
+        .ok_or_else(|| GuardianError::InvalidDelta("Missing 'tx_summary' field".to_string()))?;
 
     let signatures = delta_payload
         .get("signatures")
@@ -68,6 +101,8 @@ pub async fn push_delta_proposal(
         .cloned()
         .unwrap_or_default();
 
+    // Validate delta using network client (check validity but don't apply)
+    // and compute the delta commitment
     let commitment = {
         let client = state.network_client.lock().await;
         client
@@ -76,22 +111,34 @@ pub async fn push_delta_proposal(
                 &current_state.state_json,
                 tx_summary,
             )
-            .map_err(PsmError::InvalidDelta)?;
+            .map_err(GuardianError::InvalidDelta)?;
 
+        // Compute the delta proposal ID from the tx_summary
         client
             .delta_proposal_id(&account_id, nonce, tx_summary)
-            .map_err(PsmError::InvalidDelta)?
+            .map_err(GuardianError::InvalidDelta)?
     };
 
+    // Extract proposer ID from credentials
     let proposer_id = match &credentials {
-        Credentials::Signature { pubkey, .. } => pubkey.clone(),
+        Credentials::Signature { pubkey, .. } => resolved
+            .metadata
+            .auth
+            .compute_signer_commitment(pubkey)
+            .map_err(|e| {
+                GuardianError::AuthenticationFailed(format!(
+                    "invalid proposer public key for {}: {}",
+                    account_id, e
+                ))
+            })?,
     };
 
+    // Parse cosigner signatures from the payload and add timestamp
     let signature_timestamp = state.clock.now_rfc3339();
     let mut cosigner_sigs = Vec::new();
     for sig_value in signatures {
         let parsed: DeltaSignature = serde_json::from_value(sig_value).map_err(|e| {
-            PsmError::InvalidDelta(format!("Invalid signature entry in payload: {e}"))
+            GuardianError::InvalidDelta(format!("Invalid signature entry in payload: {e}"))
         })?;
 
         cosigner_sigs.push(CosignerSignature {
@@ -112,6 +159,7 @@ pub async fn push_delta_proposal(
         "push_delta_proposal received"
     );
 
+    // Create delta object with Pending status including any provided signatures
     let timestamp = state.clock.now_rfc3339();
     let delta_proposal = DeltaObject {
         account_id: account_id.clone(),
@@ -129,11 +177,12 @@ pub async fn push_delta_proposal(
         },
     };
 
+    // Store the delta proposal in the proposals directory using the commitment as ID
     resolved
         .storage
         .submit_delta_proposal(&commitment, &delta_proposal)
         .await
-        .map_err(PsmError::StorageError)?;
+        .map_err(GuardianError::StorageError)?;
     let stored_signer_count = match &delta_proposal.status {
         DeltaStatus::Pending { cosigner_sigs, .. } => cosigner_sigs.len(),
         _ => 0,
@@ -162,7 +211,7 @@ mod tests {
     use crate::testing::fixtures;
     use crate::testing::helpers::create_test_app_state_with_mocks;
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
-    use private_state_manager_shared::ProposalSignature;
+    use guardian_shared::ProposalSignature;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -185,15 +234,10 @@ mod tests {
         (state, storage, network, metadata)
     }
 
-    fn create_account_metadata(
-        account_id: String,
-        cosigner_commitments: Vec<String>,
-    ) -> AccountMetadata {
+    fn create_account_metadata(account_id: String, auth: Auth) -> AccountMetadata {
         AccountMetadata {
             account_id,
-            auth: Auth::MidenFalconRpo {
-                cosigner_commitments,
-            },
+            auth,
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
             has_pending_candidate: false,
@@ -216,6 +260,30 @@ mod tests {
         }
     }
 
+    fn create_pending_proposal(account_id: &str, nonce: u64) -> DeltaObject {
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+
+        DeltaObject {
+            account_id: account_id.to_string(),
+            nonce,
+            prev_commitment: "0x123".to_string(),
+            new_commitment: None,
+            delta_payload: serde_json::json!({
+                "tx_summary": delta_fixture["delta_payload"].clone(),
+                "signatures": []
+            }),
+            ack_sig: String::new(),
+            ack_pubkey: String::new(),
+            ack_scheme: String::new(),
+            status: DeltaStatus::Pending {
+                timestamp: "2024-11-14T12:00:00Z".to_string(),
+                proposer_id: "0xproposer".to_string(),
+                cosigner_sigs: vec![],
+            },
+        }
+    }
+
     #[tokio::test]
     async fn test_push_delta_proposal_success() {
         let (state, storage, network, metadata) = create_test_state();
@@ -227,12 +295,15 @@ mod tests {
 
         let test_commitment = "0x780aa2edb983c1baab3c81edcfe400bc54b516d5cb51f2a7cec4690667329392";
 
+        // Generate valid Falcon signature
         let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
             crate::testing::helpers::generate_falcon_signature(&account_id);
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex.clone()],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
         ))));
 
         let storage = storage.with_pull_state(Ok(create_state_object(
@@ -246,7 +317,12 @@ mod tests {
 
         let delta_payload = serde_json::json!({
             "tx_summary": delta_fixture["delta_payload"].clone(),
-            "signatures": []
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex.clone()]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -274,7 +350,90 @@ mod tests {
                 cosigner_sigs,
                 ..
             } => {
-                assert_eq!(*proposer_id, test_pubkey);
+                assert_eq!(*proposer_id, test_commitment_hex);
+                assert_eq!(cosigner_sigs.len(), 0);
+            }
+            _ => panic!("Expected Pending status"),
+        }
+
+        let submit_calls = storage.get_submit_delta_proposal_calls();
+        assert_eq!(submit_calls.len(), 1);
+        assert_eq!(submit_calls[0].0, "mock_proposal_id");
+    }
+
+    #[tokio::test]
+    async fn test_push_delta_proposal_success_for_ecdsa() {
+        use crate::testing::helpers::TestEcdsaSigner;
+        use guardian_shared::auth_request_payload::AuthRequestPayload;
+
+        let (state, storage, network, metadata) = create_test_state();
+
+        let account_json: serde_json::Value = serde_json::from_str(fixtures::ACCOUNT_JSON).unwrap();
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let test_commitment = "0x780aa2edb983c1baab3c81edcfe400bc54b516d5cb51f2a7cec4690667329392";
+        let signer = TestEcdsaSigner::new();
+
+        let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
+            account_id.clone(),
+            Auth::MidenEcdsa {
+                cosigner_commitments: vec![signer.commitment_hex.clone()],
+            },
+        ))));
+
+        let storage = storage.with_pull_state(Ok(create_state_object(
+            account_id.clone(),
+            test_commitment.to_string(),
+            account_json.clone(),
+        )));
+
+        let network = network.with_verify_delta(Ok(()));
+        let _network = network.with_validate_credential(Ok(()));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 2,
+                "required_signatures": 2,
+                "signer_commitments": [signer.commitment_hex.clone()]
+            },
+            "signatures": []
+        });
+        let request_body = serde_json::json!({
+            "account_id": account_id.clone(),
+            "nonce": 1,
+            "delta_payload": delta_payload.clone(),
+        });
+        let request_payload = AuthRequestPayload::from_json_serializable(&request_body).unwrap();
+        let (test_signature, test_timestamp) = signer.sign_request(&account_id, &request_payload);
+
+        let params = PushDeltaProposalParams {
+            account_id: account_id.clone(),
+            nonce: 1,
+            delta_payload,
+            credentials: Credentials::signature(
+                signer.pubkey_hex.clone(),
+                test_signature,
+                test_timestamp,
+            )
+            .with_request_payload(request_payload),
+        };
+
+        let result = push_delta_proposal(&state, params).await;
+
+        assert!(result.is_ok(), "Expected success, got: {:?}", result);
+        let result = result.unwrap();
+
+        match &result.delta.status {
+            DeltaStatus::Pending {
+                proposer_id,
+                cosigner_sigs,
+                ..
+            } => {
+                assert_eq!(*proposer_id, signer.commitment_hex);
                 assert_eq!(cosigner_sigs.len(), 0);
             }
             _ => panic!("Expected Pending status"),
@@ -296,6 +455,7 @@ mod tests {
 
         let test_commitment = "0x780aa2edb983c1baab3c81edcfe400bc54b516d5cb51f2a7cec4690667329392";
 
+        // Generate valid Falcon signatures for two cosigners
         let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
             crate::testing::helpers::generate_falcon_signature(&account_id);
         let (_, cosigner_commitment, _, _) =
@@ -303,7 +463,12 @@ mod tests {
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex.clone(), cosigner_commitment.clone()],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![
+                    test_commitment_hex.clone(),
+                    cosigner_commitment.clone(),
+                ],
+            },
         ))));
 
         let _storage = storage.with_pull_state(Ok(create_state_object(
@@ -326,7 +491,12 @@ mod tests {
                         "signature": dummy_sig
                     }
                 }
-            ]
+            ],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex.clone(), cosigner_commitment.clone()]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -346,7 +516,9 @@ mod tests {
                     ProposalSignature::Falcon { signature } => {
                         assert_eq!(*signature, dummy_sig);
                     }
-                    _ => panic!("Expected Falcon signature"),
+                    ProposalSignature::Ecdsa { signature, .. } => {
+                        assert_eq!(*signature, dummy_sig);
+                    }
                 }
             }
             _ => panic!("Expected Pending status"),
@@ -365,7 +537,9 @@ mod tests {
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
         ))));
 
         let _storage = storage.with_pull_state(Ok(create_state_object(
@@ -375,7 +549,12 @@ mod tests {
         )));
 
         let delta_payload = serde_json::json!({
-            "signatures": []
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -389,7 +568,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            PsmError::InvalidDelta(msg) => {
+            GuardianError::InvalidDelta(msg) => {
                 assert!(msg.contains("tx_summary"));
             }
             e => panic!("Expected InvalidDelta error, got: {:?}", e),
@@ -410,7 +589,9 @@ mod tests {
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
         ))));
 
         let _storage = storage.with_pull_state(Ok(create_state_object(
@@ -423,7 +604,12 @@ mod tests {
 
         let delta_payload = serde_json::json!({
             "tx_summary": delta_fixture["delta_payload"].clone(),
-            "signatures": []
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -437,7 +623,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            PsmError::InvalidDelta(msg) => {
+            GuardianError::InvalidDelta(msg) => {
                 assert_eq!(msg, "Invalid delta");
             }
             e => panic!("Expected InvalidDelta error, got: {:?}", e),
@@ -457,14 +643,21 @@ mod tests {
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
         ))));
 
         let _storage = storage.with_pull_state(Err("State not found".to_string()));
 
         let delta_payload = serde_json::json!({
             "tx_summary": delta_fixture["delta_payload"].clone(),
-            "signatures": []
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -478,7 +671,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            PsmError::StateNotFound(id) => {
+            GuardianError::StateNotFound(id) => {
                 assert_eq!(id, account_id);
             }
             e => panic!("Expected StateNotFound error, got: {:?}", e),
@@ -501,7 +694,9 @@ mod tests {
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
             account_id.clone(),
-            vec![test_commitment_hex.clone()],
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
         ))));
 
         let storage = storage.with_pull_state(Ok(create_state_object(
@@ -510,6 +705,7 @@ mod tests {
             account_json.clone(),
         )));
 
+        // Mock pull_deltas_after to return a candidate delta (this triggers has_pending_candidate)
         let candidate_delta = DeltaObject {
             account_id: account_id.clone(),
             nonce: 1,
@@ -530,7 +726,12 @@ mod tests {
 
         let delta_payload = serde_json::json!({
             "tx_summary": delta_fixture["delta_payload"].clone(),
-            "signatures": []
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex]
+            }
         });
 
         let params = PushDeltaProposalParams {
@@ -544,8 +745,129 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            PsmError::ConflictPendingDelta => {}
+            GuardianError::ConflictPendingDelta => {
+                // Expected - proposal creation blocked because there's a pending candidate
+            }
             e => panic!("Expected ConflictPendingDelta error, got: {:?}", e),
         }
+    }
+
+    #[tokio::test]
+    async fn test_push_delta_proposal_blocked_by_pending_proposal_limit() {
+        let (state, storage, network, metadata) = create_test_state();
+
+        let account_json: serde_json::Value = serde_json::from_str(fixtures::ACCOUNT_JSON).unwrap();
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
+            crate::testing::helpers::generate_falcon_signature(&account_id);
+
+        let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
+            account_id.clone(),
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
+        ))));
+
+        let mut pending = Vec::new();
+        for nonce in 1..=20u64 {
+            pending.push(create_pending_proposal(&account_id, nonce));
+        }
+
+        let _storage = storage
+            .with_pull_state(Ok(create_state_object(
+                account_id.clone(),
+                "0x123".to_string(),
+                account_json,
+            )))
+            .with_pull_all_delta_proposals(Ok(pending));
+
+        let _network = network.with_validate_credential(Ok(()));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex.clone()]
+            }
+        });
+
+        let params = PushDeltaProposalParams {
+            account_id,
+            nonce: 21,
+            delta_payload,
+            credentials: Credentials::signature(test_pubkey, test_signature, test_timestamp),
+        };
+
+        let result = push_delta_proposal(&state, params).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GuardianError::PendingProposalsLimit { limit } => {
+                assert_eq!(limit, 20);
+            }
+            e => panic!("Expected PendingProposalsLimit error, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_push_delta_proposal_allows_when_pending_proposals_below_limit() {
+        let (state, storage, network, metadata) = create_test_state();
+
+        let account_json: serde_json::Value = serde_json::from_str(fixtures::ACCOUNT_JSON).unwrap();
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
+            crate::testing::helpers::generate_falcon_signature(&account_id);
+
+        let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
+            account_id.clone(),
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
+        ))));
+
+        let mut pending = Vec::new();
+        for nonce in 1..20u64 {
+            pending.push(create_pending_proposal(&account_id, nonce));
+        }
+
+        let _storage = storage
+            .with_pull_state(Ok(create_state_object(
+                account_id.clone(),
+                "0x123".to_string(),
+                account_json,
+            )))
+            .with_pull_all_delta_proposals(Ok(pending));
+
+        let network = network.with_verify_delta(Ok(()));
+        let _network = network.with_validate_credential(Ok(()));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex.clone()]
+            }
+        });
+
+        let params = PushDeltaProposalParams {
+            account_id: account_id.clone(),
+            nonce: 20,
+            delta_payload,
+            credentials: Credentials::signature(test_pubkey, test_signature, test_timestamp),
+        };
+
+        let result = push_delta_proposal(&state, params).await;
+
+        assert!(result.is_ok(), "Expected success, got: {:?}", result);
     }
 }

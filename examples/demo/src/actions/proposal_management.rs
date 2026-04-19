@@ -1,9 +1,11 @@
 //! Unified proposal management - all proposal operations in one place.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use miden_multisig_client::{
-    commitment_from_hex, ensure_hex_prefix, Asset, ExportedProposal, NoteId, ProposalStatus,
+    ensure_hex_prefix, word_from_hex, Asset, ExportedProposal, NoteId, ProcedureName,
     TransactionType,
 };
 use miden_protocol::account::AccountId;
@@ -11,18 +13,12 @@ use rustyline::DefaultEditor;
 
 use crate::display::{
     print_error, print_full_hex, print_info, print_section, print_success, print_waiting,
-    shorten_hex, shorten_hex_32,
+    shorten_hex,
 };
 use crate::menu::prompt_input;
 use crate::state::SessionState;
 
-fn format_commitment_hex(ecdsa_mode: bool, hex: &str) -> String {
-    if ecdsa_mode {
-        shorten_hex_32(hex)
-    } else {
-        shorten_hex(hex)
-    }
-}
+type StateFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + 'a>>;
 
 /// Proposal Management submenu - all proposal operations.
 pub async fn action_proposal_management(
@@ -75,8 +71,8 @@ fn print_proposal_menu() {
     println!("\n┌─────────────────────────────────────────────┐");
     println!("│ Proposal Management                         │");
     println!("└─────────────────────────────────────────────┘");
-    println!("  PSM Operations:");
-    println!("  [1] Create proposal (via PSM)");
+    println!("  GUARDIAN Operations:");
+    println!("  [1] Create proposal (via GUARDIAN)");
     println!("  [2] View pending proposals");
     println!("  [3] Sign a proposal");
     println!("  [4] Execute a proposal");
@@ -90,10 +86,10 @@ fn print_proposal_menu() {
 }
 
 // =============================================================================
-// PSM Operations
+// GUARDIAN Operations
 // =============================================================================
 
-/// Create a proposal via PSM.
+/// Create a proposal via GUARDIAN.
 async fn action_create_proposal(
     state: &mut SessionState,
     editor: &mut DefaultEditor,
@@ -118,7 +114,8 @@ async fn action_create_proposal(
     println!("    [2] Remove cosigner");
     println!("    [3] Transfer assets (P2ID)");
     println!("    [4] Consume notes");
-    println!("    [5] Switch PSM provider");
+    println!("    [5] Switch GUARDIAN provider");
+    println!("    [6] Update procedure threshold override");
     println!("    [b] Back");
     println!();
 
@@ -129,33 +126,35 @@ async fn action_create_proposal(
         "2" => prompt_remove_cosigner(state, editor)?,
         "3" => prompt_p2id(state, editor)?,
         "4" => prompt_consume_notes(state, editor).await?,
-        "5" => prompt_switch_psm(state, editor)?,
+        "5" => prompt_switch_guardian(state, editor)?,
+        "6" => prompt_update_procedure_threshold(state, editor)?,
         "b" | "B" => return Ok(()),
         _ => return Err("Invalid choice".to_string()),
     };
 
-    print_waiting("Creating proposal on PSM");
+    print_waiting("Creating proposal on GUARDIAN");
 
     // Try to create proposal with retry for non-canonical delta pending errors
     match create_proposal_with_retry(state, transaction_type.clone(), editor).await {
         Ok(proposal) => {
             let client = state.get_client()?;
-            print_success("Proposal created on PSM server");
+            print_success("Proposal created on GUARDIAN server");
             print_full_hex("Proposal ID", &proposal.id);
             print_success(&format!(
                 "Automatically signed with your key ({})",
-                format_commitment_hex(state.is_ecdsa(), &client.user_commitment_hex())
+                shorten_hex(&client.user_commitment_hex())
             ));
+            let (_, required) = proposal.signature_counts();
             print_info(&format!(
                 "\nNeed {} signatures total. Use [3] to sign, [4] to execute.",
-                threshold
+                required
             ));
             Ok(())
         }
         Err(e) => {
             // Check if this is a non-retriable error and offer offline fallback
             if !is_pending_candidate_error(&e) {
-                print_error(&format!("PSM proposal creation failed: {}", e));
+                print_error(&format!("GUARDIAN proposal creation failed: {}", e));
                 print_info("\nWould you like to create this proposal offline instead? [y/N]");
                 let fallback = prompt_input(editor, "Choice: ")?;
 
@@ -181,6 +180,36 @@ fn is_commitment_mismatch_error(error: &str) -> bool {
         || error.contains("commitment mismatch")
 }
 
+fn is_recency_condition_error(error: &str) -> bool {
+    error.contains("recency condition error") || error.contains("too far behind the chain tip")
+}
+
+async fn sync_network_only_for_retry(state: &mut SessionState) -> Result<(), String> {
+    print_info("  Client is behind the chain tip. Syncing with the Miden network and retrying...");
+    let client = state.get_client_mut()?;
+    client
+        .sync_network_only()
+        .await
+        .map_err(|e| format!("Failed to sync with Miden network: {}", e))
+}
+
+async fn retry_on_recency_condition<T, F>(
+    state: &mut SessionState,
+    mut operation: F,
+) -> Result<T, String>
+where
+    F: for<'a> FnMut(&'a mut SessionState) -> StateFuture<'a, T>,
+{
+    match operation(state).await {
+        Ok(value) => Ok(value),
+        Err(error) if is_recency_condition_error(&error) => {
+            sync_network_only_for_retry(state).await?;
+            operation(state).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Maximum number of retries for proposal creation when delta is pending.
 const MAX_PROPOSAL_RETRIES: u32 = 6;
 /// Delay between retries in seconds.
@@ -197,16 +226,25 @@ async fn create_proposal_with_retry(
     let mut commitment_mismatch_retried = false;
 
     for attempt in 1..=MAX_PROPOSAL_RETRIES {
-        let client = state.get_client_mut()?;
-        let result = client.propose_transaction(transaction_type.clone()).await;
+        let result = retry_on_recency_condition(state, |state| {
+            let transaction_type = transaction_type.clone();
+            Box::pin(async move {
+                let client = state.get_client_mut()?;
+                client
+                    .propose_transaction(transaction_type)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .await;
 
         match result {
             Ok(proposal) => return Ok(proposal),
             Err(e) => {
-                last_error = e.to_string();
+                last_error = e;
 
                 if is_commitment_mismatch_error(&last_error) && !commitment_mismatch_retried {
-                    // Account was updated on-chain - need to re-sync and re-pull from PSM
+                    // Account was updated on-chain - need to re-sync and re-pull from GUARDIAN
                     print_info("  Account was updated on-chain. Re-syncing...");
                     commitment_mismatch_retried = true;
 
@@ -223,7 +261,7 @@ async fn create_proposal_with_retry(
                             return Err(last_error);
                         }
 
-                        // Re-pull account from PSM
+                        // Re-pull account from GUARDIAN
                         let client = state.get_client_mut()?;
                         if let Err(e) = client.pull_account(account_id).await {
                             print_error(&format!("Failed to re-pull account: {}", e));
@@ -270,17 +308,21 @@ async fn create_proposal_with_retry(
     ))
 }
 
-/// View pending proposals from PSM.
+/// View pending proposals from GUARDIAN.
 async fn action_view_proposals(state: &mut SessionState) -> Result<(), String> {
     print_section("View Pending Proposals");
 
-    let client = state.get_client_mut()?;
-
-    print_waiting("Fetching proposals from PSM");
-    let proposals = client
-        .list_proposals()
-        .await
-        .map_err(|e| format!("Failed to fetch proposals: {}", e))?;
+    print_waiting("Fetching proposals from GUARDIAN");
+    let proposals = retry_on_recency_condition(state, |state| {
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .list_proposals()
+                .await
+                .map_err(|e| format!("Failed to fetch proposals: {}", e))
+        })
+    })
+    .await?;
 
     if proposals.is_empty() {
         print_info("No pending proposals found for this account");
@@ -298,12 +340,10 @@ async fn action_view_proposals(state: &mut SessionState) -> Result<(), String> {
         print_full_hex("      Proposal ID", &proposal.id);
         println!("      Signatures: {}/{}", collected, required);
 
-        if let ProposalStatus::Pending { signers, .. } = &proposal.status {
-            if !signers.is_empty() {
-                println!("      Signers:");
-                for signer in signers {
-                    println!("        - {}", shorten_hex(signer));
-                }
+        if proposal.status.is_pending() && !proposal.metadata.signers.is_empty() {
+            println!("      Signers:");
+            for signer in &proposal.metadata.signers {
+                println!("        - {}", shorten_hex(signer));
             }
         }
         println!();
@@ -312,20 +352,24 @@ async fn action_view_proposals(state: &mut SessionState) -> Result<(), String> {
     Ok(())
 }
 
-/// Sign a proposal via PSM.
+/// Sign a proposal via GUARDIAN.
 async fn action_sign_proposal(
     state: &mut SessionState,
     editor: &mut DefaultEditor,
 ) -> Result<(), String> {
     print_section("Sign a Proposal");
 
-    let client = state.get_client_mut()?;
-
-    print_waiting("Fetching proposals from PSM");
-    let proposals = client
-        .list_proposals()
-        .await
-        .map_err(|e| format!("Failed to fetch proposals: {}", e))?;
+    print_waiting("Fetching proposals from GUARDIAN");
+    let proposals = retry_on_recency_condition(state, |state| {
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .list_proposals()
+                .await
+                .map_err(|e| format!("Failed to fetch proposals: {}", e))
+        })
+    })
+    .await?;
 
     if proposals.is_empty() {
         print_info("No pending proposals found");
@@ -353,19 +397,24 @@ async fn action_sign_proposal(
     }
 
     let proposal_id = proposals[idx].id.clone();
-    let ecdsa_mode = state.is_ecdsa();
-
     print_waiting("Signing proposal");
 
-    let client = state.get_client_mut()?;
-    let updated = client
-        .sign_proposal(&proposal_id)
-        .await
-        .map_err(|e| format!("Failed to sign: {}", e))?;
+    let updated = retry_on_recency_condition(state, |state| {
+        let proposal_id = proposal_id.clone();
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .sign_proposal(&proposal_id)
+                .await
+                .map_err(|e| format!("Failed to sign: {}", e))
+        })
+    })
+    .await?;
 
+    let client = state.get_client()?;
     print_success(&format!(
         "Signed with key {}",
-        format_commitment_hex(ecdsa_mode, &client.user_commitment_hex())
+        shorten_hex(&client.user_commitment_hex())
     ));
 
     let (collected, required) = updated.signature_counts();
@@ -378,20 +427,24 @@ async fn action_sign_proposal(
     Ok(())
 }
 
-/// Execute a proposal via PSM.
+/// Execute a proposal via GUARDIAN.
 async fn action_execute_proposal(
     state: &mut SessionState,
     editor: &mut DefaultEditor,
 ) -> Result<(), String> {
     print_section("Execute Proposal");
 
-    let client = state.get_client_mut()?;
-
-    print_waiting("Fetching proposals from PSM");
-    let proposals = client
-        .list_proposals()
-        .await
-        .map_err(|e| format!("Failed to get proposals: {}", e))?;
+    print_waiting("Fetching proposals from GUARDIAN");
+    let proposals = retry_on_recency_condition(state, |state| {
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .list_proposals()
+                .await
+                .map_err(|e| format!("Failed to get proposals: {}", e))
+        })
+    })
+    .await?;
 
     if proposals.is_empty() {
         print_info("No pending proposals found");
@@ -426,8 +479,17 @@ async fn action_execute_proposal(
 
     print_waiting("Executing proposal");
 
-    let client = state.get_client_mut()?;
-    let execute_result = client.execute_proposal(&proposal_id).await;
+    let execute_result = retry_on_recency_condition(state, |state| {
+        let proposal_id = proposal_id.clone();
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .execute_proposal(&proposal_id)
+                .await
+                .map_err(|e| format!("Failed to execute: {}", e))
+        })
+    })
+    .await;
 
     match execute_result {
         Ok(()) => {
@@ -453,12 +515,11 @@ async fn action_execute_proposal(
             Ok(())
         }
         Err(e) => {
-            let error_str = e.to_string();
-            if is_pending_candidate_error(&error_str) {
+            if is_pending_candidate_error(&e) {
                 print_error("A previous transaction is still being processed on-chain.");
                 print_info("Please wait for it to be confirmed before executing proposals.");
             }
-            Err(format!("Failed to execute: {}", e))
+            Err(e)
         }
     }
 }
@@ -467,20 +528,24 @@ async fn action_execute_proposal(
 // Offline/Export Operations
 // =============================================================================
 
-/// Export a proposal from PSM to file.
+/// Export a proposal from GUARDIAN to file.
 async fn action_export_proposal(
     state: &mut SessionState,
     editor: &mut DefaultEditor,
 ) -> Result<(), String> {
     print_section("Export Proposal to File");
 
-    let client = state.get_client_mut()?;
-
-    print_waiting("Fetching proposals from PSM");
-    let proposals = client
-        .list_proposals()
-        .await
-        .map_err(|e| format!("Failed to get proposals: {}", e))?;
+    print_waiting("Fetching proposals from GUARDIAN");
+    let proposals = retry_on_recency_condition(state, |state| {
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .list_proposals()
+                .await
+                .map_err(|e| format!("Failed to get proposals: {}", e))
+        })
+    })
+    .await?;
 
     if proposals.is_empty() {
         print_info("No pending proposals found");
@@ -518,11 +583,18 @@ async fn action_export_proposal(
 
     print_waiting("Exporting proposal");
 
-    let client = state.get_client_mut()?;
-    client
-        .export_proposal(&proposal_id, Path::new(&path))
-        .await
-        .map_err(|e| format!("Failed to export: {}", e))?;
+    retry_on_recency_condition(state, |state| {
+        let proposal_id = proposal_id.clone();
+        let path = path.clone();
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .export_proposal(&proposal_id, Path::new(&path))
+                .await
+                .map_err(|e| format!("Failed to export: {}", e))
+        })
+    })
+    .await?;
 
     print_success(&format!("Proposal exported to: {}", path));
     print_info("Share this file with other cosigners for offline signing");
@@ -569,13 +641,20 @@ async fn action_import_and_work(
 
     print_waiting("Importing proposal");
 
-    let client = state.get_client()?;
-    let proposal = client
-        .import_proposal(Path::new(&path))
-        .map_err(|e| format!("Failed to import: {}", e))?;
+    let proposal = retry_on_recency_condition(state, |state| {
+        let path = path.clone();
+        Box::pin(async move {
+            let client = state.get_client_mut()?;
+            client
+                .import_proposal(Path::new(&path))
+                .await
+                .map_err(|e| format!("Failed to import: {}", e))
+        })
+    })
+    .await?;
 
     print_success("Proposal imported successfully!");
-    print_proposal_details(&proposal, state.is_ecdsa());
+    print_proposal_details(&proposal);
 
     state.set_imported_proposal(proposal);
 
@@ -617,7 +696,7 @@ async fn sign_imported_proposal(
         .take_imported_proposal()
         .ok_or_else(|| "No imported proposal".to_string())?;
 
-    print_proposal_details(&proposal, state.is_ecdsa());
+    print_proposal_details(&proposal);
 
     let confirm = prompt_input(editor, "\nSign this proposal? [y/N]: ")?;
     if confirm.to_lowercase() != "y" {
@@ -627,10 +706,22 @@ async fn sign_imported_proposal(
 
     print_waiting("Signing proposal");
 
-    let client = state.get_client()?;
-    client
+    match state
+        .get_client_mut()?
         .sign_imported_proposal(&mut proposal)
-        .map_err(|e| format!("Failed to sign: {}", e))?;
+        .await
+    {
+        Ok(()) => {}
+        Err(e) if is_recency_condition_error(&e.to_string()) => {
+            sync_network_only_for_retry(state).await?;
+            state
+                .get_client_mut()?
+                .sign_imported_proposal(&mut proposal)
+                .await
+                .map_err(|retry_error| format!("Failed to sign: {}", retry_error))?;
+        }
+        Err(e) => return Err(format!("Failed to sign: {}", e)),
+    }
 
     print_success("Proposal signed!");
     println!(
@@ -670,7 +761,7 @@ async fn execute_imported_proposal(
         .ok_or_else(|| "No imported proposal".to_string())?
         .clone();
 
-    print_proposal_details(&proposal, state.is_ecdsa());
+    print_proposal_details(&proposal);
 
     if !proposal.is_ready() {
         return Err(format!(
@@ -689,12 +780,24 @@ async fn execute_imported_proposal(
 
     // Execute and get nonce in a scope to release borrow
     let nonce = {
-        let client = state.get_client_mut()?;
-        client
+        match state
+            .get_client_mut()?
             .execute_imported_proposal(&proposal)
             .await
-            .map_err(|e| format!("Failed to execute: {}", e))?;
+        {
+            Ok(()) => {}
+            Err(e) if is_recency_condition_error(&e.to_string()) => {
+                sync_network_only_for_retry(state).await?;
+                state
+                    .get_client_mut()?
+                    .execute_imported_proposal(&proposal)
+                    .await
+                    .map_err(|retry_error| format!("Failed to execute: {}", retry_error))?;
+            }
+            Err(e) => return Err(format!("Failed to execute: {}", e)),
+        }
 
+        let client = state.get_client()?;
         print_success("Transaction executed successfully!");
 
         client
@@ -733,7 +836,7 @@ fn save_imported_proposal(
     Ok(())
 }
 
-/// Create a proposal offline (fallback when PSM fails).
+/// Create a proposal offline (fallback when GUARDIAN fails).
 async fn create_proposal_offline(
     state: &mut SessionState,
     editor: &mut DefaultEditor,
@@ -750,7 +853,7 @@ async fn create_proposal_offline(
         .map_err(|e| format!("Failed to create offline proposal: {}", e))?;
 
     print_success("Proposal created offline!");
-    print_proposal_details(&proposal, state.is_ecdsa());
+    print_proposal_details(&proposal);
 
     // Ask to save
     let default_path = format!(
@@ -785,7 +888,7 @@ fn prompt_add_cosigner(editor: &mut DefaultEditor) -> Result<TransactionType, St
         return Err("Commitment is required".to_string());
     }
 
-    let new_commitment = commitment_from_hex(&ensure_hex_prefix(&hex))
+    let new_commitment = word_from_hex(&ensure_hex_prefix(&hex))
         .map_err(|e| format!("Invalid commitment: {}", e))?;
 
     Ok(TransactionType::add_cosigner(new_commitment))
@@ -807,11 +910,7 @@ fn prompt_remove_cosigner(
 
     println!("\nCurrent cosigners:");
     for (i, commitment) in account.cosigner_commitments_hex().iter().enumerate() {
-        println!(
-            "  [{}] {}",
-            i + 1,
-            format_commitment_hex(state.is_ecdsa(), commitment)
-        );
+        println!("  [{}] {}", i + 1, shorten_hex(commitment));
     }
 
     let idx_str = prompt_input(editor, "\nSelect cosigner to remove: ")?;
@@ -861,9 +960,9 @@ fn prompt_p2id(
             }
             Asset::NonFungible(nft) => {
                 println!(
-                    "  [{}] NFT (faucet prefix: {}) - NOT SUPPORTED for P2ID",
+                    "  [{}] NFT (faucet: {}) - NOT SUPPORTED for P2ID",
                     i + 1,
-                    shorten_hex(&format!("{:?}", nft.faucet_id_prefix()))
+                    shorten_hex(&nft.faucet_id().to_hex())
                 );
             }
         }
@@ -982,7 +1081,10 @@ async fn prompt_consume_notes(
                     );
                 }
                 Asset::NonFungible(nft) => {
-                    println!("      - NFT (faucet: {:?})", nft.faucet_id_prefix());
+                    println!(
+                        "      - NFT (faucet: {})",
+                        shorten_hex(&nft.faucet_id().to_hex())
+                    );
                 }
             }
         }
@@ -1018,52 +1120,118 @@ async fn prompt_consume_notes(
     Ok(TransactionType::consume_notes(note_ids))
 }
 
-fn prompt_switch_psm(
+fn prompt_switch_guardian(
     state: &SessionState,
     editor: &mut DefaultEditor,
 ) -> Result<TransactionType, String> {
     let client = state.get_client()?;
-    print_info(&format!("Current PSM: {}", client.psm_endpoint()));
+    print_info(&format!("Current GUARDIAN: {}", client.guardian_endpoint()));
 
-    print_info("\nEnter new PSM server details:");
-    let new_endpoint = prompt_input(editor, "  New PSM endpoint: ")?;
+    print_info("\nEnter new GUARDIAN server details:");
+    let new_endpoint = prompt_input(editor, "  New GUARDIAN endpoint: ")?;
     if new_endpoint.is_empty() {
         return Err("Endpoint is required".to_string());
     }
 
-    let pubkey_hex = prompt_input(editor, "  New PSM pubkey commitment: ")?;
+    let pubkey_hex = prompt_input(editor, "  New GUARDIAN pubkey commitment: ")?;
     if pubkey_hex.is_empty() {
         return Err("Pubkey commitment is required".to_string());
     }
 
-    let new_commitment = commitment_from_hex(&ensure_hex_prefix(&pubkey_hex))
+    let new_commitment = word_from_hex(&ensure_hex_prefix(&pubkey_hex))
         .map_err(|e| format!("Invalid pubkey: {}", e))?;
 
-    println!("\nPSM switch details:");
+    println!("\nGuardian switch details:");
     println!("  New endpoint: {}", new_endpoint);
-    println!(
-        "  New pubkey:   {}",
-        format_commitment_hex(state.is_ecdsa(), &pubkey_hex)
-    );
+    println!("  New pubkey:   {}", shorten_hex(&pubkey_hex));
 
-    print_info("\n⚠️  WARNING: After execution, all future transactions use the new PSM.");
+    print_info("\n⚠️  WARNING: After execution, all future transactions use the new GUARDIAN.");
 
-    let confirm = prompt_input(editor, "\nConfirm PSM switch? [y/N]: ")?;
+    let confirm = prompt_input(editor, "\nConfirm GUARDIAN switch? [y/N]: ")?;
     if confirm.to_lowercase() != "y" {
         return Err("Cancelled".to_string());
     }
 
-    Ok(TransactionType::switch_psm(new_endpoint, new_commitment))
+    Ok(TransactionType::switch_guardian(
+        new_endpoint,
+        new_commitment,
+    ))
+}
+
+fn prompt_update_procedure_threshold(
+    state: &SessionState,
+    editor: &mut DefaultEditor,
+) -> Result<TransactionType, String> {
+    let client = state.get_client()?;
+    let account = client
+        .account()
+        .ok_or_else(|| "No account loaded".to_string())?;
+    let num_signers = account.cosigner_commitments().len() as u32;
+
+    println!("\nAvailable procedures:");
+    for (idx, procedure) in ProcedureName::all().iter().enumerate() {
+        let current = account
+            .procedure_threshold(*procedure)
+            .map_err(|e| format!("Failed to read procedure threshold: {}", e))?;
+        match current {
+            Some(threshold) => println!(
+                "  [{}] {} (current override: {})",
+                idx + 1,
+                procedure,
+                threshold
+            ),
+            None => println!("  [{}] {} (current override: none)", idx + 1, procedure),
+        }
+    }
+
+    let choice = prompt_input(editor, "\nSelect procedure: ")?;
+    let idx: usize = choice
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid selection".to_string())?;
+    if idx == 0 || idx > ProcedureName::all().len() {
+        return Err("Invalid selection".to_string());
+    }
+
+    let procedure = ProcedureName::all()[idx - 1];
+    let threshold_input = prompt_input(
+        editor,
+        &format!(
+            "  New threshold override for {} (0 clears, max {}): ",
+            procedure, num_signers
+        ),
+    )?;
+    let new_threshold: u32 = threshold_input
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid threshold".to_string())?;
+
+    if new_threshold > num_signers {
+        return Err(format!(
+            "Threshold override {} exceeds number of signers {}",
+            new_threshold, num_signers
+        ));
+    }
+
+    Ok(TransactionType::update_procedure_threshold(
+        procedure,
+        new_threshold,
+    ))
 }
 
 /// Print details of an exported proposal.
-fn print_proposal_details(proposal: &ExportedProposal, ecdsa_mode: bool) {
+fn print_proposal_details(proposal: &ExportedProposal) {
     let (collected, required) = proposal.signature_counts();
+    let proposal_type = if proposal.metadata.proposal_type.is_empty() {
+        "<unknown>"
+    } else {
+        proposal.metadata.proposal_type.as_str()
+    };
 
     println!("\nProposal Details:");
     println!("  ID:           {}", shorten_hex(&proposal.id));
     println!("  Account:      {}", shorten_hex(&proposal.account_id));
-    println!("  Type:         {}", proposal.transaction_type);
+    println!("  Type:         {}", proposal_type);
     println!("  Nonce:        {}", proposal.nonce);
     println!("  Signatures:   {}/{}", collected, required);
 
@@ -1078,12 +1246,7 @@ fn print_proposal_details(proposal: &ExportedProposal, ecdsa_mode: bool) {
     if !signers.is_empty() {
         println!("  Signers:");
         for signer in signers {
-            let display = if ecdsa_mode {
-                shorten_hex_32(signer)
-            } else {
-                shorten_hex(signer)
-            };
-            println!("    - {}", display);
+            println!("    - {}", shorten_hex(signer));
         }
     }
 }
