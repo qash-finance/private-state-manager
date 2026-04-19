@@ -5,8 +5,8 @@ use crate::network::NetworkClient;
 use crate::state_object::StateObject;
 use crate::storage::StorageBackend;
 use async_trait::async_trait;
+use guardian_shared::FromJson;
 use miden_protocol::account::Account;
-use private_state_manager_shared::FromJson;
 use std::sync::{Arc, Mutex as StdMutex};
 
 type StdResult<T, E> = std::result::Result<T, E>;
@@ -23,6 +23,7 @@ pub struct MockNetworkClient {
     pub get_state_commitment_responses: Arc<StdMutex<Vec<StdResult<String, String>>>>,
     pub get_state_commitment_calls: Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
     pub validate_credential_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
+    pub validate_guardian_commitment_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub verify_delta_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub apply_delta_responses: Arc<StdMutex<Vec<ApplyDeltaResult>>>,
     pub should_update_auth_responses: Arc<StdMutex<Vec<ShouldUpdateAuthResult>>>,
@@ -48,6 +49,14 @@ impl MockNetworkClient {
 
     pub fn with_validate_credential(self, response: StdResult<(), String>) -> Self {
         self.validate_credential_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_validate_guardian_commitment(self, response: StdResult<(), String>) -> Self {
+        self.validate_guardian_commitment_responses
             .lock()
             .unwrap()
             .push(response);
@@ -102,7 +111,7 @@ impl NetworkClient for MockNetworkClient {
 
         let account = Account::from_json(state_json)
             .map_err(|e| format!("Failed to deserialize account: {e}"))?;
-        let commitment_hex = format!("0x{}", hex::encode(account.commitment().as_bytes()));
+        let commitment_hex = format!("0x{}", hex::encode(account.to_commitment().as_bytes()));
         Ok(commitment_hex)
     }
 
@@ -166,6 +175,18 @@ impl NetworkClient for MockNetworkClient {
         _auth: &Auth,
     ) -> StdResult<(), String> {
         self.validate_credential_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(Ok(()))
+    }
+
+    fn validate_guardian_commitment(
+        &self,
+        _state_json: &serde_json::Value,
+        _expected_guardian_commitment: &str,
+    ) -> StdResult<(), String> {
+        self.validate_guardian_commitment_responses
             .lock()
             .unwrap()
             .pop()

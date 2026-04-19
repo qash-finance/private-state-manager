@@ -1,9 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Multisig } from './multisig.js';
-import { PsmHttpClient, type Signer } from '@openzeppelin/psm-client';
+import { GuardianHttpClient, type Signer } from '@openzeppelin/guardian-client';
+import {
+  buildUpdateProcedureThresholdTransactionRequest,
+  buildUpdateGuardianTransactionRequest,
+  buildUpdateSignersTransactionRequest,
+  executeForSummary,
+} from './transaction.js';
+
+const { mockRpcGetAccountDetails, mockAccountDeserialize, mockDetectConfig } = vi.hoisted(() => ({
+  mockRpcGetAccountDetails: vi.fn(),
+  mockAccountDeserialize: vi.fn(),
+  mockDetectConfig: vi.fn(),
+}));
 
 // Mock the Miden SDK
 vi.mock('@miden-sdk/miden-sdk', () => ({
+  Account: {
+    deserialize: mockAccountDeserialize,
+  },
   AccountId: {
     fromHex: vi.fn((hex: string) => ({ toString: () => hex })),
   },
@@ -33,11 +48,15 @@ vi.mock('@miden-sdk/miden-sdk', () => ({
     insert: vi.fn(),
   })),
   FeltArray: vi.fn().mockImplementation((arr: any[]) => arr),
-  Rpo256: {
+  Poseidon2: {
     hashElements: vi.fn().mockReturnValue({
       toHex: () => '0x' + 'e'.repeat(64),
     }),
   },
+  Endpoint: vi.fn().mockImplementation((url: string) => ({ url })),
+  RpcClient: vi.fn().mockImplementation(() => ({
+    getAccountDetails: mockRpcGetAccountDetails,
+  })),
 }));
 
 // Mock transaction module
@@ -48,7 +67,12 @@ vi.mock('./transaction.js', () => ({
     salt: { toHex: () => '0x' + 'd'.repeat(64) },
     configHash: { toHex: () => '0x' + 'e'.repeat(64) },
   }),
-  buildUpdatePsmTransactionRequest: vi.fn().mockResolvedValue({
+  buildUpdateProcedureThresholdTransactionRequest: vi.fn().mockResolvedValue({
+    request: {},
+    salt: { toHex: () => '0x' + 'd'.repeat(64) },
+    configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+  }),
+  buildUpdateGuardianTransactionRequest: vi.fn().mockResolvedValue({
     request: {},
     salt: { toHex: () => '0x' + 'd'.repeat(64) },
   }),
@@ -62,50 +86,95 @@ vi.mock('./transaction.js', () => ({
   }),
 }));
 
-vi.mock('./utils/signature.js', () => ({
-  buildSignatureAdviceEntry: vi.fn().mockReturnValue({
-    key: { toHex: () => '0x' + 'f'.repeat(64) },
-    values: [1, 2, 3],
-  }),
-  signatureHexToBytes: vi.fn((hex: string) => new Uint8Array([0, 1, 2, 3])),
-}));
+vi.mock('./utils/signature.js', async () => {
+  const actual = await vi.importActual<typeof import('./utils/signature.js')>('./utils/signature.js');
+  return {
+    ...actual,
+    buildSignatureAdviceEntry: vi.fn().mockImplementation((signerCommitment: { toHex?: () => string }) => ({
+      key: { toHex: () => signerCommitment.toHex ? signerCommitment.toHex() : '0x' + 'f'.repeat(64) },
+      values: [1, 2, 3],
+    })),
+    signatureHexToBytes: vi.fn((hex: string) => new Uint8Array([0, 1, 2, 3])),
+  };
+});
 
 vi.mock('./utils/encoding.js', async () => {
   const actual = await vi.importActual<typeof import('./utils/encoding.js')>('./utils/encoding.js');
   return {
-    ensureHexPrefix: actual.ensureHexPrefix,
-    normalizeHexWord: vi.fn((hex: string) => '0x' + hex.replace(/^0x/i, '').padStart(64, '0')),
-    bytesToHex: actual.bytesToHex,
-    hexToBytes: actual.hexToBytes,
-    uint8ArrayToBase64: actual.uint8ArrayToBase64,
-    base64ToUint8Array: actual.base64ToUint8Array,
+    ...actual,
+    normalizeHexWord: vi.fn((hex: string) => '0x' + hex.replace(/^0x/i, '').toLowerCase().padStart(64, '0')),
   };
 });
 
-// Mock fetch for PSM client
+vi.mock('./inspector.js', () => ({
+  AccountInspector: {
+    fromAccount: mockDetectConfig,
+  },
+}));
+
+// Mock fetch for GUARDIAN client
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
+function mockedAccount(commitmentHex: string, nonce = 0): any {
+  return {
+    commitment: () => ({
+      toHex: () => commitmentHex,
+    }),
+    to_commitment: () => ({
+      toHex: () => commitmentHex,
+    }),
+    nonce: () => ({
+      asInt: () => BigInt(nonce),
+    }),
+  };
+}
+
 describe('Multisig', () => {
-  let psm: PsmHttpClient;
+  let guardian: GuardianHttpClient;
   let mockSigner: Signer;
   let mockAccount: any;
   let mockWebClient: any;
 
   beforeEach(() => {
     mockFetch.mockReset();
+    vi.mocked(executeForSummary).mockResolvedValue({
+      toCommitment: () => ({
+        toHex: () => '0x' + 'c'.repeat(64),
+      }),
+      serialize: () => new Uint8Array([1, 2, 3]),
+    } as any);
+    mockRpcGetAccountDetails.mockReset();
+    mockAccountDeserialize.mockReset();
+    mockRpcGetAccountDetails.mockResolvedValue({
+      commitment: () => ({
+        toHex: () => '0x' + 'b'.repeat(64),
+      }),
+    });
+    mockAccountDeserialize.mockReturnValue(mockedAccount('0x' + 'b'.repeat(64), 1));
+    mockDetectConfig.mockReset();
+    mockDetectConfig.mockReturnValue({
+      threshold: 1,
+      numSigners: 1,
+      signerCommitments: ['0x' + 'a'.repeat(64)],
+      guardianEnabled: true,
+      guardianCommitment: '0x' + 'c'.repeat(64),
+      vaultBalances: [],
+      procedureThresholds: new Map(),
+    });
 
-    psm = new PsmHttpClient('http://localhost:3000');
+    guardian = new GuardianHttpClient('http://localhost:3000');
 
     mockSigner = {
-      scheme: 'falcon',
       commitment: '0x' + '1'.repeat(64),
       publicKey: '0x' + '2'.repeat(64),
+      scheme: 'falcon',
       signAccountIdWithTimestamp: vi.fn().mockResolvedValue('0x' + 'a'.repeat(128)),
-      signCommitment: vi.fn().mockResolvedValue('0x' + 'b'.repeat(128)),
+      signRequest: vi.fn().mockReturnValue('0x' + 'a'.repeat(128)),
+      signCommitment: vi.fn().mockReturnValue('0x' + 'b'.repeat(128)),
     };
 
-    psm.setSigner(mockSigner);
+    guardian.setSigner(mockSigner);
 
     mockAccount = {
       id: () => ({
@@ -121,8 +190,15 @@ describe('Multisig', () => {
       proveTransaction: vi.fn(),
       submitProvenTransaction: vi.fn(),
       applyTransaction: vi.fn(),
+      submitNewTransaction: vi.fn(),
+      submitNewTransactionWithProver: vi.fn(),
+      transactions: {
+        submit: vi.fn(),
+      },
       getConsumableNotes: vi.fn().mockResolvedValue([]),
       syncState: vi.fn(),
+      getAccount: vi.fn().mockResolvedValue(null),
+      newAccount: vi.fn(),
     };
   });
 
@@ -131,28 +207,28 @@ describe('Multisig', () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       expect(multisig.threshold).toBe(2);
       expect(multisig.signerCommitments).toEqual(config.signerCommitments);
-      expect(multisig.psmCommitment).toBe(config.psmCommitment);
+      expect(multisig.guardianCommitment).toBe(config.guardianCommitment);
       expect(multisig.account).toBe(mockAccount);
     });
 
-    it('should create Multisig without account (loaded)', () => {
+    it('should create Multisig with explicit accountId override', () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
       const accountId = '0x' + 'd'.repeat(30);
-      const multisig = new Multisig(null, config, psm, mockSigner, mockWebClient, accountId);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient, accountId);
 
-      expect(multisig.account).toBeNull();
+      expect(multisig.account).toBe(mockAccount);
       expect(multisig.accountId).toBe(accountId);
     });
   });
@@ -162,22 +238,22 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
       expect(multisig.accountId).toBe('0x' + 'a'.repeat(30));
     });
 
-    it('should return provided account ID for loaded multisig', () => {
+    it('should return provided account ID when constructor override is set', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
       const accountId = '0x' + 'e'.repeat(30);
-      const multisig = new Multisig(null, config, psm, mockSigner, mockWebClient, accountId);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient, accountId);
       expect(multisig.accountId).toBe(accountId);
     });
   });
@@ -187,23 +263,23 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
       expect(multisig.signerCommitment).toBe(mockSigner.commitment);
     });
   });
 
   describe('fetchState', () => {
-    it('should fetch account state from PSM', async () => {
+    it('should fetch account state from GUARDIAN', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -224,15 +300,366 @@ describe('Multisig', () => {
     });
   });
 
-  describe('registerOnPsm', () => {
-    it('should register account on PSM', async () => {
+  describe('syncState', () => {
+    it('should overwrite local state when account is missing locally', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(null);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await multisig.syncState();
+
+      expect(mockWebClient.newAccount).toHaveBeenCalledTimes(1);
+      expect(mockRpcGetAccountDetails).toHaveBeenCalledTimes(1);
+    });
+
+    it('should overwrite local state when incoming commitment matches on-chain commitment', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'a'.repeat(64), 0));
+      mockRpcGetAccountDetails.mockResolvedValueOnce({
+        commitment: () => ({
+          toHex: () => '0x' + 'b'.repeat(64),
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await multisig.syncState();
+
+      expect(mockWebClient.newAccount).toHaveBeenCalledTimes(1);
+    });
+
+    it('refreshes multisig config from synced account state', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'b'.repeat(64), 0));
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+      mockDetectConfig.mockReturnValueOnce({
+        threshold: 2,
+        numSigners: 2,
+        signerCommitments: ['0x' + '1'.repeat(64), '0x' + '2'.repeat(64)],
+        guardianEnabled: true,
+        guardianCommitment: '0x' + 'd'.repeat(64),
+        vaultBalances: [],
+        procedureThresholds: new Map(),
+      });
+
+      await multisig.syncState();
+
+      expect(multisig.threshold).toBe(2);
+      expect(multisig.signerCommitments).toEqual([
+        '0x' + '1'.repeat(64),
+        '0x' + '2'.repeat(64),
+      ]);
+      expect(multisig.guardianCommitment).toBe('0x' + 'd'.repeat(64));
+      expect(mockWebClient.newAccount).not.toHaveBeenCalled();
+    });
+
+    it('should overwrite local state when account is not found on-chain', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'a'.repeat(64), 0));
+      mockRpcGetAccountDetails.mockRejectedValueOnce(
+        new Error('No account header record found for given ID')
+      );
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await multisig.syncState();
+
+      expect(mockWebClient.newAccount).toHaveBeenCalledTimes(1);
+    });
+
+    it('should throw when incoming commitment does not match on-chain commitment', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'a'.repeat(64), 0));
+      mockAccountDeserialize.mockReturnValueOnce(mockedAccount('0x' + 'b'.repeat(64), 1));
+      mockRpcGetAccountDetails.mockResolvedValueOnce({
+        commitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await expect(multisig.syncState()).rejects.toThrow('Refusing to overwrite local state');
+      expect(mockWebClient.newAccount).not.toHaveBeenCalled();
+    });
+
+    it('should throw when incoming state nonce is lower than local nonce', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'a'.repeat(64), 3));
+      mockAccountDeserialize.mockReturnValueOnce(mockedAccount('0x' + 'b'.repeat(64), 2));
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await expect(multisig.syncState()).rejects.toThrow(
+        'incoming nonce 2 is not greater than local nonce 3'
+      );
+      expect(mockWebClient.newAccount).not.toHaveBeenCalled();
+    });
+
+    it('should throw when incoming state nonce equals local nonce but commitment differs', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'a'.repeat(64), 2));
+      mockAccountDeserialize.mockReturnValueOnce(mockedAccount('0x' + 'b'.repeat(64), 2));
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          commitment: '0x' + 'b'.repeat(64),
+          state_json: { data: 'AQID' },
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-02T00:00:00Z',
+        }),
+      });
+
+      await expect(multisig.syncState()).rejects.toThrow(
+        'incoming nonce 2 is not greater than local nonce 2'
+      );
+      expect(mockWebClient.newAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('verifyStateCommitment', () => {
+    it('should pass when local and on-chain commitments match', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'b'.repeat(64), 0));
+
+      const multisigWithRpc = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      await expect(
+        multisigWithRpc.verifyStateCommitment()
+      ).resolves.toMatchObject({
+        accountId: multisigWithRpc.accountId,
+      });
+    });
+
+    it('should throw when local account state is missing', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+      mockWebClient.getAccount.mockResolvedValueOnce(null);
+
+      const multisigWithRpc = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      await expect(
+        multisigWithRpc.verifyStateCommitment()
+      ).rejects.toThrow('Local account state not found');
+    });
+
+    it('should throw when local and on-chain commitments differ', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+      mockWebClient.getAccount.mockResolvedValueOnce(mockedAccount('0x' + 'f'.repeat(64), 0));
+      mockRpcGetAccountDetails.mockResolvedValueOnce({
+        commitment: () => ({
+          toHex: () => '0x' + 'b'.repeat(64),
+        }),
+      });
+
+      const multisigWithRpc = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        undefined,
+        'https://rpc.devnet.miden.io'
+      );
+
+      await expect(
+        multisigWithRpc.verifyStateCommitment()
+      ).rejects.toThrow('Local account commitment does not match on-chain commitment');
+    });
+  });
+
+  describe('registerOnGuardian', () => {
+    it('should register account on GUARDIAN', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -243,29 +670,60 @@ describe('Multisig', () => {
         }),
       });
 
-      await expect(multisig.registerOnPsm()).resolves.toBeUndefined();
+      await expect(multisig.registerOnGuardian()).resolves.toBeUndefined();
     });
 
-    it('should throw when no account and no initial state', async () => {
+    it('should register ECDSA accounts with MidenEcdsa auth', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(null, config, psm, mockSigner, mockWebClient, '0x' + 'e'.repeat(30));
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        publicKey: '0x' + '2'.repeat(66),
+        scheme: 'ecdsa',
+      };
 
-      await expect(multisig.registerOnPsm()).rejects.toThrow('Cannot register on PSM');
+      guardian.setSigner(ecdsaSigner);
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          success: true,
+          message: 'Account configured',
+          ack_pubkey: '0x' + 'd'.repeat(66),
+        }),
+      });
+
+      await expect(multisig.registerOnGuardian()).resolves.toBeUndefined();
+
+      const [, requestInit] = mockFetch.mock.calls[0] as [string, RequestInit];
+      const body = JSON.parse(String(requestInit.body));
+      expect(body.auth).toEqual({
+        MidenEcdsa: {
+          cosigner_commitments: config.signerCommitments,
+        },
+      });
     });
 
-    it('should accept initial state base64', async () => {
+    it('should accept explicit initial state base64', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(null, config, psm, mockSigner, mockWebClient, '0x' + 'e'.repeat(30));
+      const multisig = new Multisig(
+        mockAccount,
+        config,
+        guardian,
+        mockSigner,
+        mockWebClient,
+        '0x' + 'e'.repeat(30),
+      );
 
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -275,17 +733,17 @@ describe('Multisig', () => {
         }),
       });
 
-      await expect(multisig.registerOnPsm('base64initialstate')).resolves.toBeUndefined();
+      await expect(multisig.registerOnGuardian('base64initialstate')).resolves.toBeUndefined();
     });
 
-    it('should throw on PSM registration failure', async () => {
+    it('should throw on GUARDIAN registration failure', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -295,19 +753,19 @@ describe('Multisig', () => {
         }),
       });
 
-      await expect(multisig.registerOnPsm()).rejects.toThrow('Failed to register on PSM');
+      await expect(multisig.registerOnGuardian()).rejects.toThrow('Failed to register on GUARDIAN');
     });
   });
 
-  describe('syncTransactionProposals', () => {
-    it('should sync proposals from PSM', async () => {
+  describe('syncProposals', () => {
+    it('should sync proposals from GUARDIAN', async () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockProposals = [
         {
@@ -330,7 +788,7 @@ describe('Multisig', () => {
             proposer_id: '0x' + 'c'.repeat(64),
             cosigner_sigs: [
               {
-                signer_id: '0x' + 'd'.repeat(64),
+                signer_id: '0x' + 'a'.repeat(64),
                 signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
                 timestamp: '2024-01-01T00:00:00Z',
               },
@@ -344,22 +802,21 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
       expect(proposals.length).toBe(1);
       expect(proposals[0].nonce).toBe(1);
-      expect(proposals[0].status.type).toBe('pending');
-      expect(proposals[0].commitment).toBe(proposals[0].id);
+      expect(proposals[0].status).toBe('pending');
     });
 
     it('should return ready status when enough signatures', async () => {
       const config = {
         threshold: 1, // Only 1 signature needed
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockProposals = [
         {
@@ -382,7 +839,7 @@ describe('Multisig', () => {
             proposer_id: '0x' + 'c'.repeat(64),
             cosigner_sigs: [
               {
-                signer_id: '0x' + 'd'.repeat(64),
+                signer_id: '0x' + 'a'.repeat(64),
                 signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
                 timestamp: '2024-01-01T00:00:00Z',
               },
@@ -396,22 +853,170 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
-      expect(proposals[0].status.type).toBe('ready');
+      expect(proposals[0].status).toBe('ready');
+    });
+
+    it('should reject proposals whose metadata does not match tx_summary', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          proposals: [
+            {
+              account_id: '0x' + 'a'.repeat(30),
+              nonce: 1,
+              prev_commitment: '0x' + 'b'.repeat(64),
+              delta_payload: {
+                tx_summary: { data: 'AQID' },
+                signatures: [],
+                metadata: {
+                  proposal_type: 'add_signer',
+                  target_threshold: 1,
+                  signer_commitments: ['0x' + 'a'.repeat(64)],
+                  description: '',
+                },
+              },
+              status: {
+                status: 'pending',
+                timestamp: '2024-01-01T00:00:00Z',
+                proposer_id: '0x' + 'c'.repeat(64),
+                cosigner_sigs: [],
+              },
+            },
+          ],
+        }),
+      });
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'f'.repeat(64),
+        }),
+      } as any);
+
+      await expect(multisig.syncProposals()).rejects.toThrow(
+        'Invalid proposal: metadata does not match tx_summary'
+      );
+    });
+
+    it('should reject non-32-byte signer IDs from GUARDIAN proposals', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockProposals = [
+        {
+          account_id: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'add_signer',
+              target_threshold: 1,
+              signer_commitments: ['0x' + 'a'.repeat(64)],
+              description: '',
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'c'.repeat(64),
+            cosigner_sigs: [
+              {
+                signer_id: '0x1',
+                signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
+                timestamp: '2024-01-01T00:00:00Z',
+              },
+            ],
+          },
+        },
+      ];
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ proposals: mockProposals }),
+      });
+
+      await expect(multisig.syncProposals()).rejects.toThrow('expected signerId as 32-byte hex');
+    });
+
+    it('should reject duplicate normalized signer IDs from GUARDIAN proposals', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockProposals = [
+        {
+          account_id: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'add_signer',
+              target_threshold: 2,
+              signer_commitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+              description: '',
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'c'.repeat(64),
+            cosigner_sigs: [
+              {
+                signer_id: '0x' + 'A'.repeat(64),
+                signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
+                timestamp: '2024-01-01T00:00:00Z',
+              },
+              {
+                signer_id: '0x' + 'a'.repeat(64),
+                signature: { scheme: 'falcon', signature: '0x' + 'f'.repeat(128) },
+                timestamp: '2024-01-01T00:00:01Z',
+              },
+            ],
+          },
+        },
+      ];
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ proposals: mockProposals }),
+      });
+
+      await expect(multisig.syncProposals()).rejects.toThrow('duplicate signatures for signer');
     });
   });
 
-  describe('listTransactionProposals', () => {
+  describe('listProposals', () => {
     it('should return empty list initially', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
-      expect(multisig.listTransactionProposals()).toEqual([]);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      expect(multisig.listProposals()).toEqual([]);
     });
   });
 
@@ -420,17 +1025,17 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockDelta = {
         account_id: '0x' + 'a'.repeat(30),
         nonce: 1,
         prev_commitment: '0x' + 'b'.repeat(64),
         delta_payload: {
-          tx_summary: { data: 'base64summary' },
+          tx_summary: { data: 'AQID' },
           signatures: [],
         },
         status: {
@@ -445,7 +1050,7 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({
           delta: mockDelta,
-          commitment: '0x' + 'd'.repeat(64),
+          commitment: '0x' + 'c'.repeat(64),
         }),
       });
 
@@ -457,21 +1062,18 @@ describe('Multisig', () => {
       });
 
       expect(proposal.nonce).toBe(1);
-      expect(proposal.id).toBe('0x' + 'd'.repeat(64));
+      expect(proposal.id).toBe('0x' + 'c'.repeat(64));
     });
-  });
 
-  describe('signTransactionProposal', () => {
-    it('should sign a proposal', async () => {
+    it('should reject a mismatched returned commitment', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
-      // First create a proposal
       const mockDelta = {
         account_id: '0x' + 'a'.repeat(30),
         nonce: 1,
@@ -496,6 +1098,442 @@ describe('Multisig', () => {
         }),
       });
 
+      await expect(
+        multisig.createProposal(1, 'AQID', {
+          proposalType: 'add_signer',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        }),
+      ).rejects.toThrow(
+        'Invalid proposal: commitment 0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd does not match tx_summary 0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      );
+    });
+
+    it('should reject a response whose tx_summary does not match the provided metadata', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'f'.repeat(64),
+        }),
+      } as any);
+
+      await expect(
+        multisig.createProposal(1, 'AQID', {
+          proposalType: 'add_signer',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        })
+      ).rejects.toThrow('Invalid proposal: metadata does not match tx_summary');
+    });
+  });
+
+  describe('createP2idProposal', () => {
+    it('should include the faucet asset in the proposal description', async () => {
+      const { executeForSummary } = await import('./transaction.js');
+      vi.mocked(executeForSummary).mockResolvedValue({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+          metadata: {
+            proposal_type: 'p2id',
+            recipient_id: '0xrecipient',
+            faucet_id: '0xfaucet',
+            amount: '100',
+            description: '',
+          },
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      const proposal = await multisig.createP2idProposal('0xrecipient', '0xfaucet', 100n, 1);
+
+      expect(proposal.metadata.description).toBe('Send 100 of asset 0xfaucet... to 0xrecipien...');
+    });
+  });
+
+  describe('createChangeThresholdProposal', () => {
+    it('passes the signer scheme to update-signers requests', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        publicKey: '0x' + '2'.repeat(66),
+        scheme: 'ecdsa',
+      };
+      guardian.setSigner(ecdsaSigner);
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+          metadata: {
+            proposal_type: 'change_threshold',
+            target_threshold: 2,
+            description: '',
+          },
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+      await multisig.createChangeThresholdProposal(2, 1);
+
+      expect(buildUpdateSignersTransactionRequest).toHaveBeenCalledWith(
+        mockWebClient,
+        2,
+        config.signerCommitments,
+        { signatureScheme: 'ecdsa' },
+      );
+    });
+  });
+
+  describe('createSwitchGuardianProposal', () => {
+    it('should verify new endpoint commitment before creating proposal', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const newGuardianPubkey = '0x' + '1'.repeat(64);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: newGuardianPubkey }),
+      });
+
+      const proposal = await multisig.createSwitchGuardianProposal('http://new-guardian.com', newGuardianPubkey);
+
+      expect(proposal.metadata?.proposalType).toBe('switch_guardian');
+      if (proposal.metadata?.proposalType === 'switch_guardian') {
+        expect(proposal.metadata.newGuardianEndpoint).toBe('http://new-guardian.com');
+      }
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://new-guardian.com/pubkey?scheme=falcon',
+        expect.objectContaining({ method: 'GET' })
+      );
+    });
+
+    it('should reject switch proposal when endpoint commitment does not match', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: '0x' + '2'.repeat(64) }),
+      });
+
+      await expect(
+        multisig.createSwitchGuardianProposal('http://new-guardian.com', '0x' + '1'.repeat(64))
+      ).rejects.toThrow('Refusing to use GUARDIAN endpoint');
+    });
+
+    it('should use the signer scheme when resolving new GUARDIAN commitments', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        publicKey: '0x' + '2'.repeat(66),
+        scheme: 'ecdsa',
+      };
+      guardian.setSigner(ecdsaSigner);
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+      const newGuardianCommitment = '0x' + '1'.repeat(64);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: newGuardianCommitment }),
+      });
+
+      await multisig.createSwitchGuardianProposal('http://new-guardian.com', newGuardianCommitment);
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://new-guardian.com/pubkey?scheme=ecdsa',
+        expect.objectContaining({ method: 'GET' }),
+      );
+      expect(buildUpdateGuardianTransactionRequest).toHaveBeenCalledWith(
+        mockWebClient,
+        newGuardianCommitment,
+        { signatureScheme: 'ecdsa' },
+      );
+    });
+  });
+
+  describe('createUpdateProcedureThresholdProposal', () => {
+    it('should create procedure-threshold update proposals', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+          metadata: {
+            proposal_type: 'update_procedure_threshold',
+            target_threshold: 1,
+            target_procedure: 'send_asset',
+            description: '',
+          },
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      const proposal = await multisig.createUpdateProcedureThresholdProposal('send_asset', 1, 1);
+
+      expect(buildUpdateProcedureThresholdTransactionRequest).toHaveBeenCalledWith(
+        mockWebClient,
+        'send_asset',
+        1,
+        { signatureScheme: 'falcon' },
+      );
+      expect(proposal.metadata.proposalType).toBe('update_procedure_threshold');
+      if (proposal.metadata.proposalType === 'update_procedure_threshold') {
+        expect(proposal.metadata.targetProcedure).toBe('send_asset');
+        expect(proposal.metadata.targetThreshold).toBe(1);
+      }
+    });
+
+    it('passes the signer scheme to ECDSA procedure-threshold updates', async () => {
+      vi.mocked(executeForSummary).mockResolvedValue({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+        serialize: () => new Uint8Array([1, 2, 3]),
+      } as any);
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        publicKey: '0x' + '2'.repeat(66),
+        scheme: 'ecdsa',
+      };
+      guardian.setSigner(ecdsaSigner);
+
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+          metadata: {
+            proposal_type: 'update_procedure_threshold',
+            target_threshold: 1,
+            target_procedure: 'send_asset',
+            description: '',
+          },
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      await multisig.createUpdateProcedureThresholdProposal('send_asset', 1, 1);
+
+      expect(buildUpdateProcedureThresholdTransactionRequest).toHaveBeenCalledWith(
+        mockWebClient,
+        'send_asset',
+        1,
+        { signatureScheme: 'ecdsa' },
+      );
+    });
+  });
+
+  describe('signProposal', () => {
+    it('should sign a proposal', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: [mockSigner.commitment],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      // First create a proposal
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
       await multisig.createProposal(1, 'AQID', {
         proposalType: 'add_signer',
         targetThreshold: 1,
@@ -503,7 +1541,6 @@ describe('Multisig', () => {
         description: '',
       });
 
-      // Now sign it
       const signedDelta = {
         ...mockDelta,
         status: {
@@ -529,39 +1566,212 @@ describe('Multisig', () => {
         },
       };
 
-      // Mock for signDeltaProposal
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => signedDelta,
       });
 
-      // Mock for auto-sync (syncTransactionProposals)
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ proposals: [signedDelta] }),
-      });
-
-      const proposalId = '0x' + 'd'.repeat(64);
-      const proposals = await multisig.signTransactionProposal(proposalId);
+      const proposalId = '0x' + 'c'.repeat(64);
+      const signedProposal = await multisig.signProposal(proposalId);
 
       expect(mockSigner.signCommitment).toHaveBeenCalledWith(proposalId);
-      expect(proposals.length).toBeGreaterThanOrEqual(1);
-      expect(proposals[0].signatures.length).toBe(1);
-      expect(proposals[0].commitment).toBe(proposals[0].id);
+      expect(signedProposal.signatures.length).toBe(1);
+    });
+
+    it('should reject signing when metadata does not match tx_summary', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockDelta = {
+        account_id: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        prev_commitment: '0x' + 'b'.repeat(64),
+        delta_payload: {
+          tx_summary: { data: 'AQID' },
+          signatures: [],
+        },
+        status: {
+          status: 'pending',
+          timestamp: '2024-01-01T00:00:00Z',
+          proposer_id: '0x' + 'c'.repeat(64),
+          cosigner_sigs: [],
+        },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          delta: mockDelta,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      });
+
+      await multisig.createProposal(1, 'AQID', {
+        proposalType: 'add_signer',
+        targetThreshold: 1,
+        targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+        description: '',
+      });
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'f'.repeat(64),
+        }),
+      } as any);
+
+      await expect(multisig.signProposal('0x' + 'c'.repeat(64))).rejects.toThrow(
+        'Invalid proposal: metadata does not match tx_summary'
+      );
+    });
+
+    it('should reject proposals for a different account before signing', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: [mockSigner.commitment],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'd'.repeat(64);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          proposals: [
+            {
+              account_id: '0x' + 'f'.repeat(30),
+              nonce: 1,
+              prev_commitment: '0x' + 'b'.repeat(64),
+              delta_payload: {
+                tx_summary: { data: 'AQID' },
+                signatures: [],
+                metadata: {
+                  proposal_type: 'add_signer',
+                  description: '',
+                  target_threshold: 1,
+                  signer_commitments: [mockSigner.commitment],
+                },
+              },
+              status: {
+                status: 'pending',
+                timestamp: '2024-01-01T00:00:00Z',
+                proposer_id: '0x' + 'c'.repeat(64),
+                cosigner_sigs: [],
+              },
+            },
+          ],
+        }),
+      });
+
+      await expect(multisig.signProposal(proposalId)).rejects.toThrow(
+        'Proposal is for a different account: 0x' + 'f'.repeat(30),
+      );
+      expect(mockSigner.signCommitment).not.toHaveBeenCalled();
     });
   });
 
-  describe('exportTransactionProposalToJson', () => {
-    it('should export proposal to JSON from local cache', async () => {
+  describe('importProposal', () => {
+    it('should reject imported proposals whose metadata does not match tx_summary', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'f'.repeat(64),
+        }),
+      } as any);
+
+      await expect(
+        multisig.importProposal(
+          JSON.stringify({
+            accountId: '0x' + 'a'.repeat(30),
+            nonce: 1,
+            commitment: '0x' + 'c'.repeat(64),
+            txSummaryBase64: 'AQID',
+            signatures: [],
+            metadata: {
+              proposalType: 'add_signer',
+              targetThreshold: 1,
+              targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+              description: '',
+            },
+          })
+        )
+      ).rejects.toThrow('Invalid proposal: metadata does not match tx_summary');
+    });
+  });
+
+  describe('signProposalOffline', () => {
+    it('should reject signing imported proposals whose metadata does not match tx_summary', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'c'.repeat(64),
+        }),
+      } as any);
+
+      const proposal = await multisig.importProposal(
+        JSON.stringify({
+          accountId: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          commitment: '0x' + 'c'.repeat(64),
+          txSummaryBase64: 'AQID',
+          signatures: [],
+          metadata: {
+            proposalType: 'add_signer',
+            targetThreshold: 1,
+            targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+            description: '',
+          },
+        })
+      );
+
+      proposal.metadata = {
+        proposalType: 'add_signer',
+        targetThreshold: 2,
+        targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+        description: '',
+      };
+
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'f'.repeat(64),
+        }),
+      } as any);
+
+      await expect(multisig.signProposalOffline(proposal.id)).rejects.toThrow(
+        'Invalid proposal: metadata does not match tx_summary'
+      );
+    });
+  });
+
+  describe('exportProposal', () => {
+    it('should export proposal for offline signing', async () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
-      // First sync proposals to populate local cache
       const mockProposals = [
         {
           account_id: '0x' + 'a'.repeat(30),
@@ -583,7 +1793,494 @@ describe('Multisig', () => {
             proposer_id: '0x' + 'c'.repeat(64),
             cosigner_sigs: [
               {
-                signer_id: '0x' + 'd'.repeat(64),
+                signer_id: '0x' + 'a'.repeat(64),
+                signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
+                timestamp: '2024-01-01T00:00:00Z',
+              },
+            ],
+          },
+        },
+      ];
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => mockProposals[0],
+      });
+
+      // The proposal ID is computed from tx_summary, which is mocked to return 'c'.repeat(64)
+      const exported = await multisig.exportProposal('0x' + 'c'.repeat(64));
+
+      expect(exported.accountId).toBe('0x' + 'a'.repeat(30));
+      expect(exported.nonce).toBe(1);
+      expect(exported.txSummaryBase64).toBe('AQID');
+      expect(exported.signatures.length).toBe(1);
+    });
+
+    it('should preserve ECDSA signature metadata in exported proposals', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const publicKey = '0x' + 'd'.repeat(66);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'change_threshold',
+              description: '',
+              target_threshold: 2,
+              signer_commitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'c'.repeat(64),
+            cosigner_sigs: [
+              {
+                signer_id: '0x' + 'a'.repeat(64),
+                signature: {
+                  scheme: 'ecdsa',
+                  signature: '0x' + 'e'.repeat(130),
+                  public_key: publicKey,
+                },
+                timestamp: '2024-01-01T00:00:00Z',
+              },
+            ],
+          },
+        }),
+      });
+
+      const exported = await multisig.exportProposal('0x' + 'c'.repeat(64));
+
+      expect(exported.signatures).toEqual([
+        {
+          commitment: '0x' + 'a'.repeat(64),
+          signatureHex: '0x' + 'e'.repeat(130),
+          scheme: 'ecdsa',
+          publicKey,
+          timestamp: '2024-01-01T00:00:00Z',
+        },
+      ]);
+    });
+
+    it('should throw if proposal not found', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        text: async () => 'Proposal not found',
+      });
+
+      await expect(
+        multisig.exportProposal('0x' + 'nonexistent'.repeat(5))
+      ).rejects.toThrow('Proposal not found');
+    });
+  });
+
+  describe('importProposal', () => {
+    it('should reject imported signatures with non-32-byte signer IDs', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const exported = {
+        accountId: multisig.accountId,
+        nonce: 1,
+        commitment: '0x' + 'c'.repeat(64),
+        txSummaryBase64: 'AQID',
+        signatures: [
+          {
+            commitment: '0x1',
+            signatureHex: '0x' + 'b'.repeat(128),
+          },
+        ],
+        metadata: {
+          proposalType: 'add_signer' as const,
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        },
+      };
+
+      await expect(multisig.importProposal(JSON.stringify(exported))).rejects.toThrow(
+        'expected signerId as 32-byte hex',
+      );
+    });
+
+    it('should preserve ECDSA imported signature metadata', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const publicKey = '0x' + 'd'.repeat(66);
+
+      const proposal = await multisig.importProposal(
+        JSON.stringify({
+          accountId: multisig.accountId,
+          nonce: 1,
+          commitment: '0x' + 'c'.repeat(64),
+          txSummaryBase64: 'AQID',
+          signatures: [
+            {
+              commitment: '0x' + 'a'.repeat(64),
+              signatureHex: '0x' + 'b'.repeat(130),
+              scheme: 'ecdsa',
+              publicKey,
+              timestamp: '2024-01-01T00:00:00Z',
+            },
+          ],
+          metadata: {
+            proposalType: 'change_threshold',
+            targetThreshold: 1,
+            targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+            description: '',
+          },
+        })
+      );
+
+      expect(proposal.signatures).toEqual([
+        {
+          signerId: '0x' + 'a'.repeat(64),
+          signature: {
+            scheme: 'ecdsa',
+            signature: '0x' + 'b'.repeat(130),
+            publicKey,
+          },
+          timestamp: '2024-01-01T00:00:00Z',
+        },
+      ]);
+    });
+
+    it('should reject imported ECDSA signatures without a public key', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      await expect(
+        multisig.importProposal(
+          JSON.stringify({
+            accountId: multisig.accountId,
+            nonce: 1,
+            commitment: '0x' + 'c'.repeat(64),
+            txSummaryBase64: 'AQID',
+            signatures: [
+              {
+                commitment: '0x' + 'a'.repeat(64),
+                signatureHex: '0x' + 'b'.repeat(130),
+                scheme: 'ecdsa',
+              },
+            ],
+            metadata: {
+              proposalType: 'change_threshold',
+              targetThreshold: 1,
+              targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+              description: '',
+            },
+          })
+        )
+      ).rejects.toThrow('ECDSA signature for 0x' + 'a'.repeat(64) + ' is missing publicKey');
+    });
+
+    it('should reject offline signing if an imported proposal account is changed', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), mockSigner.commitment],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const exported = {
+        accountId: multisig.accountId,
+        nonce: 1,
+        commitment: '0x' + 'c'.repeat(64),
+        txSummaryBase64: 'AQID',
+        signatures: [],
+        metadata: {
+          proposalType: 'add_signer' as const,
+          targetThreshold: 2,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+          description: '',
+        },
+      };
+
+      const proposal = await multisig.importProposal(JSON.stringify(exported));
+      proposal.accountId = '0x' + 'f'.repeat(30);
+
+      await expect(multisig.signProposalOffline(proposal.id)).rejects.toThrow(
+        'Proposal is for a different account: 0x' + 'f'.repeat(30),
+      );
+      expect(mockSigner.signCommitment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('createTransactionProposalRequest', () => {
+    it('should return a ready non-switch_guardian request without executing it', async () => {
+      const { buildSignatureAdviceEntry, signatureHexToBytes } = await import('./utils/signature.js');
+      vi.mocked(signatureHexToBytes).mockClear();
+      vi.mocked(buildSignatureAdviceEntry).mockClear();
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+        guardianPublicKey: '0x' + '1'.repeat(66),
+      };
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        scheme: 'ecdsa',
+        publicKey: '0x' + '2'.repeat(66),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+      const cachedProposalId = '0x' + 'c'.repeat(64);
+      const requestedProposalId = '0x' + 'C'.repeat(64);
+      const cosignerPubkey = '0x' + '3'.repeat(66);
+      const ackPubkey = '0x' + '4'.repeat(66);
+      const cosignerSignature = '0x' + '5'.repeat(130);
+      const ackSignature = '0x' + '6'.repeat(130);
+      const finalRequest = { kind: 'final-change-threshold-request' };
+
+      vi.mocked(buildUpdateSignersTransactionRequest)
+        .mockResolvedValueOnce({
+          request: { kind: 'verify-change-threshold-request' },
+          salt: { toHex: () => '0x' + 'd'.repeat(64) },
+          configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+        } as any)
+        .mockResolvedValueOnce({
+          request: finalRequest,
+          salt: { toHex: () => '0x' + 'd'.repeat(64) },
+          configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+        } as any);
+
+      (multisig as any).proposals.set(cachedProposalId, {
+        id: cachedProposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: {
+              scheme: 'ecdsa',
+              signature: cosignerSignature,
+              publicKey: cosignerPubkey,
+            },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'change_threshold',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'change_threshold',
+              target_threshold: 1,
+              signer_commitments: ['0x' + 'a'.repeat(64)],
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'a'.repeat(64),
+            cosigner_sigs: [],
+          },
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          ack_sig: ackSignature,
+          ack_pubkey: ackPubkey,
+          ack_scheme: 'ecdsa',
+        }),
+      });
+
+      await expect(
+        multisig.createTransactionProposalRequest(requestedProposalId)
+      ).resolves.toBe(finalRequest);
+
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        1,
+        cosignerSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        2,
+        ackSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        cosignerPubkey,
+        cosignerSignature,
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        ackPubkey,
+        ackSignature,
+      );
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.proveTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.submitProvenTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.applyTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should return a ready switch_guardian request without executing it', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+      const newGuardianPubkey = '0x' + '1'.repeat(64);
+      const finalRequest = { kind: 'final-switch-guardian-request' };
+
+      vi.mocked(buildUpdateGuardianTransactionRequest)
+        .mockResolvedValueOnce({
+          request: { kind: 'verify-switch-guardian-request' },
+          salt: { toHex: () => '0x' + 'd'.repeat(64) },
+        } as any)
+        .mockResolvedValueOnce({
+          request: finalRequest,
+          salt: { toHex: () => '0x' + 'd'.repeat(64) },
+        } as any);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey,
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: newGuardianPubkey }),
+      });
+
+      await expect(multisig.createTransactionProposalRequest(proposalId)).resolves.toBe(finalRequest);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.proveTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.submitProvenTransaction).not.toHaveBeenCalled();
+      expect(mockWebClient.applyTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should throw if proposal not found locally', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      await expect(
+        multisig.createTransactionProposalRequest('0x' + 'nonexistent'.repeat(5))
+      ).rejects.toThrow('Proposal not found');
+    });
+
+    it('should throw if proposal is still pending', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+
+      const mockProposals = [
+        {
+          account_id: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'add_signer',
+              description: '',
+              target_threshold: 2,
+              signer_commitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'c'.repeat(64),
+            cosigner_sigs: [
+              {
+                signer_id: '0x' + 'a'.repeat(64),
                 signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
                 timestamp: '2024-01-01T00:00:00Z',
               },
@@ -597,46 +2294,323 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposals }),
       });
 
-      await multisig.syncTransactionProposals();
+      await multisig.syncProposals();
 
-      // The proposal ID is computed from tx_summary, which is mocked to return 'c'.repeat(64)
-      const json = multisig.exportTransactionProposalToJson('0x' + 'c'.repeat(64));
-      const exported = JSON.parse(json);
-
-      expect(exported.accountId).toBe('0x' + 'a'.repeat(30));
-      expect(exported.nonce).toBe(1);
-      expect(exported.txSummaryBase64).toBe('AQID');
-      expect(exported.signatures.length).toBe(1);
-      expect(exported.commitment).toBe('0x' + 'c'.repeat(64));
+      await expect(
+        multisig.createTransactionProposalRequest('0x' + 'c'.repeat(64))
+      ).rejects.toThrow('not ready for execution');
     });
 
-    it('should throw if proposal not found in cache', () => {
+    it('should throw when proposal metadata does not match tx_summary', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
 
-      expect(() =>
-        multisig.exportTransactionProposalToJson('0x' + 'nonexistent'.repeat(5))
-      ).toThrow('Proposal not found');
+      vi.mocked(executeForSummary).mockResolvedValueOnce({
+        toCommitment: () => ({
+          toHex: () => '0x' + 'd'.repeat(64),
+        }),
+      } as any);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'change_threshold',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        },
+      });
+
+      await expect(multisig.createTransactionProposalRequest(proposalId)).rejects.toThrow(
+        `Invalid proposal: metadata does not match tx_summary for ${proposalId}`
+      );
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should reject switch_guardian requests when endpoint commitment mismatches', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: '0x' + '2'.repeat(64) }),
+      });
+
+      await expect(multisig.createTransactionProposalRequest(proposalId)).rejects.toThrow(
+        'Refusing to use GUARDIAN endpoint'
+      );
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should reject duplicate normalized signer IDs during request creation', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+          {
+            signerId: '0x' + 'A'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'c'.repeat(128) },
+            timestamp: '2024-01-01T00:00:01Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      await expect(multisig.createTransactionProposalRequest(proposalId)).rejects.toThrow(
+        'duplicate signatures for signer',
+      );
+    });
+
+    it('should build a fresh tx commitment word for each advice entry during request creation', async () => {
+      const { buildSignatureAdviceEntry } = await import('./utils/signature.js');
+      const { Word } = await import('@miden-sdk/miden-sdk');
+
+      const originalAdviceImpl = vi.mocked(buildSignatureAdviceEntry).getMockImplementation();
+      const originalWordFromHexImpl = vi.mocked(Word.fromHex).getMockImplementation();
+
+      try {
+        vi.mocked(Word.fromHex).mockImplementation((hex: string) => {
+          let consumed = false;
+          return {
+            toHex: () => hex,
+            toFelts: () => {
+              if (consumed) {
+                throw new Error('Word already consumed');
+              }
+              consumed = true;
+              return [1, 2, 3, 4];
+            },
+          } as any;
+        });
+
+        vi.mocked(buildSignatureAdviceEntry).mockImplementation(
+          (signerCommitment: any, message: any) => {
+            message.toFelts();
+            return {
+              key: { toHex: () => signerCommitment.toHex() },
+              values: [1, 2, 3],
+            } as any;
+          },
+        );
+
+        const config = {
+          threshold: 1,
+          signerCommitments: ['0x' + 'a'.repeat(64)],
+          guardianCommitment: '0x' + 'c'.repeat(64),
+        };
+
+        const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+        const proposalId = '0x' + 'c'.repeat(64);
+        const finalRequest = { kind: 'fresh-message-word-request' };
+
+        vi.mocked(buildUpdateSignersTransactionRequest)
+          .mockResolvedValueOnce({
+            request: { kind: 'verify-change-threshold-request' },
+            salt: { toHex: () => '0x' + 'd'.repeat(64) },
+            configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+          } as any)
+          .mockResolvedValueOnce({
+            request: finalRequest,
+            salt: { toHex: () => '0x' + 'd'.repeat(64) },
+            configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+          } as any);
+
+        (multisig as any).proposals.set(proposalId, {
+          id: proposalId,
+          accountId: multisig.accountId,
+          nonce: 1,
+          status: 'ready',
+          txSummary: 'AQID',
+          signatures: [
+            {
+              signerId: '0x' + 'a'.repeat(64),
+              signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+              timestamp: '2024-01-01T00:00:00Z',
+            },
+          ],
+          metadata: {
+            proposalType: 'change_threshold',
+            targetThreshold: 1,
+            targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+            description: '',
+          },
+        });
+
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            account_id: multisig.accountId,
+            nonce: 1,
+            prev_commitment: '0x' + 'b'.repeat(64),
+            delta_payload: {
+              tx_summary: { data: 'AQID' },
+              signatures: [],
+              metadata: {
+                proposal_type: 'change_threshold',
+                target_threshold: 1,
+                signer_commitments: ['0x' + 'a'.repeat(64)],
+              },
+            },
+            status: {
+              status: 'pending',
+              timestamp: '2024-01-01T00:00:00Z',
+              proposer_id: '0x' + 'a'.repeat(64),
+              cosigner_sigs: [],
+            },
+          }),
+        });
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            account_id: multisig.accountId,
+            nonce: 1,
+            ack_sig: '0x' + 'f'.repeat(128),
+            ack_scheme: 'falcon',
+          }),
+        });
+
+        await expect(multisig.createTransactionProposalRequest(proposalId)).resolves.toBe(finalRequest);
+      } finally {
+        if (originalAdviceImpl) {
+          vi.mocked(buildSignatureAdviceEntry).mockImplementation(originalAdviceImpl);
+        }
+        if (originalWordFromHexImpl) {
+          vi.mocked(Word.fromHex).mockImplementation(originalWordFromHexImpl);
+        }
+      }
+    });
+
+    it('should reject advice-map key collisions during request creation', async () => {
+      const { buildSignatureAdviceEntry } = await import('./utils/signature.js');
+      vi.mocked(buildSignatureAdviceEntry)
+        .mockImplementationOnce(() => ({
+          key: { toHex: () => '0x' + 'f'.repeat(64) },
+          values: [1, 2, 3],
+        }) as any)
+        .mockImplementationOnce(() => ({
+          key: { toHex: () => '0x' + 'f'.repeat(64) },
+          values: [1, 2, 3],
+        }) as any);
+
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+          {
+            signerId: '0x' + 'b'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'c'.repeat(128) },
+            timestamp: '2024-01-01T00:00:01Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      await expect(multisig.createTransactionProposalRequest(proposalId)).rejects.toThrow(
+        'Duplicate advice-map key detected',
+      );
     });
   });
 
-  describe('executeTransactionProposal', () => {
+  describe('executeProposal', () => {
     it('should throw if proposal not found locally', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       await expect(
-        multisig.executeTransactionProposal('0x' + 'nonexistent'.repeat(5))
+        multisig.executeProposal('0x' + 'nonexistent'.repeat(5))
       ).rejects.toThrow('Proposal not found');
     });
 
@@ -644,10 +2618,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 2, // Need 2 signatures
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       // Sync with pending proposal (only 1 signature)
       const mockProposals = [
@@ -671,7 +2645,7 @@ describe('Multisig', () => {
             proposer_id: '0x' + 'c'.repeat(64),
             cosigner_sigs: [
               {
-                signer_id: '0x' + 'd'.repeat(64),
+                signer_id: '0x' + 'a'.repeat(64),
                 signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
                 timestamp: '2024-01-01T00:00:00Z',
               },
@@ -685,22 +2659,22 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposals }),
       });
 
-      await multisig.syncTransactionProposals();
+      await multisig.syncProposals();
 
       // Proposal ID is mocked to return 'c'.repeat(64)
       await expect(
-        multisig.executeTransactionProposal('0x' + 'c'.repeat(64))
+        multisig.executeProposal('0x' + 'c'.repeat(64))
       ).rejects.toThrow('not ready for execution');
     });
 
-    it('should fail when PSM ack signature is missing (selector ON)', async () => {
+    it('should fail when GUARDIAN ack signature is missing (selector ON)', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const readyDelta = {
         account_id: '0x' + 'a'.repeat(30),
@@ -722,7 +2696,7 @@ describe('Multisig', () => {
           proposer_id: '0x' + 'c'.repeat(64),
           cosigner_sigs: [
             {
-              signer_id: '0x' + 'd'.repeat(64),
+              signer_id: '0x' + 'a'.repeat(64),
               signature: { scheme: 'falcon', signature: '0x' + 'e'.repeat(128) },
               timestamp: '2024-01-01T00:00:00Z',
             },
@@ -737,12 +2711,12 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({ proposals: [readyDelta] }),
       });
-      await multisig.syncTransactionProposals();
+      await multisig.syncProposals();
 
-      // executeProposal: getDeltaProposals
+      // executeProposal: getDeltaProposal
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ proposals: [readyDelta] }),
+        json: async () => readyDelta,
       });
       // executeProposal: pushDelta without ack_sig
       mockFetch.mockResolvedValueOnce({
@@ -750,8 +2724,422 @@ describe('Multisig', () => {
         json: async () => ({ ...readyDelta, ack_sig: null }),
       });
 
-      await expect(multisig.executeTransactionProposal(proposalId)).rejects.toThrow(
-        'PSM did not return acknowledgment signature'
+      await expect(multisig.executeProposal(proposalId)).rejects.toThrow(
+        'GUARDIAN did not return acknowledgment signature'
+      );
+    });
+
+    it('should encode ECDSA proposal and ack signatures with scheme-aware advice', async () => {
+      const { buildSignatureAdviceEntry, signatureHexToBytes } = await import('./utils/signature.js');
+      vi.mocked(signatureHexToBytes).mockClear();
+      vi.mocked(buildSignatureAdviceEntry).mockClear();
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+        guardianPublicKey: '0x' + '1'.repeat(66),
+      };
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        scheme: 'ecdsa',
+        publicKey: '0x' + '2'.repeat(66),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+      const cosignerPubkey = '0x' + '3'.repeat(66);
+      const ackPubkey = '0x' + '4'.repeat(66);
+      const cosignerSignature = '0x' + '5'.repeat(130);
+      const ackSignature = '0x' + '6'.repeat(130);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: {
+              scheme: 'ecdsa',
+              signature: cosignerSignature,
+              publicKey: cosignerPubkey,
+            },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'change_threshold',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'change_threshold',
+              target_threshold: 1,
+              signer_commitments: ['0x' + 'a'.repeat(64)],
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'a'.repeat(64),
+            cosigner_sigs: [],
+          },
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          ack_sig: ackSignature,
+          ack_pubkey: ackPubkey,
+          ack_scheme: 'ecdsa',
+        }),
+      });
+      mockWebClient.transactions.submit.mockResolvedValueOnce({});
+
+      await expect(multisig.executeProposal(proposalId)).resolves.toBeUndefined();
+      expect(mockWebClient.transactions.submit).toHaveBeenCalledTimes(1);
+
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        1,
+        cosignerSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        2,
+        ackSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        cosignerPubkey,
+        cosignerSignature,
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        ackPubkey,
+        ackSignature,
+      );
+    });
+
+    it('should execute imported ECDSA proposals with scheme-aware advice', async () => {
+      const { buildSignatureAdviceEntry, signatureHexToBytes } = await import('./utils/signature.js');
+      vi.mocked(signatureHexToBytes).mockClear();
+      vi.mocked(buildSignatureAdviceEntry).mockClear();
+
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+        guardianPublicKey: '0x' + '1'.repeat(66),
+      };
+
+      const ecdsaSigner: Signer = {
+        ...mockSigner,
+        scheme: 'ecdsa',
+        publicKey: '0x' + '2'.repeat(66),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, ecdsaSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+      const cosignerPubkey = '0x' + '3'.repeat(66);
+      const ackPubkey = '0x' + '4'.repeat(66);
+      const cosignerSignature = '0x' + '5'.repeat(130);
+      const ackSignature = '0x' + '6'.repeat(130);
+
+      await multisig.importProposal(
+        JSON.stringify({
+          accountId: multisig.accountId,
+          nonce: 1,
+          commitment: proposalId,
+          txSummaryBase64: 'AQID',
+          signatures: [
+            {
+              commitment: '0x' + 'a'.repeat(64),
+              signatureHex: cosignerSignature,
+              scheme: 'ecdsa',
+              publicKey: cosignerPubkey,
+              timestamp: '2024-01-01T00:00:00Z',
+            },
+          ],
+          metadata: {
+            proposalType: 'change_threshold',
+            targetThreshold: 1,
+            targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+            description: '',
+          },
+        })
+      );
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          prev_commitment: '0x' + 'b'.repeat(64),
+          delta_payload: {
+            tx_summary: { data: 'AQID' },
+            signatures: [],
+            metadata: {
+              proposal_type: 'change_threshold',
+              target_threshold: 1,
+              signer_commitments: ['0x' + 'a'.repeat(64)],
+            },
+          },
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'a'.repeat(64),
+            cosigner_sigs: [],
+          },
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          account_id: multisig.accountId,
+          nonce: 1,
+          ack_sig: ackSignature,
+          ack_pubkey: ackPubkey,
+          ack_scheme: 'ecdsa',
+        }),
+      });
+      mockWebClient.transactions.submit.mockResolvedValueOnce({});
+
+      await expect(multisig.executeProposal(proposalId)).resolves.toBeUndefined();
+
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        1,
+        cosignerSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(signatureHexToBytes)).toHaveBeenNthCalledWith(
+        2,
+        ackSignature,
+        'ecdsa',
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        cosignerPubkey,
+        cosignerSignature,
+      );
+      expect(vi.mocked(buildSignatureAdviceEntry)).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        ackPubkey,
+        ackSignature,
+      );
+    });
+
+    it('should verify switch_guardian endpoint commitment before execution', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+      const newGuardianPubkey = '0x' + '1'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey,
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: newGuardianPubkey }),
+      });
+      mockWebClient.getAccount.mockResolvedValueOnce({
+        serialize: () => new Uint8Array([1, 2, 3]),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ success: true, message: 'ok', ack_pubkey: '0x' + 'f'.repeat(64) }),
+      });
+      mockWebClient.transactions.submit.mockResolvedValueOnce({});
+
+      await expect(multisig.executeProposal(proposalId)).resolves.toBeUndefined();
+      expect(mockWebClient.transactions.submit).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject switch_guardian execution when endpoint commitment mismatches', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ commitment: '0x' + '2'.repeat(64) }),
+      });
+
+      await expect(multisig.executeProposal(proposalId)).rejects.toThrow(
+        'Refusing to use GUARDIAN endpoint'
+      );
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should reject duplicate normalized signer IDs during execution', async () => {
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+          {
+            signerId: '0x' + 'A'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'c'.repeat(128) },
+            timestamp: '2024-01-01T00:00:01Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      await expect(multisig.executeProposal(proposalId)).rejects.toThrow(
+        'duplicate signatures for signer',
+      );
+    });
+
+    it('should reject advice-map key collisions during execution', async () => {
+      const { buildSignatureAdviceEntry } = await import('./utils/signature.js');
+      vi.mocked(buildSignatureAdviceEntry)
+        .mockImplementationOnce(() => ({
+          key: { toHex: () => '0x' + 'f'.repeat(64) },
+          values: [1, 2, 3],
+        }) as any)
+        .mockImplementationOnce(() => ({
+          key: { toHex: () => '0x' + 'f'.repeat(64) },
+          values: [1, 2, 3],
+        }) as any);
+
+      const config = {
+        threshold: 2,
+        signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      const proposalId = '0x' + 'c'.repeat(64);
+
+      (multisig as any).proposals.set(proposalId, {
+        id: proposalId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+          {
+            signerId: '0x' + 'b'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'c'.repeat(128) },
+            timestamp: '2024-01-01T00:00:01Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'switch_guardian',
+          newGuardianPubkey: '0x' + '1'.repeat(64),
+          newGuardianEndpoint: 'http://new-guardian.com',
+          description: '',
+        },
+      });
+
+      await expect(multisig.executeProposal(proposalId)).rejects.toThrow(
+        'Duplicate advice-map key detected',
       );
     });
   });
@@ -761,10 +3149,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       // Create a proposal with metadata
       const mockDelta = {
@@ -774,7 +3162,11 @@ describe('Multisig', () => {
         delta_payload: {
           tx_summary: { data: 'AQID' },
           signatures: [],
-          metadata: { proposal_type: 'add_signer' },
+          metadata: {
+            proposal_type: 'add_signer',
+            target_threshold: 2,
+            signer_commitments: ['0x1', '0x2'],
+          },
         },
         status: {
           status: 'pending',
@@ -788,7 +3180,7 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({
           delta: mockDelta,
-          commitment: '0x' + 'd'.repeat(64),
+          commitment: '0x' + 'c'.repeat(64),
         }),
       });
 
@@ -809,20 +3201,20 @@ describe('Multisig', () => {
         }),
       });
 
-      const syncedProposals = await multisig.syncTransactionProposals();
+      const syncedProposals = await multisig.syncProposals();
       const syncedProposal = syncedProposals.find(p => p.nonce === 1);
 
       expect(syncedProposal?.metadata?.proposalType).toBe('add_signer');
     });
 
-    it('should use PSM metadata for new proposals from other signers', async () => {
+    it('should use GUARDIAN metadata for new proposals from other signers', async () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       // Sync proposals - no local proposals exist
       const mockProposals = [
@@ -854,7 +3246,7 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
       expect(proposals.length).toBe(1);
       expect(proposals[0].metadata?.proposalType).toBe('p2id');
@@ -866,10 +3258,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockDelta = {
         account_id: '0x' + 'a'.repeat(30),
@@ -897,7 +3289,7 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({
           delta: mockDelta,
-          commitment: '0x' + 'd'.repeat(64),
+          commitment: '0x' + 'c'.repeat(64),
         }),
       });
 
@@ -914,10 +3306,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockDelta = {
         account_id: '0x' + 'a'.repeat(30),
@@ -945,7 +3337,7 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({
           delta: mockDelta,
-          commitment: '0x' + 'd'.repeat(64),
+          commitment: '0x' + 'c'.repeat(64),
         }),
       });
 
@@ -960,14 +3352,14 @@ describe('Multisig', () => {
       expect(proposal.metadata?.proposalType).toBe('p2id');
     });
 
-    it('should create switch_psm proposal', async () => {
+    it('should create switch_guardian proposal', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       const mockDelta = {
         account_id: '0x' + 'a'.repeat(30),
@@ -995,18 +3387,18 @@ describe('Multisig', () => {
         ok: true,
         json: async () => ({
           delta: mockDelta,
-          commitment: '0x' + 'd'.repeat(64),
+          commitment: '0x' + 'c'.repeat(64),
         }),
       });
 
       const proposal = await multisig.createProposal(1, 'AQID', {
-        proposalType: 'switch_psm',
-        newPsmPubkey: '0xnewpubkey',
-        newPsmEndpoint: 'http://new-psm.com',
+        proposalType: 'switch_guardian',
+        newGuardianPubkey: '0xnewpubkey',
+        newGuardianEndpoint: 'http://new-guardian.com',
         description: '',
       });
 
-      expect(proposal.metadata?.proposalType).toBe('switch_psm');
+      expect(proposal.metadata?.proposalType).toBe('switch_guardian');
     });
   });
 
@@ -1015,10 +3407,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       // First sync with 1 signature (pending)
       const mockProposalsPending = [
@@ -1056,8 +3448,8 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposalsPending }),
       });
 
-      let proposals = await multisig.syncTransactionProposals();
-      expect(proposals[0].status.type).toBe('pending');
+      let proposals = await multisig.syncProposals();
+      expect(proposals[0].status).toBe('pending');
 
       // Second sync with 2 signatures (ready)
       const mockProposalsReady = [
@@ -1097,8 +3489,8 @@ describe('Multisig', () => {
         json: async () => ({ proposals: mockProposalsReady }),
       });
 
-      proposals = await multisig.syncTransactionProposals();
-      expect(proposals[0].status.type).toBe('ready');
+      proposals = await multisig.syncProposals();
+      expect(proposals[0].status).toBe('ready');
     });
   });
 
@@ -1107,10 +3499,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 3,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64), '0x' + 'c'.repeat(64)],
-        psmCommitment: '0x' + 'd'.repeat(64),
+        guardianCommitment: '0x' + 'd'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
       expect(multisig.threshold).toBe(3);
     });
 
@@ -1119,33 +3511,33 @@ describe('Multisig', () => {
       const config = {
         threshold: 2,
         signerCommitments,
-        psmCommitment: '0x' + 'd'.repeat(64),
+        guardianCommitment: '0x' + 'd'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
       expect(multisig.signerCommitments).toEqual(signerCommitments);
     });
 
-    it('should expose psmCommitment', () => {
-      const psmCommitment = '0x' + 'psm'.repeat(20);
+    it('should expose guardianCommitment', () => {
+      const guardianCommitment = '0x' + 'guardian'.repeat(20);
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment,
+        guardianCommitment,
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
-      expect(multisig.psmCommitment).toBe(psmCommitment);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
+      expect(multisig.guardianCommitment).toBe(guardianCommitment);
     });
 
     it('should expose account when provided', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'd'.repeat(64),
+        guardianCommitment: '0x' + 'd'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
       expect(multisig.account).toBe(mockAccount);
     });
   });
@@ -1155,12 +3547,12 @@ describe('Multisig', () => {
       const config = {
         threshold: 2,
         signerCommitments: ['0x' + 'a'.repeat(64), '0x' + 'b'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
-      // Simulates a PSM response with canonical snake_case metadata
+      // Simulates a GUARDIAN response with canonical snake_case metadata
       const rustProposals = [
         {
           account_id: '0x' + 'a'.repeat(30),
@@ -1190,7 +3582,7 @@ describe('Multisig', () => {
         json: async () => ({ proposals: rustProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
       expect(proposals.length).toBe(1);
       // The TS client should normalize snake_case to camelCase
@@ -1205,10 +3597,10 @@ describe('Multisig', () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
       // P2ID proposal with canonical snake_case fields
       const p2idProposals = [
@@ -1247,7 +3639,7 @@ describe('Multisig', () => {
         json: async () => ({ proposals: p2idProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
       expect(proposals.length).toBe(1);
       expect(proposals[0].metadata?.proposalType).toBe('p2id');
@@ -1258,16 +3650,16 @@ describe('Multisig', () => {
       }
     });
 
-    it('should parse switch_psm proposal with snake_case fields', async () => {
+    it('should parse switch_guardian proposal with snake_case fields', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
-        psmCommitment: '0x' + 'c'.repeat(64),
+        guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
-      const multisig = new Multisig(mockAccount, config, psm, mockSigner, mockWebClient);
+      const multisig = new Multisig(mockAccount, config, guardian, mockSigner, mockWebClient);
 
-      const switchPsmProposals = [
+      const switchGuardianProposals = [
         {
           account_id: '0x' + 'a'.repeat(30),
           nonce: 1,
@@ -1276,9 +3668,9 @@ describe('Multisig', () => {
             tx_summary: { data: 'AQID' },
             signatures: [],
             metadata: {
-              proposal_type: 'switch_psm',
-              new_psm_pubkey: '0xnewpubkey',
-              new_psm_endpoint: 'http://new-psm.com',
+              proposal_type: 'switch_guardian',
+              new_guardian_pubkey: '0xnewpubkey',
+              new_guardian_endpoint: 'http://new-guardian.com',
               salt: '0xsalt',
             },
           },
@@ -1293,16 +3685,16 @@ describe('Multisig', () => {
 
       mockFetch.mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ proposals: switchPsmProposals }),
+        json: async () => ({ proposals: switchGuardianProposals }),
       });
 
-      const proposals = await multisig.syncTransactionProposals();
+      const proposals = await multisig.syncProposals();
 
       expect(proposals.length).toBe(1);
-      expect(proposals[0].metadata?.proposalType).toBe('switch_psm');
-      if (proposals[0].metadata?.proposalType === 'switch_psm') {
-        expect(proposals[0].metadata.newPsmPubkey).toBe('0xnewpubkey');
-        expect(proposals[0].metadata.newPsmEndpoint).toBe('http://new-psm.com');
+      expect(proposals[0].metadata?.proposalType).toBe('switch_guardian');
+      if (proposals[0].metadata?.proposalType === 'switch_guardian') {
+        expect(proposals[0].metadata.newGuardianPubkey).toBe('0xnewpubkey');
+        expect(proposals[0].metadata.newGuardianEndpoint).toBe('http://new-guardian.com');
       }
     });
   });

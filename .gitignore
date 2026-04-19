@@ -1,16 +1,18 @@
 target/
 store.sqlite3
-keystore/
+/keystore/
 miden-client.toml
 templates/
 .env
+.env.prod
 
-.agents/
 .cursor/
 .claude/
 CLAUDE.md
 
 .vscode/
+.specify/state/
 
 crates/server/bench/results/*
 !crates/server/bench/results/.gitkeep
+benchmarks/prod-server/reports/

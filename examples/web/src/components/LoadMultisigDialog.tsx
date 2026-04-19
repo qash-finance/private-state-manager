@@ -71,7 +71,7 @@ export function LoadMultisigDialog({
         <DialogHeader>
           <DialogTitle>Load Multisig</DialogTitle>
           <DialogDescription>
-            Load an existing multisig account from PSM. Configuration will be auto-detected.
+            Load an existing multisig account from GUARDIAN. Configuration will be auto-detected.
           </DialogDescription>
         </DialogHeader>
 
@@ -125,10 +125,10 @@ export function LoadMultisigDialog({
                     {detectedConfig.numSigners} multisig
                   </div>
                   <div>
-                    <strong>Scheme:</strong> {detectedConfig.signatureScheme}
+                    <strong>Signing as:</strong> {signatureScheme}
                   </div>
                   <div>
-                    <strong>PSM:</strong> {detectedConfig.psmEnabled ? 'Enabled' : 'Disabled'}
+                    <strong>GUARDIAN:</strong> {detectedConfig.guardianEnabled ? 'Enabled' : 'Disabled'}
                   </div>
                   <div className="text-xs text-muted-foreground">
                     Signers:{' '}
@@ -151,7 +151,7 @@ export function LoadMultisigDialog({
           >
             {loading
               ? walletSource !== 'local' ? 'Awaiting wallet approval...' : 'Loading...'
-              : 'Load from PSM'}
+              : 'Load from GUARDIAN'}
           </Button>
         </div>
       </DialogContent>

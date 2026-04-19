@@ -11,38 +11,48 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import type { ConsumableNote, SignatureScheme, VaultBalance } from '@openzeppelin/miden-multisig-client';
+import type {
+  ConsumableNote,
+  VaultBalance,
+  ProcedureName,
+  SignatureScheme,
+} from '@openzeppelin/miden-multisig-client';
+import { USER_PROCEDURES } from '@/lib/procedures';
 
-type ProposalType = 'add_signer' | 'remove_signer' | 'change_threshold' | 'consume_notes' | 'p2id' | 'switch_psm';
+type ProposalType = 'add_signer' | 'remove_signer' | 'change_threshold' | 'update_procedure_threshold' | 'consume_notes' | 'p2id' | 'switch_guardian';
 
 interface CreateProposalFormProps {
   currentThreshold: number;
   signerCommitments: string[];
   signatureScheme: SignatureScheme;
+  procedureThresholds?: Map<ProcedureName, number>;
   creatingProposal: boolean;
   consumableNotes: ConsumableNote[];
   vaultBalances: VaultBalance[];
   onCreateAddSigner: (commitment: string, increaseThreshold: boolean) => void;
   onCreateRemoveSigner: (signerToRemove: string, newThreshold?: number) => void;
   onCreateChangeThreshold: (newThreshold: number) => void;
+  onCreateUpdateProcedureThreshold: (procedure: ProcedureName, threshold: number) => void;
   onCreateConsumeNotes: (noteIds: string[]) => void;
   onCreateP2id: (recipientId: string, faucetId: string, amount: bigint) => void;
-  onCreateSwitchPsm: (newEndpoint: string, newPubkey: string) => void;
+  onCreateSwitchGuardian: (newEndpoint: string, newPubkey: string) => void;
 }
 
 export function CreateProposalForm({
   currentThreshold,
   signerCommitments,
   signatureScheme,
+  procedureThresholds,
   creatingProposal,
   consumableNotes,
   vaultBalances,
   onCreateAddSigner,
   onCreateRemoveSigner,
   onCreateChangeThreshold,
+  onCreateUpdateProcedureThreshold,
   onCreateConsumeNotes,
   onCreateP2id,
-  onCreateSwitchPsm,
+  onCreateSwitchGuardian,
 }: CreateProposalFormProps) {
   const [proposalType, setProposalType] = useState<ProposalType>('add_signer');
 
@@ -57,6 +67,10 @@ export function CreateProposalForm({
   // Change threshold state
   const [newThreshold, setNewThreshold] = useState(currentThreshold);
 
+  // Procedure-threshold override state
+  const [targetProcedure, setTargetProcedure] = useState<ProcedureName>('send_asset');
+  const [procedureThreshold, setProcedureThreshold] = useState('');
+
   // Consume notes state
   const [selectedNoteIds, setSelectedNoteIds] = useState<string[]>([]);
 
@@ -65,17 +79,17 @@ export function CreateProposalForm({
   const [selectedFaucetId, setSelectedFaucetId] = useState('');
   const [sendAmount, setSendAmount] = useState('');
 
-  // Switch PSM state
-  const [newPsmEndpoint, setNewPsmEndpoint] = useState('');
-  const [newPsmPubkey, setNewPsmPubkey] = useState('');
+  // Switch GUARDIAN state
+  const [newGuardianEndpoint, setNewGuardianEndpoint] = useState('');
+  const [newGuardianPubkey, setNewGuardianPubkey] = useState('');
   const [fetchingPubkey, setFetchingPubkey] = useState(false);
   const [pubkeyError, setPubkeyError] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
 
   // Auto-fetch pubkey when endpoint changes
   useEffect(() => {
-    if (!newPsmEndpoint.trim()) {
-      setNewPsmPubkey('');
+    if (!newGuardianEndpoint.trim()) {
+      setNewGuardianPubkey('');
       setPubkeyError(null);
       return;
     }
@@ -89,21 +103,18 @@ export function CreateProposalForm({
     debounceRef.current = window.setTimeout(async () => {
       setFetchingPubkey(true);
       setPubkeyError(null);
-      setNewPsmPubkey('');
+      setNewGuardianPubkey('');
 
       try {
-        let base = newPsmEndpoint.trim().replace(/\/+$/, '');
-        if (!/^https?:\/\//i.test(base)) {
-          base = `http://${base}`;
-        }
-        const response = await fetch(`${base}/pubkey?scheme=${signatureScheme}`);
+        const response = await fetch(
+          `${newGuardianEndpoint.trim()}/pubkey?scheme=${signatureScheme}`,
+        );
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
         const data = await response.json();
-        const commitment = data.commitment;
-        if (commitment) {
-          setNewPsmPubkey(commitment);
+        if (data.commitment) {
+          setNewGuardianPubkey(data.commitment);
         } else {
           throw new Error('No commitment in response');
         }
@@ -119,7 +130,7 @@ export function CreateProposalForm({
         clearTimeout(debounceRef.current);
       }
     };
-  }, [newPsmEndpoint, signatureScheme]);
+  }, [newGuardianEndpoint, signatureScheme]);
 
   const handleCreate = () => {
     switch (proposalType) {
@@ -144,6 +155,12 @@ export function CreateProposalForm({
           onCreateChangeThreshold(newThreshold);
         }
         break;
+      case 'update_procedure_threshold':
+        if (targetProcedure && procedureThreshold !== '') {
+          onCreateUpdateProcedureThreshold(targetProcedure, Number(procedureThreshold));
+          setProcedureThreshold('');
+        }
+        break;
       case 'consume_notes':
         if (selectedNoteIds.length > 0) {
           onCreateConsumeNotes(selectedNoteIds);
@@ -161,11 +178,11 @@ export function CreateProposalForm({
           }
         }
         break;
-      case 'switch_psm':
-        if (newPsmEndpoint.trim() && newPsmPubkey) {
-          onCreateSwitchPsm(newPsmEndpoint.trim(), newPsmPubkey);
-          setNewPsmEndpoint('');
-          setNewPsmPubkey('');
+      case 'switch_guardian':
+        if (newGuardianEndpoint.trim() && newGuardianPubkey) {
+          onCreateSwitchGuardian(newGuardianEndpoint.trim(), newGuardianPubkey);
+          setNewGuardianEndpoint('');
+          setNewGuardianPubkey('');
           setPubkeyError(null);
         }
         break;
@@ -180,6 +197,14 @@ export function CreateProposalForm({
         return signerToRemove.length > 0 && signerCommitments.length > 1;
       case 'change_threshold':
         return newThreshold !== currentThreshold && newThreshold >= 1 && newThreshold <= signerCommitments.length;
+      case 'update_procedure_threshold': {
+        if (!targetProcedure || procedureThreshold === '') {
+          return false;
+        }
+
+        const threshold = Number(procedureThreshold);
+        return Number.isInteger(threshold) && threshold >= 0 && threshold <= signerCommitments.length;
+      }
       case 'consume_notes':
         return selectedNoteIds.length > 0;
       case 'p2id': {
@@ -192,8 +217,8 @@ export function CreateProposalForm({
           return false;
         }
       }
-      case 'switch_psm':
-        return newPsmEndpoint.trim().length > 0 && newPsmPubkey.length > 0 && !fetchingPubkey && !pubkeyError;
+      case 'switch_guardian':
+        return newGuardianEndpoint.trim().length > 0 && newGuardianPubkey.length > 0 && !fetchingPubkey && !pubkeyError;
     }
   };
 
@@ -205,12 +230,14 @@ export function CreateProposalForm({
         return 'Create a proposal to remove an existing signer from the multisig.';
       case 'change_threshold':
         return 'Create a proposal to change the required signature threshold.';
+      case 'update_procedure_threshold':
+        return 'Create a proposal to set or clear a per-procedure threshold override.';
       case 'consume_notes':
         return 'Create a proposal to consume notes sent to the multisig account.';
       case 'p2id':
         return 'Create a proposal to send funds to another account.';
-      case 'switch_psm':
-        return 'Create a proposal to switch the PSM provider for this multisig.';
+      case 'switch_guardian':
+        return 'Create a proposal to switch the GUARDIAN provider for this multisig.';
     }
   };
 
@@ -248,9 +275,10 @@ export function CreateProposalForm({
               <SelectItem value="add_signer">Add Signer</SelectItem>
               <SelectItem value="remove_signer">Remove Signer</SelectItem>
               <SelectItem value="change_threshold">Change Threshold</SelectItem>
+              <SelectItem value="update_procedure_threshold">Update Procedure Threshold</SelectItem>
               <SelectItem value="consume_notes">Consume Notes</SelectItem>
               <SelectItem value="p2id">Send Payment</SelectItem>
-              <SelectItem value="switch_psm">Switch PSM</SelectItem>
+              <SelectItem value="switch_guardian">Switch GUARDIAN</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -359,6 +387,47 @@ export function CreateProposalForm({
                 Change from {currentThreshold}-of-{signerCommitments.length} to {newThreshold}-of-{signerCommitments.length}
               </p>
             )}
+          </div>
+        )}
+
+        {proposalType === 'update_procedure_threshold' && (
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <Label>Target Procedure</Label>
+              <Select
+                value={targetProcedure}
+                onValueChange={(value: ProcedureName) => setTargetProcedure(value)}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {USER_PROCEDURES.map((procedure) => (
+                    <SelectItem key={procedure.name} value={procedure.name}>
+                      {procedure.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Override Threshold</Label>
+              <Input
+                type="number"
+                min={0}
+                max={signerCommitments.length}
+                value={procedureThreshold}
+                onChange={(e) => setProcedureThreshold(e.target.value)}
+                placeholder="0 clears the override"
+              />
+              <p className="text-xs text-muted-foreground">
+                Current override: {procedureThresholds?.get(targetProcedure) ?? 'none'}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Use 0 to clear the override. Non-zero values must be between 1 and {signerCommitments.length}.
+              </p>
+            </div>
           </div>
         )}
 
@@ -472,31 +541,31 @@ export function CreateProposalForm({
           </div>
         )}
 
-        {/* Switch PSM Form */}
-        {proposalType === 'switch_psm' && (
+        {/* Switch GUARDIAN Form */}
+        {proposalType === 'switch_guardian' && (
           <div className="space-y-3">
             <div className="space-y-2">
-              <Label>New PSM Endpoint</Label>
+              <Label>New GUARDIAN Endpoint</Label>
               <Input
                 placeholder="http://localhost:3000"
-                value={newPsmEndpoint}
-                onChange={(e) => setNewPsmEndpoint(e.target.value)}
+                value={newGuardianEndpoint}
+                onChange={(e) => setNewGuardianEndpoint(e.target.value)}
               />
             </div>
 
             <div className="space-y-2">
-              <Label>PSM Public Key</Label>
+              <Label>GUARDIAN Commitment</Label>
               {fetchingPubkey ? (
-                <p className="text-sm text-muted-foreground">Fetching pubkey...</p>
+                <p className="text-sm text-muted-foreground">Fetching commitment...</p>
               ) : pubkeyError ? (
                 <p className="text-sm text-destructive">Failed to fetch: {pubkeyError}</p>
-              ) : newPsmPubkey ? (
+              ) : newGuardianPubkey ? (
                 <code className="block text-xs bg-muted px-2 py-1 rounded font-mono break-all">
-                  {newPsmPubkey}
+                  {newGuardianPubkey}
                 </code>
               ) : (
                 <p className="text-sm text-muted-foreground">
-                  Enter an endpoint URL to auto-fetch the pubkey
+                  Enter an endpoint URL to auto-fetch the commitment
                 </p>
               )}
             </div>

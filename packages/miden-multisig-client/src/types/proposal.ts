@@ -1,21 +1,32 @@
-import type { ProposalType as PsmProposalType, SignatureScheme } from '@openzeppelin/psm-client';
-export type ProposalType = Exclude<PsmProposalType, 'custom'>;
+import type {
+  ProposalSignature,
+  ProposalType as GuardianProposalType,
+  SignatureScheme,
+} from '@openzeppelin/guardian-client';
+import type { ProcedureName } from '../procedures.js';
+
+export type ProposalType = Exclude<GuardianProposalType, 'custom'>;
+
+export type ProposalStatus = 'pending' | 'ready' | 'finalized';
 
 export type TransactionProposalStatus =
   | { type: 'pending'; signaturesCollected: number; signaturesRequired: number; signers: string[] }
   | { type: 'ready' }
   | { type: 'finalized' };
 
-export interface TransactionProposalSignature {
+export interface ProposalSignatureEntry {
   signerId: string;
-  signature: { scheme: 'falcon' | 'ecdsa'; signature: string; publicKey?: string };
+  signature: ProposalSignature;
   timestamp: string;
 }
+
+export type TransactionProposalSignature = ProposalSignatureEntry;
 
 interface BaseProposalMetadata {
   proposalType: ProposalType;
   description: string;
   saltHex?: string;
+  requiredSignatures?: number;
 }
 
 export interface UpdateSignersProposalMetadata extends BaseProposalMetadata {
@@ -24,12 +35,18 @@ export interface UpdateSignersProposalMetadata extends BaseProposalMetadata {
   targetSignerCommitments: string[];
 }
 
-export interface SwitchPsmProposalMetadata extends BaseProposalMetadata {
-  proposalType: 'switch_psm';
-  newPsmPubkey: string;
-  newPsmEndpoint?: string;
+export interface SwitchGuardianProposalMetadata extends BaseProposalMetadata {
+  proposalType: 'switch_guardian';
+  newGuardianPubkey: string;
+  newGuardianEndpoint?: string;
   targetThreshold?: number;
   targetSignerCommitments?: string[];
+}
+
+export interface UpdateProcedureThresholdProposalMetadata extends BaseProposalMetadata {
+  proposalType: 'update_procedure_threshold';
+  targetProcedure: ProcedureName;
+  targetThreshold: number;
 }
 
 export interface ConsumeNotesProposalMetadata extends BaseProposalMetadata {
@@ -50,10 +67,21 @@ export interface UnknownProposalMetadata extends BaseProposalMetadata {
 
 export type ProposalMetadata =
   | UpdateSignersProposalMetadata
-  | SwitchPsmProposalMetadata
+  | SwitchGuardianProposalMetadata
+  | UpdateProcedureThresholdProposalMetadata
   | ConsumeNotesProposalMetadata
   | P2IdProposalMetadata
   | UnknownProposalMetadata;
+
+export interface Proposal {
+  id: string;
+  accountId: string;
+  nonce: number;
+  status: ProposalStatus;
+  txSummary: string;
+  signatures: ProposalSignatureEntry[];
+  metadata: ProposalMetadata;
+}
 
 export interface TransactionProposal {
   id: string;
@@ -66,7 +94,7 @@ export interface TransactionProposal {
   metadata: ProposalMetadata;
 }
 
-export interface ExportedTransactionProposal {
+export interface ExportedProposal {
   accountId: string;
   nonce: number;
   commitment: string;
@@ -74,10 +102,14 @@ export interface ExportedTransactionProposal {
   signatures: Array<{
     commitment: string;
     signatureHex: string;
+    scheme?: SignatureScheme;
+    publicKey?: string;
     timestamp?: string;
   }>;
-  metadata?: ProposalMetadata;
+  metadata: ProposalMetadata;
 }
+
+export type ExportedTransactionProposal = ExportedProposal;
 
 export interface SignTransactionProposalParams {
   commitment: string;

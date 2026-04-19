@@ -1,4 +1,5 @@
-import { WebClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
+import { MidenClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
+import { EcdsaSigner, FalconSigner } from '@openzeppelin/miden-multisig-client';
 import { MIDEN_DB_NAME, MIDEN_RPC_URL } from '@/config';
 import type { SignerInfo } from '@/types';
 
@@ -11,21 +12,45 @@ export async function clearMidenDatabase(dbName = MIDEN_DB_NAME): Promise<void> 
   });
 }
 
-export async function createWebClient(rpcUrl = MIDEN_RPC_URL): Promise<WebClient> {
-  const client = await WebClient.createClient(rpcUrl);
-  await client.syncState();
-  return client;
+export async function createMidenClient(rpcUrl = MIDEN_RPC_URL): Promise<MidenClient> {
+  const normalizedRpcUrl = rpcUrl.trim().toLowerCase();
+  if (normalizedRpcUrl === 'devnet' || normalizedRpcUrl === 'https://rpc.devnet.miden.io') {
+    return MidenClient.createDevnet({ rpcUrl, storeName: MIDEN_DB_NAME });
+  }
+
+  if (normalizedRpcUrl === 'testnet' || normalizedRpcUrl === 'https://rpc.testnet.miden.io') {
+    return MidenClient.createTestnet({ rpcUrl, storeName: MIDEN_DB_NAME });
+  }
+
+  return MidenClient.create({
+    rpcUrl,
+    proverUrl:
+      normalizedRpcUrl === 'local' ||
+      normalizedRpcUrl === 'localhost' ||
+      normalizedRpcUrl === 'http://localhost:57291'
+        ? 'local'
+        : undefined,
+    storeName: MIDEN_DB_NAME,
+    autoSync: true,
+  });
 }
 
-export function initializeSigner(): SignerInfo {
+export async function initializeSigner(_midenClient: MidenClient): Promise<SignerInfo> {
   const falconSecretKey = AuthSecretKey.rpoFalconWithRNG(undefined);
   const ecdsaSecretKey = AuthSecretKey.ecdsaWithRNG(undefined);
-  const falconCommitment = falconSecretKey.publicKey().toCommitment().toHex();
-  const ecdsaCommitment = ecdsaSecretKey.publicKey().toCommitment().toHex();
+
+  const falconSigner = new FalconSigner(falconSecretKey);
+  const ecdsaSigner = new EcdsaSigner(ecdsaSecretKey);
 
   return {
-    falcon: { commitment: falconCommitment, secretKey: falconSecretKey },
-    ecdsa: { commitment: ecdsaCommitment, secretKey: ecdsaSecretKey },
+    falcon: {
+      commitment: falconSigner.commitment,
+      secretKey: falconSecretKey,
+    },
+    ecdsa: {
+      commitment: ecdsaSigner.commitment,
+      secretKey: ecdsaSecretKey,
+    },
     activeScheme: 'falcon',
   };
 }

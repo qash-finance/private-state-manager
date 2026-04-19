@@ -1,34 +1,33 @@
-use crate::auth::FalconRpoSigner;
 use crate::proto::auth_config::AuthType;
 use crate::testing::mocks::{
-    MockStateManagerService, create_mock_account_state, create_mock_delta, start_mock_server,
+    MockGuardianService, create_mock_account_state, create_mock_delta, start_mock_server,
 };
 use crate::{
-    Auth, AuthConfig, ClientError, ConfigureResponse, GetDeltaProposalsResponse, GetDeltaResponse,
-    GetDeltaSinceResponse, GetStateResponse, PsmClient, PushDeltaProposalResponse,
-    PushDeltaResponse, SignDeltaProposalResponse,
+    AuthConfig, ClientError, ConfigureResponse, FalconKeyStore, GetDeltaProposalResponse,
+    GetDeltaProposalsResponse, GetDeltaResponse, GetDeltaSinceResponse, GetStateResponse,
+    GuardianClient, PushDeltaProposalResponse, PushDeltaResponse, SignDeltaProposalResponse,
+    Signer,
 };
+use guardian_shared::ProposalSignature as JsonProposalSignature;
 use miden_protocol::account::AccountId;
-use miden_protocol::crypto::dsa::falcon512_rpo::SecretKey;
-use private_state_manager_shared::ProposalSignature as JsonProposalSignature;
+use miden_protocol::crypto::dsa::falcon512_poseidon2::SecretKey;
+use std::sync::Arc;
 use tonic::Status;
 
 fn create_test_account_id() -> AccountId {
     AccountId::from_hex("0x7bfb0f38b0fafa103f86a805594170").unwrap()
 }
 
-fn create_test_auth() -> Auth {
-    let secret_key = SecretKey::new();
-    Auth::FalconRpoSigner(FalconRpoSigner::new(secret_key))
+fn create_test_signer() -> Arc<dyn Signer> {
+    Arc::new(FalconKeyStore::new(SecretKey::new()))
 }
 
 #[tokio::test]
 async fn test_get_pubkey_success() {
-    let service =
-        MockStateManagerService::default().with_get_pubkey(Ok("test_pubkey_123".to_string()));
+    let service = MockGuardianService::default().with_get_pubkey(Ok("test_pubkey_123".to_string()));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let mut client = PsmClient::connect(endpoint).await.unwrap();
+    let mut client = GuardianClient::connect(endpoint).await.unwrap();
 
     let result = client.get_pubkey(None).await;
 
@@ -39,10 +38,10 @@ async fn test_get_pubkey_success() {
 #[tokio::test]
 async fn test_get_pubkey_error() {
     let service =
-        MockStateManagerService::default().with_get_pubkey(Err(Status::internal("Server error")));
+        MockGuardianService::default().with_get_pubkey(Err(Status::internal("Server error")));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let mut client = PsmClient::connect(endpoint).await.unwrap();
+    let mut client = GuardianClient::connect(endpoint).await.unwrap();
 
     let result = client.get_pubkey(None).await;
 
@@ -55,7 +54,7 @@ async fn test_get_pubkey_error() {
 
 #[tokio::test]
 async fn test_configure_success() {
-    let service = MockStateManagerService::default().with_configure(Ok(ConfigureResponse {
+    let service = MockGuardianService::default().with_configure(Ok(ConfigureResponse {
         success: true,
         message: "Account configured".to_string(),
         ack_pubkey: "test_pubkey_123".to_string(),
@@ -63,8 +62,11 @@ async fn test_configure_success() {
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
     let initial_state = serde_json::json!({"balance": 1000});
@@ -87,7 +89,7 @@ async fn test_configure_success() {
 
 #[tokio::test]
 async fn test_configure_server_error() {
-    let service = MockStateManagerService::default().with_configure(Ok(ConfigureResponse {
+    let service = MockGuardianService::default().with_configure(Ok(ConfigureResponse {
         success: false,
         message: "Account already exists".to_string(),
         ack_pubkey: String::new(),
@@ -95,8 +97,11 @@ async fn test_configure_server_error() {
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
     let initial_state = serde_json::json!({"balance": 1000});
@@ -122,18 +127,20 @@ async fn test_configure_server_error() {
 #[tokio::test]
 async fn test_push_delta_proposal_success() {
     let mock_delta = create_mock_delta();
-    let service = MockStateManagerService::default().with_push_delta_proposal(Ok(
-        PushDeltaProposalResponse {
+    let service =
+        MockGuardianService::default().with_push_delta_proposal(Ok(PushDeltaProposalResponse {
             success: true,
             message: String::new(),
             commitment: "proposal_commitment_123".to_string(),
             delta: Some(mock_delta.clone()),
-        },
-    ));
+        }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
     let delta_payload = serde_json::json!({"tx_summary": {}, "signatures": []});
@@ -155,17 +162,19 @@ async fn test_get_delta_proposals_success() {
     let mut mock_delta2 = create_mock_delta();
     mock_delta2.nonce = 2;
 
-    let service = MockStateManagerService::default().with_get_delta_proposals(Ok(
-        GetDeltaProposalsResponse {
+    let service =
+        MockGuardianService::default().with_get_delta_proposals(Ok(GetDeltaProposalsResponse {
             success: true,
             message: String::new(),
             proposals: vec![mock_delta1, mock_delta2],
-        },
-    ));
+        }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -179,17 +188,19 @@ async fn test_get_delta_proposals_success() {
 
 #[tokio::test]
 async fn test_get_delta_proposals_empty() {
-    let service = MockStateManagerService::default().with_get_delta_proposals(Ok(
-        GetDeltaProposalsResponse {
+    let service =
+        MockGuardianService::default().with_get_delta_proposals(Ok(GetDeltaProposalsResponse {
             success: true,
             message: String::new(),
             proposals: vec![],
-        },
-    ));
+        }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -202,19 +213,50 @@ async fn test_get_delta_proposals_empty() {
 }
 
 #[tokio::test]
+async fn test_get_delta_proposal_success() {
+    let mock_delta = create_mock_delta();
+    let service =
+        MockGuardianService::default().with_get_delta_proposal(Ok(GetDeltaProposalResponse {
+            success: true,
+            message: String::new(),
+            proposal: Some(mock_delta),
+        }));
+
+    let endpoint = start_mock_server(service).await.unwrap();
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
+
+    let account_id = create_test_account_id();
+
+    let result = client
+        .get_delta_proposal(&account_id, "proposal_commitment_123")
+        .await;
+
+    assert!(result.is_ok());
+    let response = result.unwrap();
+    assert!(response.success);
+    assert!(response.proposal.is_some());
+}
+
+#[tokio::test]
 async fn test_sign_delta_proposal_success() {
     let mock_delta = create_mock_delta();
-    let service = MockStateManagerService::default().with_sign_delta_proposal(Ok(
-        SignDeltaProposalResponse {
+    let service =
+        MockGuardianService::default().with_sign_delta_proposal(Ok(SignDeltaProposalResponse {
             success: true,
             message: "Signature added".to_string(),
             delta: Some(mock_delta),
-        },
-    ));
+        }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
     let signature = JsonProposalSignature::Falcon {
@@ -235,7 +277,7 @@ async fn test_sign_delta_proposal_success() {
 #[tokio::test]
 async fn test_push_delta_success() {
     let mock_delta = create_mock_delta();
-    let service = MockStateManagerService::default().with_push_delta(Ok(PushDeltaResponse {
+    let service = MockGuardianService::default().with_push_delta(Ok(PushDeltaResponse {
         success: true,
         message: "Delta pushed".to_string(),
         delta: Some(mock_delta),
@@ -243,8 +285,11 @@ async fn test_push_delta_success() {
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
     let delta_payload = serde_json::json!({"updates": []});
@@ -263,15 +308,18 @@ async fn test_push_delta_success() {
 #[tokio::test]
 async fn test_get_delta_success() {
     let mock_delta = create_mock_delta();
-    let service = MockStateManagerService::default().with_get_delta(Ok(GetDeltaResponse {
+    let service = MockGuardianService::default().with_get_delta(Ok(GetDeltaResponse {
         success: true,
         message: String::new(),
         delta: Some(mock_delta),
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -286,15 +334,18 @@ async fn test_get_delta_success() {
 
 #[tokio::test]
 async fn test_get_delta_not_found() {
-    let service = MockStateManagerService::default().with_get_delta(Ok(GetDeltaResponse {
+    let service = MockGuardianService::default().with_get_delta(Ok(GetDeltaResponse {
         success: false,
         message: "Delta not found".to_string(),
         delta: None,
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -312,16 +363,18 @@ async fn test_get_delta_not_found() {
 #[tokio::test]
 async fn test_get_delta_since_success() {
     let mock_delta = create_mock_delta();
-    let service =
-        MockStateManagerService::default().with_get_delta_since(Ok(GetDeltaSinceResponse {
-            success: true,
-            message: String::new(),
-            merged_delta: Some(mock_delta),
-        }));
+    let service = MockGuardianService::default().with_get_delta_since(Ok(GetDeltaSinceResponse {
+        success: true,
+        message: String::new(),
+        merged_delta: Some(mock_delta),
+    }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -336,15 +389,18 @@ async fn test_get_delta_since_success() {
 #[tokio::test]
 async fn test_get_state_success() {
     let mock_state = create_mock_account_state();
-    let service = MockStateManagerService::default().with_get_state(Ok(GetStateResponse {
+    let service = MockGuardianService::default().with_get_state(Ok(GetStateResponse {
         success: true,
         message: String::new(),
         state: Some(mock_state),
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -359,15 +415,18 @@ async fn test_get_state_success() {
 
 #[tokio::test]
 async fn test_get_state_not_found() {
-    let service = MockStateManagerService::default().with_get_state(Ok(GetStateResponse {
+    let service = MockGuardianService::default().with_get_state(Ok(GetStateResponse {
         success: false,
         message: "State not found".to_string(),
         state: None,
     }));
 
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let mut client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let mut client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
     let account_id = create_test_account_id();
 
@@ -383,31 +442,34 @@ async fn test_get_state_not_found() {
 }
 
 #[tokio::test]
-async fn test_auth_pubkey_hex_without_auth() {
-    let service = MockStateManagerService::default();
+async fn test_signer_pubkey_hex_without_signer() {
+    let service = MockGuardianService::default();
     let endpoint = start_mock_server(service).await.unwrap();
-    let client = PsmClient::connect(endpoint).await.unwrap();
+    let client = GuardianClient::connect(endpoint).await.unwrap();
 
-    let result = client.auth_pubkey_hex();
+    let result = client.signer_pubkey_hex();
 
     assert!(result.is_err());
     match result.unwrap_err() {
         ClientError::InvalidResponse(msg) => {
-            assert!(msg.contains("no auth configured"));
+            assert!(msg.contains("no signer configured"));
         }
         e => panic!("Expected InvalidResponse, got: {:?}", e),
     }
 }
 
 #[tokio::test]
-async fn test_auth_pubkey_hex_with_auth() {
-    let service = MockStateManagerService::default();
+async fn test_signer_pubkey_hex_with_signer() {
+    let service = MockGuardianService::default();
     let endpoint = start_mock_server(service).await.unwrap();
-    let auth = create_test_auth();
-    let expected_pubkey = auth.public_key_hex();
-    let client = PsmClient::connect(endpoint).await.unwrap().with_auth(auth);
+    let signer = create_test_signer();
+    let expected_pubkey = signer.public_key_hex();
+    let client = GuardianClient::connect(endpoint)
+        .await
+        .unwrap()
+        .with_signer(signer);
 
-    let result = client.auth_pubkey_hex();
+    let result = client.signer_pubkey_hex();
 
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), expected_pubkey);

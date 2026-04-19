@@ -5,13 +5,12 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { copyToClipboard } from '@/lib/helpers';
 import { getEffectiveThreshold } from '@/lib/procedures';
-import type { TransactionProposal, ProposalType, ProcedureName } from '@openzeppelin/miden-multisig-client';
-import type { SignerInfo } from '@/types';
+import type { Proposal, ProposalType, ProcedureName } from '@openzeppelin/miden-multisig-client';
 import type { WalletSource } from '@/wallets/types';
 
 interface ProposalCardProps {
-  proposal: TransactionProposal;
-  signer: SignerInfo | null;
+  proposal: Proposal;
+  activeSignerCommitment: string | null;
   defaultThreshold: number;
   procedureThresholds?: Map<ProcedureName, number>;
   signingProposal: string | null;
@@ -31,8 +30,10 @@ function getProposalTypeLabel(type?: ProposalType): string {
       return 'Remove Signer';
     case 'change_threshold':
       return 'Change Threshold';
-    case 'switch_psm':
-      return 'Switch PSM';
+    case 'update_procedure_threshold':
+      return 'Update Procedure Threshold';
+    case 'switch_guardian':
+      return 'Switch GUARDIAN';
     case 'consume_notes':
       return 'Consume Notes';
     case 'p2id':
@@ -50,7 +51,9 @@ function getProposalTypeVariant(type?: ProposalType): 'default' | 'secondary' | 
       return 'destructive';
     case 'change_threshold':
       return 'secondary';
-    case 'switch_psm':
+    case 'update_procedure_threshold':
+      return 'secondary';
+    case 'switch_guardian':
       return 'secondary';
     case 'consume_notes':
       return 'default';
@@ -63,7 +66,7 @@ function getProposalTypeVariant(type?: ProposalType): 'default' | 'secondary' | 
 
 export function ProposalCard({
   proposal,
-  signer,
+  activeSignerCommitment,
   defaultThreshold,
   procedureThresholds,
   signingProposal,
@@ -81,35 +84,31 @@ export function ProposalCard({
 
   const meta = proposal.metadata as { proposalType?: ProposalType; description?: string };
   const proposalType = meta.proposalType;
-  const activeCommitment = signer
-    ? signer.activeScheme === 'ecdsa'
-      ? signer.ecdsa.commitment
-      : signer.falcon.commitment
-    : null;
 
   // Calculate effective threshold for this proposal type
   const effectiveThreshold = proposalType
     ? getEffectiveThreshold(proposalType, defaultThreshold, procedureThresholds)
     : defaultThreshold;
 
-  const userSigned = activeCommitment
+  const userSigned = activeSignerCommitment
     ? proposal.signatures.some(
-        (sig) => sig.signerId.toLowerCase() === activeCommitment.toLowerCase()
+        (sig: Proposal['signatures'][number]) =>
+          sig.signerId.toLowerCase() === activeSignerCommitment.toLowerCase()
       )
     : false;
 
-  const canSign = proposal.status.type === 'pending' && !userSigned;
+  const canSign = proposal.status === 'pending' && !userSigned;
   const canExecute =
-    proposal.status.type === 'ready' ||
-    (proposal.status.type === 'pending' && proposal.signatures.length >= effectiveThreshold);
+    proposal.status === 'ready' ||
+    (proposal.status === 'pending' && proposal.signatures.length >= effectiveThreshold);
   const isSigningThis = signingProposal === proposal.id;
   const isExecutingThis = executingProposal === proposal.id;
   const isExternalWallet = walletSource !== 'local';
 
   const statusVariant =
-    proposal.status.type === 'ready'
+    proposal.status === 'ready'
       ? 'default'
-      : proposal.status.type === 'finalized'
+      : proposal.status === 'finalized'
         ? 'secondary'
         : 'outline';
 
@@ -132,7 +131,7 @@ export function ProposalCard({
             </code>
           </div>
           <Badge variant={statusVariant} className="uppercase">
-            {proposal.status.type}
+            {proposal.status}
           </Badge>
         </div>
 
@@ -155,9 +154,10 @@ export function ProposalCard({
           <div className="text-sm">
             <span className="text-muted-foreground">Signers:</span>
             <div className="flex flex-wrap gap-1 mt-1">
-              {proposal.signatures.map((sig) => {
+              {proposal.signatures.map((sig: Proposal['signatures'][number]) => {
                 const isYou =
-                  activeCommitment && sig.signerId.toLowerCase() === activeCommitment.toLowerCase();
+                  activeSignerCommitment &&
+                  sig.signerId.toLowerCase() === activeSignerCommitment.toLowerCase();
                 return (
                   <Badge
                     key={sig.signerId}
@@ -215,7 +215,7 @@ export function ProposalCard({
           >
             Export
           </Button>
-          {!canSign && !canExecute && proposal.status.type === 'finalized' && (
+          {!canSign && !canExecute && proposal.status === 'finalized' && (
             <span className="text-sm text-muted-foreground italic">Finalized</span>
           )}
         </div>
