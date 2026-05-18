@@ -86,8 +86,10 @@ jobs:
           docker push ${IMAGE%:*}:latest
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
+      # --- Slack notifications ---
       - name: Notify Success
         if: success()
+        continue-on-error: true
         uses: slackapi/slack-github-action@v1.26.0
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -101,6 +103,7 @@ jobs:
 
       - name: Notify Failure
         if: failure()
+        continue-on-error: true
         uses: slackapi/slack-github-action@v1.26.0
         with:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -111,6 +114,45 @@ jobs:
             By: ${{ github.actor }} | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      # --- Discord notifications ---
+      - name: Notify Discord (Success)
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no Discord webhook configured"; exit 0; fi
+          payload=$(jq -n \
+            --arg envname "${{ inputs.environment }}" \
+            --arg sha "${{ steps.sha.outputs.short_sha }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg url "${{ github.event.head_commit.url }}" \
+            '{content: (":white_check_mark: **[" + $envname + "] Build Successful**\n"
+              + "Service: `psm` | Image: `" + $sha + "`\n"
+              + "Repo: " + $repo + " | Branch: " + $branch + "\n"
+              + "By: " + $actor + " | " + $url)}')
+          curl -sf -H "Content-Type: application/json" -X POST -d "$payload" "$DISCORD_WEBHOOK_URL"
+
+      - name: Notify Discord (Failure)
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no Discord webhook configured"; exit 0; fi
+          logs_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          payload=$(jq -n \
+            --arg envname "${{ inputs.environment }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg logs "$logs_url" \
+            '{content: (":x: **[" + $envname + "] Build Failed**\n"
+              + "Service: `psm` | Branch: " + $branch + "\n"
+              + "Repo: " + $repo + "\n"
+              + "By: " + $actor + " | " + $logs)}')
+          curl -sf -H "Content-Type: application/json" -X POST -d "$payload" "$DISCORD_WEBHOOK_URL"
 
   deploy:
     name: Deploy
