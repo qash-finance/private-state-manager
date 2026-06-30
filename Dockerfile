@@ -26,6 +26,9 @@ COPY examples ./examples
 # Build for release (only server)
 FROM base-builder as server-builder
 
+# build.rs reads this to stamp the git commit; the build context has no .git to fall back on.
+ARG GUARDIAN_GIT_SHA
+
 RUN if [ -n "$GUARDIAN_SERVER_FEATURES" ]; then \
       cargo build --release --package guardian-server --bin server --features "$GUARDIAN_SERVER_FEATURES"; \
     else \
@@ -51,7 +54,7 @@ COPY --from=benchmark-builder /app/crates/contracts/masm /app/crates/contracts/m
 ENTRYPOINT ["/app/guardian-prod-benchmarks"]
 
 # Runtime stage
-FROM debian:bookworm-slim@sha256:7e490910eea2861b9664577a96b54ce68ea3e02ce7f51d89cb0103a6f9c386e0
+FROM debian:bookworm-slim@sha256:7e490910eea2861b9664577a96b54ce68ea3e02ce7f51d89cb0103a6f9c386e0 as server-runner
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

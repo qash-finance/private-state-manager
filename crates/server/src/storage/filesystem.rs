@@ -1,8 +1,15 @@
 use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::state_object::StateObject;
 use crate::storage::StorageBackend;
+use crate::storage::encryption::marker::{EncryptionMarker, MarkerStore};
+use crate::storage::{
+    AccountDeltaCursor, AccountProposalCursor, DeltaStatusCounts, DeltaStatusKind,
+    GlobalDeltaCursor, GlobalDeltaRow, GlobalProposalCursor, ProposalRecord, StorageType,
+};
 use crate::utils::normalize_commitment_hex;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -152,10 +159,241 @@ impl FilesystemService {
 
         Ok(proposals)
     }
+
+    // ----------------------------------------------------------------------
+    // Cross-account aggregate walk helpers — feature
+    // `005-operator-dashboard-metrics`, FR-029.
+    //
+    // The filesystem backend has no global indexes, so cross-account
+    // aggregates (info per-status counts, latest activity timestamp,
+    // global feed walks) require fanning out across every account
+    // directory. Above a configured inventory threshold we refuse to
+    // perform the scan and return [`AggregateUnavailableReason::
+    // FilesystemThresholdExceeded`] so callers can surface a degraded
+    // marker rather than block the dashboard.
+    //
+    // Postgres-backed deployments do not use these helpers; they query
+    // their indexes directly.
+    // ----------------------------------------------------------------------
+
+    /// Walk the per-account proposals directory and return every
+    /// `(commitment, proposal)` pair that is currently in the
+    /// `Pending` state. Filenames carry the commitment value
+    /// (`<commitment>.json`), which the on-disk shape doesn't preserve
+    /// inside the `DeltaObject` body — the new paginated methods need
+    /// it for the wire `commitment` field and for the
+    /// (nonce, commitment) cursor tiebreaker.
+    async fn pending_proposals_with_commitment(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String, DeltaObject)>, String> {
+        Ok(self
+            .load_proposal_records(account_id)
+            .await?
+            .into_iter()
+            .filter(|record| record.proposal.status.is_pending())
+            .map(|record| (record.commitment, record.proposal))
+            .collect())
+    }
+
+    /// Walk the per-account proposals directory and return one
+    /// [`ProposalRecord`] per `<commitment>.json` file, propagating any
+    /// read/parse/decrypt failure so callers never see a partial list.
+    async fn load_proposal_records(&self, account_id: &str) -> Result<Vec<ProposalRecord>, String> {
+        let mut proposals = Vec::new();
+        for filename in self.list_proposal_filenames(account_id).await? {
+            let Some(commitment) = filename.strip_suffix(".json") else {
+                continue;
+            };
+            let proposal = self.pull_delta_proposal(account_id, commitment).await?;
+            proposals.push(ProposalRecord {
+                account_id: account_id.to_string(),
+                commitment: commitment.to_string(),
+                proposal,
+            });
+        }
+        Ok(proposals)
+    }
+
+    /// Count the number of account directories under `app_path`. An
+    /// "account directory" is any immediate subdirectory of the app
+    /// root. This is used by [`Self::enforce_aggregate_threshold`].
+    pub async fn count_accounts(&self) -> Result<usize, String> {
+        if !self.app_path.exists() {
+            return Ok(0);
+        }
+        let mut entries = fs::read_dir(&self.app_path)
+            .await
+            .map_err(|e| format!("Failed to read app directory: {e}"))?;
+        let mut count = 0usize;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read directory entry: {e}"))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| format!("Failed to read file type: {e}"))?;
+            if file_type.is_dir() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Returns `Ok(count)` if the on-disk inventory is at or below
+    /// `threshold`; otherwise [`Err(AggregateUnavailableReason::
+    /// FilesystemThresholdExceeded)`]. Service-layer callers map the
+    /// error to [`crate::error::GuardianError::DataUnavailable`] when
+    /// surfacing a degraded marker on the info response or returning
+    /// `503` on the global feed endpoints.
+    pub async fn enforce_aggregate_threshold(
+        &self,
+        threshold: usize,
+    ) -> Result<usize, AggregateUnavailableReason> {
+        let count = self
+            .count_accounts()
+            .await
+            .map_err(AggregateUnavailableReason::CountFailed)?;
+        if count > threshold {
+            Err(AggregateUnavailableReason::FilesystemThresholdExceeded { count, threshold })
+        } else {
+            Ok(count)
+        }
+    }
+}
+
+/// Reason a cross-account aggregate could not be computed on the
+/// filesystem backend. See FR-029 of `005-operator-dashboard-metrics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateUnavailableReason {
+    /// On-disk inventory is above the configured threshold; the
+    /// caller should mark the affected aggregate as degraded rather
+    /// than perform a full scan.
+    FilesystemThresholdExceeded { count: usize, threshold: usize },
+    /// Counting accounts on disk failed for an underlying I/O reason.
+    /// Callers should surface this as `503 DataUnavailable`.
+    CountFailed(String),
+}
+
+impl AggregateUnavailableReason {
+    /// Stable, machine-readable reason name for inclusion in the
+    /// `degraded_aggregates` list on the info response or in the body
+    /// of a `503 DataUnavailable` response.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AggregateUnavailableReason::FilesystemThresholdExceeded { .. } => {
+                "filesystem_threshold_exceeded"
+            }
+            AggregateUnavailableReason::CountFailed(_) => "filesystem_count_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for AggregateUnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateUnavailableReason::FilesystemThresholdExceeded { count, threshold } => {
+                write!(
+                    f,
+                    "filesystem cross-account aggregate suppressed: {count} accounts exceeds threshold {threshold}"
+                )
+            }
+            AggregateUnavailableReason::CountFailed(msg) => {
+                write!(f, "filesystem account count failed: {msg}")
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(any(feature = "integration", feature = "e2e"))))]
+mod aggregate_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    async fn fixture_with_n_accounts(n: usize) -> (TempDir, FilesystemService) {
+        let dir = TempDir::new().expect("tempdir");
+        let svc = FilesystemService::new(dir.path().to_path_buf())
+            .await
+            .expect("filesystem service");
+        for i in 0..n {
+            let acc_dir = dir.path().join(format!("account_{i}"));
+            fs::create_dir_all(&acc_dir).await.expect("create acc dir");
+        }
+        (dir, svc)
+    }
+
+    #[tokio::test]
+    async fn count_accounts_empty_dir_returns_zero() {
+        let (_dir, svc) = fixture_with_n_accounts(0).await;
+        assert_eq!(svc.count_accounts().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_accounts_returns_subdir_count() {
+        let (_dir, svc) = fixture_with_n_accounts(7).await;
+        assert_eq!(svc.count_accounts().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn count_accounts_ignores_files_at_app_root() {
+        let (dir, svc) = fixture_with_n_accounts(3).await;
+        // A stray file at the app root should not be counted as an
+        // account.
+        tokio::fs::write(dir.path().join("README.md"), "hello")
+            .await
+            .expect("write stray file");
+        assert_eq!(svc.count_accounts().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn enforce_aggregate_threshold_below_returns_ok_with_count() {
+        let (_dir, svc) = fixture_with_n_accounts(5).await;
+        let count = svc.enforce_aggregate_threshold(10).await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn enforce_aggregate_threshold_at_returns_ok() {
+        // At threshold is OK (we use strictly greater for the trigger).
+        let (_dir, svc) = fixture_with_n_accounts(10).await;
+        let count = svc.enforce_aggregate_threshold(10).await.unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[tokio::test]
+    async fn enforce_aggregate_threshold_above_returns_degraded() {
+        let (_dir, svc) = fixture_with_n_accounts(11).await;
+        let err = svc.enforce_aggregate_threshold(10).await.unwrap_err();
+        match err {
+            AggregateUnavailableReason::FilesystemThresholdExceeded { count, threshold } => {
+                assert_eq!(count, 11);
+                assert_eq!(threshold, 10);
+            }
+            other => panic!("expected ThresholdExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_unavailable_reason_codes_are_stable() {
+        let r = AggregateUnavailableReason::FilesystemThresholdExceeded {
+            count: 5,
+            threshold: 1,
+        };
+        assert_eq!(r.code(), "filesystem_threshold_exceeded");
+
+        let r = AggregateUnavailableReason::CountFailed("io".into());
+        assert_eq!(r.code(), "filesystem_count_failed");
+    }
 }
 
 #[async_trait]
 impl StorageBackend for FilesystemService {
+    fn kind(&self) -> StorageType {
+        StorageType::Filesystem
+    }
+
     async fn submit_state(&self, state: &StateObject) -> Result<(), String> {
         let content = serde_json::to_string_pretty(state)
             .map_err(|e| format!("Failed to serialize state: {e}"))?;
@@ -314,43 +552,20 @@ impl StorageBackend for FilesystemService {
         Ok(proposal)
     }
 
-    async fn pull_all_delta_proposals(&self, account_id: &str) -> Result<Vec<DeltaObject>, String> {
-        let proposal_filenames = self.list_proposal_filenames(account_id).await?;
-
-        let mut proposals = Vec::new();
-        for filename in proposal_filenames {
-            if let Some(commitment) = filename.strip_suffix(".json") {
-                match self.pull_delta_proposal(account_id, commitment).await {
-                    Ok(proposal) => proposals.push(proposal),
-                    Err(e) => {
-                        // Log error but continue loading other proposals
-                        tracing::warn!("Failed to load proposal {}: {}", filename, e);
-                    }
-                }
-            }
-        }
-
-        // Proposals will be sorted and filtered by the service layer
-        Ok(proposals)
+    async fn pull_all_delta_proposals(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        self.load_proposal_records(account_id).await
     }
 
-    async fn pull_pending_proposals(&self, account_id: &str) -> Result<Vec<DeltaObject>, String> {
-        let proposal_filenames = self.list_proposal_filenames(account_id).await?;
-        let mut proposals = Vec::new();
-
-        for filename in proposal_filenames {
-            if let Some(commitment) = filename.strip_suffix(".json") {
-                match self.pull_delta_proposal(account_id, commitment).await {
-                    Ok(proposal) if proposal.status.is_pending() => proposals.push(proposal),
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to load proposal {}: {}", filename, e);
-                    }
-                }
-            }
-        }
-
-        proposals.sort_by_key(|proposal| proposal.nonce);
+    async fn pull_pending_proposals(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        let mut proposals = self.load_proposal_records(account_id).await?;
+        proposals.retain(|record| record.proposal.status.is_pending());
+        proposals.sort_by_key(|record| record.proposal.nonce);
         Ok(proposals)
     }
 
@@ -419,6 +634,346 @@ impl StorageBackend for FilesystemService {
 
         self.write(&path, &updated_content).await
     }
+
+    // ----------------------------------------------------------------------
+    // Dashboard read APIs (feature `005-operator-dashboard-metrics`).
+    //
+    // Filesystem has no global indexes, so cross-account aggregates
+    // either fan out across every account directory or refuse with
+    // [`AggregateUnavailableReason::FilesystemThresholdExceeded`] when
+    // above the configured inventory size. Per-account methods walk
+    // one account directory and sort/slice in memory; bounded by the
+    // per-account history size, which is acceptable at MVP scale.
+    // ----------------------------------------------------------------------
+
+    async fn list_account_deltas_paged(
+        &self,
+        account_id: &str,
+        limit: u32,
+        cursor: Option<AccountDeltaCursor>,
+    ) -> Result<Vec<DeltaObject>, String> {
+        let cutoff = cursor.map(|c| c.last_nonce as u64);
+        let mut deltas: Vec<DeltaObject> = self
+            .pull_deltas_after(account_id, 0)
+            .await?
+            .into_iter()
+            .filter(|d| !matches!(d.status, DeltaStatus::Pending { .. }))
+            .filter(|d| cutoff.is_none_or(|cutoff_nonce| d.nonce < cutoff_nonce))
+            .collect();
+        deltas.sort_by(|a, b| b.nonce.cmp(&a.nonce));
+        deltas.truncate(limit as usize);
+        Ok(deltas)
+    }
+
+    async fn list_account_proposals_paged(
+        &self,
+        account_id: &str,
+        limit: u32,
+        cursor: Option<AccountProposalCursor>,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        let mut rows: Vec<ProposalRecord> = self
+            .pending_proposals_with_commitment(account_id)
+            .await?
+            .into_iter()
+            .filter(|(commitment, proposal)| match cursor.as_ref() {
+                None => true,
+                Some(c) => {
+                    let cn = c.last_nonce as u64;
+                    proposal.nonce < cn
+                        || (proposal.nonce == cn
+                            && commitment.as_str() < c.last_commitment.as_str())
+                }
+            })
+            .map(|(commitment, proposal)| ProposalRecord {
+                account_id: account_id.to_string(),
+                commitment,
+                proposal,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.proposal
+                .nonce
+                .cmp(&a.proposal.nonce)
+                .then_with(|| b.commitment.cmp(&a.commitment))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_global_deltas_paged(
+        &self,
+        limit: u32,
+        cursor: Option<GlobalDeltaCursor>,
+        status_filter: Option<Vec<DeltaStatusKind>>,
+    ) -> Result<Vec<GlobalDeltaRow>, String> {
+        let account_ids = self.fanout_account_ids().await?;
+        // Hold the parsed cursor `DateTime<Utc>` so cutoff comparison
+        // is instant-based, not string-based. Comparing raw RFC3339
+        // strings is fragile: `2026-05-11T12:17:34Z` and
+        // `2026-05-11T12:17:34.000+00:00` represent the same instant
+        // but compare differently lexicographically, which can skip
+        // or duplicate page boundaries.
+        let cutoff = cursor.as_ref().map(|c| {
+            (
+                c.last_status_timestamp,
+                c.last_account_id.clone(),
+                c.last_nonce as u64,
+            )
+        });
+        let mut rows: Vec<GlobalDeltaRow> = Vec::new();
+        for account_id in &account_ids {
+            let deltas = self.pull_deltas_after(account_id, 0).await?;
+            for delta in deltas {
+                let kind = match &delta.status {
+                    DeltaStatus::Pending { .. } => continue,
+                    DeltaStatus::Candidate { .. } => DeltaStatusKind::Candidate,
+                    DeltaStatus::Canonical { .. } => DeltaStatusKind::Canonical,
+                    DeltaStatus::Discarded { .. } => DeltaStatusKind::Discarded,
+                };
+                if let Some(allowed) = &status_filter
+                    && !allowed.contains(&kind)
+                {
+                    continue;
+                }
+                if let Some((cutoff_ts, cutoff_account, cutoff_nonce)) = &cutoff {
+                    // Unparseable timestamps sort as `MIN_UTC` so
+                    // they land at the back of the DESC feed and
+                    // never accidentally jump the cutoff.
+                    let parsed = parse_status_timestamp(delta.status.timestamp())
+                        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                    let keep = match parsed.cmp(cutoff_ts) {
+                        Ordering::Less => true,
+                        Ordering::Greater => false,
+                        Ordering::Equal => match account_id.cmp(cutoff_account) {
+                            Ordering::Less => false,
+                            Ordering::Greater => true,
+                            Ordering::Equal => delta.nonce > *cutoff_nonce,
+                        },
+                    };
+                    if !keep {
+                        continue;
+                    }
+                }
+                rows.push(GlobalDeltaRow {
+                    account_id: account_id.clone(),
+                    delta,
+                });
+            }
+        }
+        // Newest-first by parsed `DateTime<Utc>`, then account_id
+        // ASC, then nonce ASC — mirrors the Postgres SQL ORDER BY.
+        // Parsing on the sort path means two rows representing the
+        // same instant land in the deterministic tie-break order
+        // regardless of how their RFC3339 strings happen to be
+        // formatted.
+        rows.sort_by(|a, b| {
+            let ts_a = parse_status_timestamp(a.delta.status.timestamp())
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            let ts_b = parse_status_timestamp(b.delta.status.timestamp())
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            ts_b.cmp(&ts_a)
+                .then_with(|| a.account_id.cmp(&b.account_id))
+                .then_with(|| a.delta.nonce.cmp(&b.delta.nonce))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_global_proposals_paged(
+        &self,
+        limit: u32,
+        cursor: Option<GlobalProposalCursor>,
+    ) -> Result<Vec<ProposalRecord>, String> {
+        let account_ids = self.fanout_account_ids().await?;
+        // See `list_global_deltas_paged` above for the rationale on
+        // holding the cutoff as a parsed `DateTime<Utc>`.
+        let cutoff = cursor.as_ref().map(|c| {
+            (
+                c.last_originating_timestamp,
+                c.last_account_id.clone(),
+                c.last_nonce as u64,
+                c.last_commitment.clone(),
+            )
+        });
+        let mut rows: Vec<ProposalRecord> = Vec::new();
+        for account_id in &account_ids {
+            for (commitment, proposal) in self.pending_proposals_with_commitment(account_id).await?
+            {
+                if let Some((cutoff_ts, cutoff_account, cutoff_nonce, cutoff_commitment)) = &cutoff
+                {
+                    let parsed = parse_status_timestamp(proposal.status.timestamp())
+                        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                    let keep = match parsed.cmp(cutoff_ts) {
+                        Ordering::Less => true,
+                        Ordering::Greater => false,
+                        Ordering::Equal => match account_id.as_str().cmp(cutoff_account.as_str()) {
+                            Ordering::Less => false,
+                            Ordering::Greater => true,
+                            Ordering::Equal => match proposal.nonce.cmp(cutoff_nonce) {
+                                Ordering::Less => false,
+                                Ordering::Greater => true,
+                                Ordering::Equal => commitment.as_str() > cutoff_commitment.as_str(),
+                            },
+                        },
+                    };
+                    if !keep {
+                        continue;
+                    }
+                }
+                rows.push(ProposalRecord {
+                    account_id: account_id.clone(),
+                    commitment,
+                    proposal,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            let ts_a = parse_status_timestamp(a.proposal.status.timestamp())
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            let ts_b = parse_status_timestamp(b.proposal.status.timestamp())
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            ts_b.cmp(&ts_a)
+                .then_with(|| a.account_id.cmp(&b.account_id))
+                .then_with(|| a.proposal.nonce.cmp(&b.proposal.nonce))
+                .then_with(|| a.commitment.cmp(&b.commitment))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn count_deltas_by_status(&self) -> Result<DeltaStatusCounts, String> {
+        let account_ids = self.fanout_account_ids().await?;
+        let mut counts = DeltaStatusCounts::default();
+        for account_id in &account_ids {
+            let deltas = self.pull_deltas_after(account_id, 0).await?;
+            for delta in deltas {
+                match delta.status {
+                    DeltaStatus::Candidate { .. } => counts.candidate += 1,
+                    DeltaStatus::Canonical { .. } => counts.canonical += 1,
+                    DeltaStatus::Discarded { .. } => counts.discarded += 1,
+                    DeltaStatus::Pending { .. } => {}
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn count_in_flight_proposals(&self) -> Result<u64, String> {
+        let account_ids = self.fanout_account_ids().await?;
+        let mut total: u64 = 0;
+        for account_id in &account_ids {
+            let proposals = self.pull_pending_proposals(account_id).await?;
+            total += proposals.len() as u64;
+        }
+        Ok(total)
+    }
+
+    async fn latest_activity_timestamp(&self) -> Result<Option<DateTime<Utc>>, String> {
+        let account_ids = self.fanout_account_ids().await?;
+        let mut latest: Option<DateTime<Utc>> = None;
+        for account_id in &account_ids {
+            let deltas = self.pull_deltas_after(account_id, 0).await?;
+            for delta in deltas {
+                if let Some(ts) = parse_status_timestamp(delta.status.timestamp()) {
+                    latest = match latest {
+                        None => Some(ts),
+                        Some(existing) if ts > existing => Some(ts),
+                        Some(existing) => Some(existing),
+                    };
+                }
+            }
+            let proposals = self.pull_pending_proposals(account_id).await?;
+            for record in proposals {
+                if let Some(ts) = parse_status_timestamp(record.proposal.status.timestamp()) {
+                    latest = match latest {
+                        None => Some(ts),
+                        Some(existing) if ts > existing => Some(ts),
+                        Some(existing) => Some(existing),
+                    };
+                }
+            }
+        }
+        Ok(latest)
+    }
+}
+
+/// Enumerate account directories under `app_path` for the cross-account
+/// fan-out methods. Used by the dashboard global feed and aggregate
+/// implementations.
+impl FilesystemService {
+    async fn fanout_account_ids(&self) -> Result<Vec<String>, String> {
+        if !self.app_path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = fs::read_dir(&self.app_path)
+            .await
+            .map_err(|e| format!("Failed to read app directory: {e}"))?;
+        let mut ids = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read directory entry: {e}"))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| format!("Failed to read file type: {e}"))?;
+            if file_type.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                ids.push(name.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+}
+
+const ENCRYPTION_MARKER_FILE: &str = ".encryption-marker.json";
+
+#[async_trait]
+impl MarkerStore for FilesystemService {
+    async fn read_encryption_marker(&self) -> Result<Option<EncryptionMarker>, String> {
+        let path = self.app_path.join(ENCRYPTION_MARKER_FILE);
+        match fs::read_to_string(&path).await {
+            Ok(content) => serde_json::from_str(&content)
+                .map(Some)
+                .map_err(|e| format!("Failed to parse encryption marker: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Failed to read encryption marker: {e}")),
+        }
+    }
+
+    async fn write_encryption_marker(&self, marker: &EncryptionMarker) -> Result<(), String> {
+        let content = serde_json::to_string_pretty(marker)
+            .map_err(|e| format!("Failed to serialize encryption marker: {e}"))?;
+        self.write(&self.app_path.join(ENCRYPTION_MARKER_FILE), &content)
+            .await
+    }
+
+    async fn has_payload_records(&self) -> Result<bool, String> {
+        for account_id in self.fanout_account_ids().await? {
+            if self.get_state_path(&account_id).exists() {
+                return Ok(true);
+            }
+            if !self.list_delta_filenames(&account_id).await?.is_empty() {
+                return Ok(true);
+            }
+            if !self.list_proposal_filenames(&account_id).await?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn parse_status_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    if raw.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -441,6 +996,7 @@ mod tests {
             status: DeltaStatus::Canonical {
                 timestamp: "2024-11-14T12:00:00Z".to_string(),
             },
+            metadata: None,
         }
     }
 
@@ -462,7 +1018,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let state = create_test_state(account_id);
 
         // Submit state
@@ -492,7 +1048,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let delta = create_test_delta(account_id, 1);
 
         // Submit delta
@@ -522,7 +1078,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
 
         // Submit multiple deltas
         for nonce in 1..=5 {
@@ -556,7 +1112,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
 
         // Pull deltas when none exist
         let deltas = storage
@@ -577,7 +1133,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let commitment = "0xabc123";
         let proposal = create_test_delta(account_id, 1);
 
@@ -607,7 +1163,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
 
         // Submit multiple proposals
         let commitments = ["0xaaaa", "0xbbbb", "0xcccc"];
@@ -638,7 +1194,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let commitment = "0xabc123";
         let mut proposal = create_test_delta(account_id, 1);
 
@@ -674,7 +1230,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let commitment = "0xabc123";
         let proposal = create_test_delta(account_id, 1);
 
@@ -711,7 +1267,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let commitment = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         // Delete nonexistent proposal should succeed (no-op)
@@ -729,7 +1285,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let commitment_with_prefix = "0xabc123";
         let commitment_without_prefix = "abc123";
         let proposal = create_test_delta(account_id, 1);
@@ -762,7 +1318,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let result = storage
             .pull_delta_proposal(account_id, "../../other_account/proposals/abc")
             .await;
@@ -780,7 +1336,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let delta = create_test_delta(account_id, 1);
 
         // Submit delta
@@ -816,7 +1372,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
 
         // Delete nonexistent delta should succeed (no-op)
         let result = storage.delete_delta(account_id, 999).await;
@@ -833,7 +1389,7 @@ mod tests {
             .await
             .expect("Failed to create storage");
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170";
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b";
         let mut delta = create_test_delta(account_id, 1);
         delta.status = DeltaStatus::candidate("2024-01-01T00:00:00Z".to_string());
 

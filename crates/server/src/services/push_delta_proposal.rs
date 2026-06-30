@@ -2,6 +2,7 @@ use crate::builder::state::AppState;
 use crate::delta_object::{CosignerSignature, DeltaObject, DeltaStatus};
 use crate::error::{GuardianError, Result};
 use crate::metadata::auth::Credentials;
+use crate::services::account_status::ensure_account_active_metadata;
 use crate::services::{normalize_payload, resolve_account};
 use guardian_shared::DeltaSignature;
 use tracing::info;
@@ -34,6 +35,19 @@ pub async fn push_delta_proposal(
     state: &AppState,
     params: PushDeltaProposalParams,
 ) -> Result<PushDeltaProposalResult> {
+    if crate::metadata::network::is_evm_account_id(&params.account_id)
+        || params
+            .delta_payload
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "evm")
+    {
+        return Err(GuardianError::UnsupportedForNetwork {
+            network: "evm".to_string(),
+            operation: "delta_proposal".to_string(),
+        });
+    }
+
     let PushDeltaProposalParams {
         account_id,
         nonce,
@@ -44,6 +58,13 @@ pub async fn push_delta_proposal(
     let delta_payload = normalize_payload(delta_payload)?;
 
     let resolved = resolve_account(state, &account_id, &credentials).await?;
+    ensure_account_active_metadata(&resolved.metadata)?;
+    if resolved.metadata.network_config.is_evm() {
+        return Err(GuardianError::UnsupportedForNetwork {
+            network: "evm".to_string(),
+            operation: "delta_proposal".to_string(),
+        });
+    }
 
     // Fetch current state to validate delta
     let current_state = resolved
@@ -175,6 +196,7 @@ pub async fn push_delta_proposal(
             proposer_id,
             cosigner_sigs,
         },
+        metadata: None,
     };
 
     // Store the delta proposal in the proposals directory using the commitment as ID
@@ -194,6 +216,12 @@ pub async fn push_delta_proposal(
         signer_count = stored_signer_count,
         "push_delta_proposal stored"
     );
+    metrics::counter!(
+        crate::metrics::names::PROPOSALS_TOTAL,
+        crate::metrics::names::LABEL_EVENT =>
+            crate::metrics::labels::ProposalEvent::Created.as_str()
+    )
+    .increment(1);
 
     Ok(PushDeltaProposalResult {
         delta: delta_proposal.clone(),
@@ -211,6 +239,7 @@ mod tests {
     use crate::testing::fixtures;
     use crate::testing::helpers::create_test_app_state_with_mocks;
     use crate::testing::mocks::{MockMetadataStore, MockNetworkClient, MockStorageBackend};
+    use chrono::TimeZone;
     use guardian_shared::ProposalSignature;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -238,10 +267,13 @@ mod tests {
         AccountMetadata {
             account_id,
             auth,
+            network_config: crate::metadata::NetworkConfig::miden_default(),
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
             has_pending_candidate: false,
             last_auth_timestamp: None,
+            paused_at: None,
+            paused_reason: None,
         }
     }
 
@@ -281,6 +313,7 @@ mod tests {
                 proposer_id: "0xproposer".to_string(),
                 cosigner_sigs: vec![],
             },
+            metadata: None,
         }
     }
 
@@ -340,7 +373,10 @@ mod tests {
 
         assert!(result.is_ok(), "Expected success, got: {:?}", result);
         let result = result.unwrap();
-        assert_eq!(result.commitment, "mock_proposal_id");
+        assert_eq!(
+            result.commitment,
+            "0xabababababababababababababababababababababababababababababababab"
+        );
         assert_eq!(result.delta.account_id, account_id);
         assert_eq!(result.delta.nonce, 1);
 
@@ -358,7 +394,75 @@ mod tests {
 
         let submit_calls = storage.get_submit_delta_proposal_calls();
         assert_eq!(submit_calls.len(), 1);
-        assert_eq!(submit_calls[0].0, "mock_proposal_id");
+        assert_eq!(
+            submit_calls[0].0,
+            "0xabababababababababababababababababababababababababababababababab"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_delta_proposal_accepts_custom_proposal_type() {
+        // Issue #266: a proposal_type outside the first-party set (e.g. an
+        // agglayer bridge note) must be accepted at ingress — the old
+        // VALID_PROPOSAL_TYPES allowlist used to reject it here.
+        let (state, storage, network, metadata) = create_test_state();
+
+        let account_json: serde_json::Value = serde_json::from_str(fixtures::ACCOUNT_JSON).unwrap();
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let test_commitment = "0x780aa2edb983c1baab3c81edcfe400bc54b516d5cb51f2a7cec4690667329392";
+
+        let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
+            crate::testing::helpers::generate_falcon_signature(&account_id);
+
+        let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
+            account_id.clone(),
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
+        ))));
+
+        let storage = storage.with_pull_state(Ok(create_state_object(
+            account_id.clone(),
+            test_commitment.to_string(),
+            account_json.clone(),
+        )));
+
+        let network = network.with_verify_delta(Ok(()));
+        let _network = network.with_validate_credential(Ok(()));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "b2agg",
+                "description": "agglayer bridge note"
+            }
+        });
+
+        let params = PushDeltaProposalParams {
+            account_id: account_id.clone(),
+            nonce: 1,
+            delta_payload,
+            credentials: Credentials::signature(
+                test_pubkey.clone(),
+                test_signature.clone(),
+                test_timestamp,
+            ),
+        };
+
+        let result = push_delta_proposal(&state, params).await;
+
+        assert!(
+            result.is_ok(),
+            "custom proposal_type should be accepted, got: {:?}",
+            result
+        );
+        let result = result.unwrap();
+        assert_eq!(result.delta.proposal_type(), Some("b2agg"));
+        assert_eq!(storage.get_submit_delta_proposal_calls().len(), 1);
     }
 
     #[tokio::test]
@@ -441,7 +545,10 @@ mod tests {
 
         let submit_calls = storage.get_submit_delta_proposal_calls();
         assert_eq!(submit_calls.len(), 1);
-        assert_eq!(submit_calls[0].0, "mock_proposal_id");
+        assert_eq!(
+            submit_calls[0].0,
+            "0xabababababababababababababababababababababababababababababababab"
+        );
     }
 
     #[tokio::test]
@@ -530,7 +637,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
 
         let account_json: serde_json::Value = serde_json::from_str(fixtures::ACCOUNT_JSON).unwrap();
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
 
         let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
             crate::testing::helpers::generate_falcon_signature(&account_id);
@@ -719,6 +826,7 @@ mod tests {
                 timestamp: "2024-11-14T12:00:00Z".to_string(),
                 retry_count: 0,
             },
+            metadata: None,
         };
         let _storage = storage.with_pull_deltas_after(Ok(vec![candidate_delta]));
 
@@ -869,5 +977,118 @@ mod tests {
         let result = push_delta_proposal(&state, params).await;
 
         assert!(result.is_ok(), "Expected success, got: {:?}", result);
+    }
+
+    /// Pause-gate guard: a paused account must be rejected before
+    /// any proposal-side effects fire — but only AFTER authentication
+    /// succeeds, so unauthenticated probes cannot leak pause state.
+    /// Asserts AccountPaused and that `submit_delta_proposal` was
+    /// never called.
+    #[tokio::test]
+    async fn paused_account_rejected_before_proposal_submitted() {
+        let (state, storage, _network, metadata) = create_test_state();
+
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let (test_pubkey, test_commitment_hex, test_signature, test_timestamp) =
+            crate::testing::helpers::generate_falcon_signature(&account_id);
+
+        let mut paused = create_account_metadata(
+            account_id.clone(),
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec![test_commitment_hex.clone()],
+            },
+        );
+        paused.paused_at = Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 5, 19, 14, 30, 0)
+                .unwrap(),
+        );
+        paused.paused_reason = Some("compliance".to_string());
+        let _metadata = metadata.with_get(Ok(Some(paused)));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": [test_commitment_hex.clone()]
+            }
+        });
+
+        let params = PushDeltaProposalParams {
+            account_id: account_id.clone(),
+            nonce: 1,
+            delta_payload,
+            credentials: Credentials::signature(test_pubkey, test_signature, test_timestamp),
+        };
+
+        let err = push_delta_proposal(&state, params)
+            .await
+            .expect_err("paused account must be rejected");
+        assert!(
+            matches!(err, GuardianError::AccountPaused { ref paused_reason, .. }
+                if paused_reason.as_deref() == Some("compliance")),
+            "unexpected error: {err:?}"
+        );
+
+        assert!(
+            storage.get_submit_delta_proposal_calls().is_empty(),
+            "no proposal should be submitted when the account is paused"
+        );
+    }
+
+    /// Pause-gate ordering: unauthenticated callers MUST get an auth
+    /// error, NOT `AccountPaused`. Defends against reintroducing the
+    /// pre-auth chokepoint that leaked pause state to probes.
+    #[tokio::test]
+    async fn paused_account_returns_auth_error_for_unauthenticated_caller() {
+        let (state, _storage, _network, metadata) = create_test_state();
+
+        let delta_fixture: serde_json::Value =
+            serde_json::from_str(fixtures::DELTA_1_JSON).unwrap();
+        let account_id = delta_fixture["account_id"].as_str().unwrap().to_string();
+
+        let mut paused = create_account_metadata(
+            account_id.clone(),
+            Auth::MidenFalconRpo {
+                cosigner_commitments: vec!["0xc1".into()],
+            },
+        );
+        paused.paused_at = Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 5, 19, 14, 30, 0)
+                .unwrap(),
+        );
+        paused.paused_reason = Some("compliance".to_string());
+        let _metadata = metadata.with_get(Ok(Some(paused)));
+
+        let delta_payload = serde_json::json!({
+            "tx_summary": delta_fixture["delta_payload"].clone(),
+            "signatures": [],
+            "metadata": {
+                "proposal_type": "change_threshold",
+                "target_threshold": 1,
+                "signer_commitments": ["0xc1"]
+            }
+        });
+
+        let params = PushDeltaProposalParams {
+            account_id,
+            nonce: 1,
+            delta_payload,
+            credentials: Credentials::signature(String::new(), String::new(), 0),
+        };
+
+        let err = push_delta_proposal(&state, params)
+            .await
+            .expect_err("unauthenticated paused account must be rejected with auth error");
+        assert!(
+            matches!(err, GuardianError::AuthenticationFailed(_)),
+            "unauthenticated caller must not learn pause state; got: {err:?}"
+        );
     }
 }

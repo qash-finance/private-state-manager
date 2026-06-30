@@ -23,10 +23,15 @@ cd examples/smoke-web && npm run dev
 
 Default startup choices:
 
-- one local GUARDIAN server at `http://localhost:3000`
-- one `examples/smoke-web` dev server at `http://localhost:3002`
-- one real browser or fully isolated browser profile per cosigner
-- Miden devnet RPC: `https://rpc.devnet.miden.io`
+- one GUARDIAN at the chosen Deployment Target (see the table in `SKILL.md`):
+  - Local dev: `http://localhost:3000`
+  - Staging (devnet): `https://guardian-stg.openzeppelin.com`
+  - Production (testnet): `https://guardian.openzeppelin.com`
+- one `examples/smoke-web` dev server at `http://localhost:3002` (or the scratch deployed-SDK project when smoking the published npm package)
+- one real browser or fully isolated browser profile per cosigner (Chrome MCP's `tabs_create_mcp` tabs count as one profile, not three — see Browser Automation in `SKILL.md`)
+- Miden RPC matching the chosen target:
+  - Local dev or Staging: `https://rpc.devnet.miden.io`
+  - Production: `https://rpc.testnet.miden.io`
 - signer source: `local`
 - signature scheme: Falcon unless the task specifically targets ECDSA, Para, or Miden Wallet
 
@@ -357,3 +362,55 @@ Expect:
 - state fetch succeeds
 - local and on-chain commitments match
 - post-execute state verification reflects the updated account state
+
+## `recover-by-key-canary`
+
+Use when:
+
+- `recoverByKey`, `lookupAccountByKeyCommitment`, `lookup_grpc.rs`, or any related code path changed.
+- The recovery UX shape changed (signer scope, return shape, error semantics on per-match `getState`).
+
+### Notes before running
+
+**Signer regeneration (Outcome Y).** `examples/_shared/multisig-browser/initClient.ts` regenerates Falcon and ECDSA local signers on every page load (`AuthSecretKey.rpoFalconWithRNG(undefined)`). A device-loss simulation via `clearLocalState` + reload would lose the signer that authorizes the just-created account. The canary therefore asserts the SDK round-trip (key → lookup → state), not seed-derivation persistence. A future change that persists local signers across reset would unlock the broader simulation.
+
+**Browser-vs-Rust create flow difference.** In `examples/demo` (Rust), the `Create multisig account` action atomically (a) builds the account, (b) submits to Miden RPC, and (c) registers with GUARDIAN. In `examples/smoke-web`, `window.smoke.createAccount` only does (a) and (b); GUARDIAN registration is a separate `window.smoke.registerOnGuardian()` call (mirroring the "Register on Guardian" button). If you skip step 5 below, `recoverByKey` will return `[]` because GUARDIAN has no record of the account yet — that's expected behavior, not a regression.
+
+### Steps
+
+1. Start GUARDIAN and `examples/smoke-web`.
+2. Browser A: page-load bootstrap reaches `ready`. Capture `status().localSigners.falconCommitment` as `coldCommitment`.
+3. Browser B: bootstrap, capture commitment.
+4. Browser A:
+   ```js
+   await window.smoke.createAccount({
+     threshold: 2,
+     otherCommitments: ['<browser-B commitment>'],
+   });
+   ```
+   Capture `status().multisig.accountId` as `originalAccountId`.
+5. Browser A — register the account with GUARDIAN. **Required**; without this, GUARDIAN has no authorization record for `coldCommitment` and step 6 will return `[]`:
+   ```js
+   await window.smoke.registerOnGuardian();
+   ```
+6. Browser A (same session — keys still in memory):
+   ```js
+   const matches = await window.smoke.recoverByKey();
+   ```
+   Assert: `matches.length >= 1` and at least one entry's `accountId` equals `originalAccountId`.
+7. Browser A: paste `originalAccountId` into the Account ID field, run `await window.smoke.loadAccount({ accountId: originalAccountId })`, then `sync`, then `verifyStateCommitment`. Assert: `localCommitment === onChainCommitment`.
+8. Capture `recoverByKey` `durationMs` from `window.smoke.events()`.
+
+### Pass criteria
+
+- recovery returns the originally-created account
+- loaded recovered account's state commitment matches on-chain commitment
+- `events()` shows a successful `recoverByKey` entry with non-zero duration
+
+### Failure indicators
+
+- `matches.length === 0` **after step 5 succeeded** (lookup auth or routing regression — distinct from "skipped step 5" where empty is expected).
+- thrown auth/unauthenticated error (proof-of-possession metadata regression)
+- recovered `accountId` differs from `originalAccountId` (server-side index regression)
+- `verifyStateCommitment` mismatch after recover + load (state-fetch regression)
+

@@ -16,6 +16,14 @@ type PullDeltasResult = StdResult<Vec<DeltaObject>, String>;
 type GetMetadataResult = StdResult<Option<crate::metadata::AccountMetadata>, String>;
 type ListResult = StdResult<Vec<String>, String>;
 
+fn delta_to_proposal_record(proposal: DeltaObject) -> crate::storage::ProposalRecord {
+    crate::storage::ProposalRecord {
+        account_id: proposal.account_id.clone(),
+        commitment: proposal.new_commitment.clone().unwrap_or_default(),
+        proposal,
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MockNetworkClient {
     pub verify_state_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
@@ -211,12 +219,21 @@ impl NetworkClient for MockNetworkClient {
         _nonce: u64,
         _delta_payload: &serde_json::Value,
     ) -> Result<String, String> {
-        Ok("mock_proposal_id".to_string())
+        Ok(format!("0x{}", "ab".repeat(32)))
     }
 }
 
 #[derive(Clone, Default)]
+#[allow(clippy::type_complexity)]
 pub struct MockStorageBackend {
+    /// Reported by [`StorageBackend::kind`]. Defaults to
+    /// [`StorageType::Postgres`] (no FR-029 threshold). Tests
+    /// asserting filesystem-degraded behavior set this to
+    /// `Filesystem` via [`Self::with_kind`].
+    pub kind: Option<crate::storage::StorageType>,
+    /// Reported by [`StorageBackend::pool_status`]. Defaults to `None`
+    /// (no pool); set via [`Self::with_pool_status`].
+    pub pool_status: Option<crate::storage::PoolStatus>,
     pub submit_state_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub submit_state_calls: Arc<StdMutex<Vec<StateObject>>>,
     pub submit_delta_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
@@ -228,18 +245,47 @@ pub struct MockStorageBackend {
     pub submit_delta_proposal_calls: Arc<StdMutex<Vec<(String, DeltaObject)>>>,
     pub pull_delta_proposal_responses: Arc<StdMutex<Vec<StdResult<DeltaObject, String>>>>,
     pub pull_delta_proposal_calls: Arc<StdMutex<Vec<(String, String)>>>,
-    #[allow(clippy::type_complexity)]
     pub pull_all_delta_proposals_responses: Arc<StdMutex<Vec<StdResult<Vec<DeltaObject>, String>>>>,
     pub pull_all_delta_proposals_calls: Arc<StdMutex<Vec<String>>>,
     pub update_delta_proposal_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub update_delta_proposal_calls: Arc<StdMutex<Vec<(String, DeltaObject)>>>,
     pub delete_delta_proposal_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub delete_delta_proposal_calls: Arc<StdMutex<Vec<(String, String)>>>,
+    // Dashboard read APIs (feature `005-operator-dashboard-metrics`).
+    // Each queue is consumed LIFO via `Vec::pop`, mirroring the
+    // existing helpers — callers either push N identical responses or
+    // push them in reverse order to control per-call values.
+    pub list_account_deltas_paged_responses:
+        Arc<StdMutex<Vec<StdResult<Vec<DeltaObject>, String>>>>,
+    pub list_account_proposals_paged_responses:
+        Arc<StdMutex<Vec<StdResult<Vec<crate::storage::ProposalRecord>, String>>>>,
+    pub list_global_deltas_paged_responses:
+        Arc<StdMutex<Vec<StdResult<Vec<crate::storage::GlobalDeltaRow>, String>>>>,
+    pub list_global_proposals_paged_responses:
+        Arc<StdMutex<Vec<StdResult<Vec<crate::storage::ProposalRecord>, String>>>>,
+    pub count_deltas_by_status_responses:
+        Arc<StdMutex<Vec<StdResult<crate::storage::DeltaStatusCounts, String>>>>,
+    /// Number of `count_deltas_by_status` invocations; the metrics
+    /// refresher tests assert ticking cadence against this.
+    pub count_deltas_by_status_calls: Arc<StdMutex<u64>>,
+    pub count_in_flight_proposals_responses: Arc<StdMutex<Vec<StdResult<u64, String>>>>,
+    pub latest_activity_timestamp_responses:
+        Arc<StdMutex<Vec<StdResult<Option<chrono::DateTime<chrono::Utc>>, String>>>>,
 }
 
 impl MockStorageBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_kind(mut self, kind: crate::storage::StorageType) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    pub fn with_pool_status(mut self, status: crate::storage::PoolStatus) -> Self {
+        self.pool_status = Some(status);
+        self
     }
 
     pub fn with_submit_state(self, response: StdResult<(), String>) -> Self {
@@ -340,10 +386,96 @@ impl MockStorageBackend {
     pub fn get_delete_delta_proposal_calls(&self) -> Vec<(String, String)> {
         self.delete_delta_proposal_calls.lock().unwrap().clone()
     }
+
+    // Dashboard read APIs (feature `005-operator-dashboard-metrics`).
+
+    pub fn with_list_account_deltas_paged(
+        self,
+        response: StdResult<Vec<DeltaObject>, String>,
+    ) -> Self {
+        self.list_account_deltas_paged_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_list_account_proposals_paged(
+        self,
+        response: StdResult<Vec<crate::storage::ProposalRecord>, String>,
+    ) -> Self {
+        self.list_account_proposals_paged_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_list_global_deltas_paged(
+        self,
+        response: StdResult<Vec<crate::storage::GlobalDeltaRow>, String>,
+    ) -> Self {
+        self.list_global_deltas_paged_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_list_global_proposals_paged(
+        self,
+        response: StdResult<Vec<crate::storage::ProposalRecord>, String>,
+    ) -> Self {
+        self.list_global_proposals_paged_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_count_deltas_by_status(
+        self,
+        response: StdResult<crate::storage::DeltaStatusCounts, String>,
+    ) -> Self {
+        self.count_deltas_by_status_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_count_in_flight_proposals(self, response: StdResult<u64, String>) -> Self {
+        self.count_in_flight_proposals_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn with_latest_activity_timestamp(
+        self,
+        response: StdResult<Option<chrono::DateTime<chrono::Utc>>, String>,
+    ) -> Self {
+        self.latest_activity_timestamp_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
 }
 
 #[async_trait]
 impl StorageBackend for MockStorageBackend {
+    fn kind(&self) -> crate::storage::StorageType {
+        self.kind
+            .clone()
+            .unwrap_or(crate::storage::StorageType::Postgres)
+    }
+
+    fn pool_status(&self) -> Option<crate::storage::PoolStatus> {
+        self.pool_status
+    }
+
     async fn submit_state(&self, state: &StateObject) -> StdResult<(), String> {
         self.submit_state_calls.lock().unwrap().push(state.clone());
         self.submit_state_responses
@@ -422,7 +554,10 @@ impl StorageBackend for MockStorageBackend {
             .unwrap_or_else(|| Err("Mock: No proposal found".to_string()))
     }
 
-    async fn pull_all_delta_proposals(&self, account_id: &str) -> Result<Vec<DeltaObject>, String> {
+    async fn pull_all_delta_proposals(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<crate::storage::ProposalRecord>, String> {
         self.pull_all_delta_proposals_calls
             .lock()
             .unwrap()
@@ -432,6 +567,12 @@ impl StorageBackend for MockStorageBackend {
             .unwrap()
             .pop()
             .unwrap_or_else(|| Ok(vec![]))
+            .map(|proposals| {
+                proposals
+                    .into_iter()
+                    .map(delta_to_proposal_record)
+                    .collect()
+            })
     }
 
     async fn update_delta_proposal(
@@ -478,17 +619,105 @@ impl StorageBackend for MockStorageBackend {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    // Dashboard read APIs (feature `005-operator-dashboard-metrics`).
+
+    async fn list_account_deltas_paged(
+        &self,
+        _account_id: &str,
+        _limit: u32,
+        _cursor: Option<crate::storage::AccountDeltaCursor>,
+    ) -> Result<Vec<DeltaObject>, String> {
+        self.list_account_deltas_paged_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    async fn list_account_proposals_paged(
+        &self,
+        _account_id: &str,
+        _limit: u32,
+        _cursor: Option<crate::storage::AccountProposalCursor>,
+    ) -> Result<Vec<crate::storage::ProposalRecord>, String> {
+        self.list_account_proposals_paged_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    async fn list_global_deltas_paged(
+        &self,
+        _limit: u32,
+        _cursor: Option<crate::storage::GlobalDeltaCursor>,
+        _status_filter: Option<Vec<crate::storage::DeltaStatusKind>>,
+    ) -> Result<Vec<crate::storage::GlobalDeltaRow>, String> {
+        self.list_global_deltas_paged_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    async fn list_global_proposals_paged(
+        &self,
+        _limit: u32,
+        _cursor: Option<crate::storage::GlobalProposalCursor>,
+    ) -> Result<Vec<crate::storage::ProposalRecord>, String> {
+        self.list_global_proposals_paged_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    async fn count_deltas_by_status(&self) -> Result<crate::storage::DeltaStatusCounts, String> {
+        *self.count_deltas_by_status_calls.lock().unwrap() += 1;
+        self.count_deltas_by_status_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(crate::storage::DeltaStatusCounts::default()))
+    }
+
+    async fn count_in_flight_proposals(&self) -> Result<u64, String> {
+        self.count_in_flight_proposals_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(Ok(0))
+    }
+
+    async fn latest_activity_timestamp(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        self.latest_activity_timestamp_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(Ok(None))
+    }
 }
 
 #[derive(Clone, Default)]
+#[allow(clippy::type_complexity)]
 pub struct MockMetadataStore {
     pub get_responses: Arc<StdMutex<Vec<GetMetadataResult>>>,
     pub get_calls: Arc<StdMutex<Vec<String>>>,
     pub set_responses: Arc<StdMutex<Vec<StdResult<(), String>>>>,
     pub set_calls: Arc<StdMutex<Vec<crate::metadata::AccountMetadata>>>,
     pub list_responses: Arc<StdMutex<Vec<ListResult>>>,
+    pub list_paged_responses:
+        Arc<StdMutex<Vec<StdResult<Vec<crate::metadata::AccountMetadata>, String>>>>,
     pub list_with_pending_candidates_responses: Arc<StdMutex<Vec<ListResult>>>,
     pub update_timestamp_cas_responses: Arc<StdMutex<Vec<StdResult<bool, String>>>>,
+    pub find_by_cosigner_commitment_responses: Arc<StdMutex<Vec<ListResult>>>,
+    pub find_by_cosigner_commitment_calls: Arc<StdMutex<Vec<String>>>,
+    /// Reported by [`MetadataStore::pool_status`]. Defaults to `None`;
+    /// set via [`Self::with_pool_status`].
+    pub pool_status: Option<crate::storage::PoolStatus>,
 }
 
 impl MockMetadataStore {
@@ -514,6 +743,19 @@ impl MockMetadataStore {
         self
     }
 
+    pub fn with_pool_status(mut self, status: crate::storage::PoolStatus) -> Self {
+        self.pool_status = Some(status);
+        self
+    }
+
+    pub fn with_list_paged(
+        self,
+        response: StdResult<Vec<crate::metadata::AccountMetadata>, String>,
+    ) -> Self {
+        self.list_paged_responses.lock().unwrap().push(response);
+        self
+    }
+
     pub fn with_list_with_pending_candidates(
         self,
         response: StdResult<Vec<String>, String>,
@@ -533,6 +775,24 @@ impl MockMetadataStore {
         self
     }
 
+    pub fn with_find_by_cosigner_commitment(
+        self,
+        response: StdResult<Vec<String>, String>,
+    ) -> Self {
+        self.find_by_cosigner_commitment_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
+    pub fn get_find_by_cosigner_commitment_calls(&self) -> Vec<String> {
+        self.find_by_cosigner_commitment_calls
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
     pub fn get_get_calls(&self) -> Vec<String> {
         self.get_calls.lock().unwrap().clone()
     }
@@ -544,6 +804,10 @@ impl MockMetadataStore {
 
 #[async_trait]
 impl MetadataStore for MockMetadataStore {
+    fn pool_status(&self) -> Option<crate::storage::PoolStatus> {
+        self.pool_status
+    }
+
     async fn get(
         &self,
         account_id: &str,
@@ -573,6 +837,19 @@ impl MetadataStore for MockMetadataStore {
             .unwrap_or_else(|| Ok(vec![]))
     }
 
+    async fn list_paged(
+        &self,
+        _limit: u32,
+        _cursor: Option<crate::metadata::AccountListCursor>,
+        _paused: Option<bool>,
+    ) -> StdResult<Vec<crate::metadata::AccountMetadata>, String> {
+        self.list_paged_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
     async fn list_with_pending_candidates(&self) -> StdResult<Vec<String>, String> {
         self.list_with_pending_candidates_responses
             .lock()
@@ -592,5 +869,46 @@ impl MetadataStore for MockMetadataStore {
             .unwrap()
             .pop()
             .unwrap_or(Ok(true)) // Default to success
+    }
+
+    async fn find_by_cosigner_commitment(
+        &self,
+        commitment: &str,
+    ) -> StdResult<Vec<String>, String> {
+        self.find_by_cosigner_commitment_calls
+            .lock()
+            .unwrap()
+            .push(commitment.to_string());
+        self.find_by_cosigner_commitment_responses
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Ok(vec![]))
+    }
+
+    async fn set_pause(
+        &self,
+        _account_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        reason: &str,
+    ) -> StdResult<crate::services::account_status::PauseTransition, String> {
+        Ok(crate::services::account_status::PauseTransition {
+            before_state: crate::services::account_status::AccountStatus::Active,
+            after_state: crate::services::account_status::AccountStatus::Paused,
+            paused_at: Some(now),
+            paused_reason: Some(reason.to_string()),
+        })
+    }
+
+    async fn clear_pause(
+        &self,
+        _account_id: &str,
+    ) -> StdResult<crate::services::account_status::PauseTransition, String> {
+        Ok(crate::services::account_status::PauseTransition {
+            before_state: crate::services::account_status::AccountStatus::Paused,
+            after_state: crate::services::account_status::AccountStatus::Active,
+            paused_at: None,
+            paused_reason: None,
+        })
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::ack::AckRegistry;
 use crate::api::grpc::GuardianService;
+use crate::dashboard::DashboardState;
 use crate::metadata::auth::Auth;
 use crate::metadata::filesystem::FilesystemMetadataStore;
 use crate::network::NetworkClient;
@@ -17,7 +18,7 @@ use guardian_shared::auth_request_payload::AuthRequestPayload;
 use guardian_shared::hex::IntoHex;
 use guardian_shared::{FromJson, ToJson};
 use miden_protocol::account::{AccountDelta, AccountId, AccountStorageDelta, AccountVaultDelta};
-use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SecretKey as EcdsaSecretKey;
+use miden_protocol::crypto::dsa::ecdsa_k256_keccak::SigningKey as EcdsaSecretKey;
 use miden_protocol::crypto::dsa::falcon512_poseidon2::SecretKey;
 use miden_protocol::transaction::{InputNotes, RawOutputNotes, TransactionSummary};
 use miden_protocol::utils::serde::Serializable;
@@ -192,6 +193,10 @@ pub async fn create_test_app_state() -> AppState {
         ack,
         canonicalization: Some(crate::canonicalization::CanonicalizationConfig::default()),
         clock: Arc::new(crate::clock::SystemClock),
+        dashboard: Arc::new(DashboardState::default()),
+        auditor: Arc::new(crate::audit::LogAuditor::new()),
+        #[cfg(feature = "evm")]
+        evm: Arc::new(crate::evm::EvmAppState::for_tests()),
     }
 }
 
@@ -242,15 +247,139 @@ pub fn create_miden_falcon_rpo_auth(cosigner_commitments: Vec<String>) -> AuthCo
     }
 }
 
+pub fn create_miden_network_config() -> NetworkConfig {
+    NetworkConfig {
+        network_type: Some(network_config::NetworkType::Miden(MidenNetworkConfig {
+            network_type: "local".to_string(),
+        })),
+    }
+}
+
 pub fn create_router(state: AppState) -> axum::Router {
     use crate::api::http;
+    let dashboard_routes = axum::Router::new()
+        .route(
+            "/accounts",
+            axum::routing::get(crate::api::dashboard::list_operator_accounts),
+        )
+        .route(
+            "/accounts/{account_id}",
+            axum::routing::get(crate::api::dashboard::get_operator_account),
+        )
+        .route(
+            "/accounts/{account_id}/snapshot",
+            axum::routing::get(crate::api::dashboard::get_operator_account_snapshot),
+        )
+        .route(
+            "/accounts/{account_id}/deltas",
+            axum::routing::get(crate::api::dashboard_feeds::list_account_deltas_handler),
+        )
+        .route(
+            "/accounts/{account_id}/proposals",
+            axum::routing::get(crate::api::dashboard_feeds::list_account_proposals_handler),
+        )
+        .route(
+            "/info",
+            axum::routing::get(crate::api::dashboard::get_dashboard_info_handler),
+        )
+        .route(
+            "/deltas",
+            axum::routing::get(crate::api::dashboard_feeds::list_global_deltas_handler),
+        )
+        .route(
+            "/proposals",
+            axum::routing::get(crate::api::dashboard_feeds::list_global_proposals_handler),
+        )
+        // Feature 006-operator-authz: existing dashboard reads now
+        // require `{dashboard:read}`. Apply the same layering as
+        // production (`builder/handle.rs`): authz inside the session
+        // layer so session validation runs first.
+        .route_layer(axum::middleware::from_fn_with_state(
+            crate::dashboard::authz::AuthzState::new(
+                state.clone(),
+                &[crate::dashboard::permissions::Permission::DashboardRead],
+            ),
+            crate::dashboard::authz::enforce,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::dashboard::require_dashboard_session,
+        ));
 
-    axum::Router::new()
+    // FR-034: /session sits outside the dashboard:read authz layer.
+    let session_router = axum::Router::new()
+        .route(
+            "/session",
+            axum::routing::get(crate::api::dashboard::get_dashboard_session_handler),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::dashboard::require_dashboard_session,
+        ));
+    let dashboard_routes = dashboard_routes.merge(session_router);
+
+    // Feature 001-account-pausing: pause/unpause sit under the same
+    // session layer as the dashboard reads, but behind their own
+    // `accounts:pause` authz layer. Mirrors production wiring in
+    // `builder/handle.rs`.
+    let dashboard_routes = {
+        let accounts_pause_authz = crate::dashboard::authz::AuthzState::new(
+            state.clone(),
+            &[crate::dashboard::permissions::Permission::AccountsPause],
+        );
+        let pause_router = axum::Router::new()
+            .route(
+                "/accounts/{account_id}/pause",
+                axum::routing::post(crate::api::dashboard::pause_account_handler),
+            )
+            .route(
+                "/accounts/{account_id}/unpause",
+                axum::routing::post(crate::api::dashboard::unpause_account_handler),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                accounts_pause_authz,
+                crate::dashboard::authz::enforce,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::dashboard::require_dashboard_session,
+            ));
+        dashboard_routes.merge(pause_router)
+    };
+
+    // Feature 006-operator-authz: probe route wired in test builds when
+    // the `authz-test-probe` Cargo feature is enabled. Mirrors production
+    // wiring in `builder/handle.rs`.
+    #[cfg(feature = "authz-test-probe")]
+    let dashboard_routes = {
+        let accounts_pause_authz = crate::dashboard::authz::AuthzState::new(
+            state.clone(),
+            &[crate::dashboard::permissions::Permission::AccountsPause],
+        );
+        let probe_router = axum::Router::new()
+            .route(
+                crate::dashboard::probe::PROBE_PATH,
+                axum::routing::post(crate::dashboard::probe::handle),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                accounts_pause_authz,
+                crate::dashboard::authz::enforce,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::dashboard::require_dashboard_session,
+            ));
+        dashboard_routes.merge(probe_router)
+    };
+
+    let router = axum::Router::new()
         .route("/configure", axum::routing::post(http::configure))
         .route("/push_delta", axum::routing::post(http::push_delta))
         .route("/get_delta", axum::routing::get(http::get_delta))
         .route("/get_state", axum::routing::get(http::get_state))
+        .route("/state/lookup", axum::routing::get(http::lookup))
         .route("/pubkey", axum::routing::get(http::get_pubkey))
+        .route("/status", axum::routing::get(http::status))
         .route(
             "/push_delta_proposal",
             axum::routing::post(http::push_delta_proposal),
@@ -267,6 +396,61 @@ pub fn create_router(state: AppState) -> axum::Router {
             "/sign_delta_proposal",
             axum::routing::post(http::sign_delta_proposal),
         )
+        .route(
+            "/auth/challenge",
+            axum::routing::get(crate::api::dashboard::challenge_operator_login),
+        )
+        .route(
+            "/auth/verify",
+            axum::routing::post(crate::api::dashboard::verify_operator_login),
+        )
+        .route(
+            "/auth/logout",
+            axum::routing::post(crate::api::dashboard::logout_operator),
+        );
+
+    #[cfg(feature = "evm")]
+    let router = router
+        .route(
+            "/evm/auth/challenge",
+            axum::routing::get(crate::api::evm::challenge_evm_session),
+        )
+        .route(
+            "/evm/auth/verify",
+            axum::routing::post(crate::api::evm::verify_evm_session),
+        )
+        .route(
+            "/evm/auth/logout",
+            axum::routing::post(crate::api::evm::logout_evm_session),
+        )
+        .route(
+            "/evm/accounts",
+            axum::routing::post(crate::api::evm::register_evm_account),
+        )
+        .route(
+            "/evm/proposals",
+            axum::routing::post(crate::api::evm::create_evm_proposal)
+                .get(crate::api::evm::list_evm_proposals),
+        )
+        .route(
+            "/evm/proposals/{proposal_id}",
+            axum::routing::get(crate::api::evm::get_evm_proposal),
+        )
+        .route(
+            "/evm/proposals/{proposal_id}/approve",
+            axum::routing::post(crate::api::evm::approve_evm_proposal),
+        )
+        .route(
+            "/evm/proposals/{proposal_id}/executable",
+            axum::routing::get(crate::api::evm::get_executable_evm_proposal),
+        )
+        .route(
+            "/evm/proposals/{proposal_id}/cancel",
+            axum::routing::post(crate::api::evm::cancel_evm_proposal),
+        );
+
+    router
+        .nest("/dashboard", dashboard_routes)
         .with_state(state)
 }
 
@@ -293,7 +477,7 @@ pub fn load_fixture_account_grpc() -> (AccountId, String, String) {
 }
 
 pub fn get_test_account_id() -> (AccountId, String) {
-    let account_id_hex = "0x8a65fc5a39e4cd106d648e3eb4ab5f";
+    let account_id_hex = "0x8a8a8a8a8a8a8a010a8a8a8a8a8a8a";
     let account_id = AccountId::from_hex(account_id_hex).expect("Valid account ID");
     (account_id, account_id_hex.to_string())
 }
@@ -430,6 +614,11 @@ impl TestSigner {
 
         (signature_hex, timestamp)
     }
+
+    pub fn sign_word(&self, message: Word) -> String {
+        let signature = self.secret_key.sign(message);
+        format!("0x{}", hex::encode(signature.to_bytes()))
+    }
 }
 
 pub struct TestEcdsaSigner {
@@ -508,6 +697,14 @@ impl TestEcdsaSigner {
         let signature_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
         (signature_hex, timestamp)
+    }
+
+    /// Sign an arbitrary `Word`. Used by lookup-endpoint tests where the
+    /// digest is a `LookupAuthMessage::to_word`, not an
+    /// `AuthRequestMessage::to_word`.
+    pub fn sign_word(&self, message: Word) -> String {
+        let signature = self.secret_key.sign(message);
+        format!("0x{}", hex::encode(signature.to_bytes()))
     }
 }
 
@@ -597,5 +794,42 @@ pub fn create_test_app_state_with_mocks(
         ack,
         canonicalization: None, // Use optimistic mode for unit tests
         clock: Arc::new(crate::clock::SystemClock),
+        dashboard: Arc::new(DashboardState::default()),
+        auditor: Arc::new(crate::audit::LogAuditor::new()),
+        #[cfg(feature = "evm")]
+        evm: Arc::new(crate::evm::EvmAppState::for_tests()),
+    }
+}
+
+// -----------------------------------------------------------------
+// Feature 006-operator-authz: `CapturingAuditor` test helper.
+// -----------------------------------------------------------------
+
+/// `Auditor` implementation that records every event in memory so
+/// tests can assert on the count, ordering, and payload of audit
+/// emissions. Used by US2 / US4 integration tests in place of the
+/// production `LogAuditor` / `PostgresAuditor`.
+#[derive(Clone, Default)]
+pub struct CapturingAuditor {
+    events: Arc<std::sync::Mutex<Vec<crate::audit::AuditEvent>>>,
+}
+
+impl CapturingAuditor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot(&self) -> Vec<crate::audit::AuditEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    pub fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
+}
+
+impl crate::audit::Auditor for CapturingAuditor {
+    fn record(&self, event: crate::audit::AuditEvent) {
+        self.events.lock().unwrap().push(event);
     }
 }

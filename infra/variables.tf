@@ -43,6 +43,12 @@ variable "server_network_type" {
   default     = "MidenTestnet"
 }
 
+variable "guardian_cors_allowed_origins" {
+  description = "Comma-separated explicit HTTP origins allowed by Guardian CORS"
+  type        = string
+  default     = ""
+}
+
 variable "vpc_id" {
   description = "VPC ID. If not specified, uses the default VPC"
   type        = string
@@ -207,6 +213,47 @@ variable "rds_engine_version" {
   default     = ""
 }
 
+variable "ca_initializer_image" {
+  description = <<-EOT
+    Minimal image used by the CA-bundle init container to write the Secrets
+    Manager bundle into the shared volume. Defaults to Alpine from the public ECR
+    mirror (avoids Docker Hub rate limits), digest-pinned for supply-chain
+    consistency with the server Dockerfile. Refresh the digest with:
+    `docker manifest inspect public.ecr.aws/docker/library/alpine:3.20`.
+  EOT
+  type        = string
+  default     = "public.ecr.aws/docker/library/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+}
+
+variable "rds_ca_bundle_secret_arn" {
+  description = <<-EOT
+    ARN of a Secrets Manager secret whose SecretString is a PEM CA bundle the
+    server trusts when connecting to Postgres. When set, an init container writes
+    the bundle into a shared in-task volume and the server DATABASE_URL uses
+    sslmode=verify-full&sslrootcert=<mounted path> (authenticated TLS); when empty
+    the server falls back to sslmode=require (encrypted, unverified).
+
+    The published image ships no CA bundle (it stays provider-neutral); the bundle
+    is delivered at deploy time via the init container, so nothing is baked into
+    the image and the app never fetches it. For RDS the secret MUST contain BOTH
+    the Amazon RDS CA roots AND the Amazon Trust Services roots (concatenated),
+    because the RDS Proxy endpoint (prod default) presents an ACM certificate
+    chaining to Amazon Trust Services while a direct instance chains to the RDS CA
+    roots. Verification fails closed at startup if the bundle is missing or
+    malformed.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.rds_ca_bundle_secret_arn == "" ||
+      can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$", trimspace(var.rds_ca_bundle_secret_arn)))
+    )
+    error_message = "rds_ca_bundle_secret_arn must be empty or a valid Secrets Manager secret ARN."
+  }
+}
+
 variable "rds_backup_retention_days" {
   description = "Backup retention in days for RDS"
   type        = number
@@ -259,6 +306,84 @@ variable "guardian_rate_limit_enabled" {
   description = "Optional override to enable or disable Guardian HTTP rate limiting"
   type        = bool
   default     = null
+}
+
+variable "guardian_operator_public_keys_secret_arn" {
+  description = "Secrets Manager secret ARN containing a JSON array of serialized Falcon public keys allowed to authenticate as dashboard operators"
+  type        = string
+  default     = ""
+}
+
+variable "guardian_evm_allowed_chain_ids_secret_arn" {
+  description = "Secrets Manager secret ARN containing comma-separated EVM chain IDs allowed by the server"
+  type        = string
+  default     = ""
+}
+
+variable "guardian_ack_ecdsa_kms_key_arn" {
+  description = "KMS key ARN for the hosted ECDSA ACK signer backend. When set, the ECS task is granted kms:Sign and kms:GetPublicKey on this key, and the ECDSA ACK secret in Secrets Manager is no longer required."
+  type        = string
+  default     = ""
+}
+
+variable "guardian_evm_allowed_chain_ids" {
+  description = "Comma-separated EVM chain IDs allowed by the server; when set, Terraform creates a Secrets Manager secret containing this value"
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  validation {
+    condition     = var.guardian_evm_allowed_chain_ids == "" || can(regex("^\\s*[0-9]+(\\s*,\\s*[0-9]+)*\\s*$", var.guardian_evm_allowed_chain_ids))
+    error_message = "guardian_evm_allowed_chain_ids must be a comma-separated list of numeric chain IDs."
+  }
+}
+
+variable "guardian_evm_rpc_urls_secret_arn" {
+  description = "Secrets Manager secret ARN containing comma-separated chain_id=url EVM RPC entries"
+  type        = string
+  default     = ""
+}
+
+variable "guardian_ack_falcon_secret_name" {
+  description = "Secrets Manager secret name holding the Falcon ACK signing key (prod only). Defaults to $${stack_name}/server/ack-falcon-secret-key when empty; override to pin a stack at a pre-existing legacy secret name."
+  type        = string
+  default     = ""
+}
+
+variable "guardian_ack_ecdsa_secret_name" {
+  description = "Secrets Manager secret name holding the ECDSA ACK signing key (prod only). Defaults to $${stack_name}/server/ack-ecdsa-secret-key when empty; override to pin a stack at a pre-existing legacy secret name."
+  type        = string
+  default     = ""
+}
+
+variable "guardian_storage_encryption_secret_name" {
+  description = "Secrets Manager secret name holding the storage encryption key document ({active, keys}). When set (prod only), the ECS task is granted secretsmanager:GetSecretValue on it and GUARDIAN_STORAGE_ENCRYPTION_KEY_SECRET_ID is injected, enabling encryption at rest. Empty leaves storage in plaintext at rest."
+  type        = string
+  default     = ""
+}
+
+variable "guardian_evm_rpc_urls" {
+  description = "Comma-separated chain_id=url EVM RPC entries; when set, Terraform creates a Secrets Manager secret containing this value"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "guardian_evm_entrypoint_address" {
+  description = "Shared EVM EntryPoint address used for every configured EVM chain"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.guardian_evm_entrypoint_address == "" || can(regex("^0x[0-9a-fA-F]{40}$", var.guardian_evm_entrypoint_address))
+    error_message = "guardian_evm_entrypoint_address must be a 20-byte 0x-prefixed hex address."
+  }
+}
+
+variable "guardian_operator_public_keys" {
+  description = "Serialized Falcon public keys allowed to authenticate as dashboard operators; when set, Terraform creates a Secrets Manager secret containing this JSON array"
+  type        = list(string)
+  default     = []
 }
 
 variable "guardian_db_pool_max_size" {

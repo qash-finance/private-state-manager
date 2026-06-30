@@ -6,6 +6,7 @@ import type {
   DeltaProposalRequest,
   DeltaStatus,
   ExecutionDelta,
+  LookupResponse,
   ProposalSignature,
   ProposalMetadata,
   SignProposalRequest,
@@ -19,6 +20,7 @@ import type {
   ServerDeltaProposalRequest,
   ServerDeltaStatus,
   ServerExecutionDelta,
+  ServerLookupResponse,
   ServerProposalSignature,
   ServerProposalMetadata,
   ServerSignProposalRequest,
@@ -99,6 +101,8 @@ export function fromServerProposalMetadata(server: ServerProposalMetadata): Prop
     newGuardianPubkey: server.new_guardian_pubkey,
     newGuardianEndpoint: server.new_guardian_endpoint,
     noteIds: server.note_ids,
+    consumeNotesMetadataVersion: server.consume_notes_metadata_version,
+    consumeNotesNotes: server.consume_notes_notes,
     recipientId: server.recipient_id,
     faucetId: server.faucet_id,
     amount: server.amount,
@@ -148,6 +152,15 @@ export function fromServerConfigureResponse(server: ServerConfigureResponse): Co
   };
 }
 
+export function fromServerLookupResponse(server: ServerLookupResponse): LookupResponse {
+  if (!server || !Array.isArray(server.accounts)) {
+    throw new Error('Malformed /state/lookup response: expected { accounts: [...] }');
+  }
+  return {
+    accounts: server.accounts.map((entry) => ({ accountId: entry.account_id })),
+  };
+}
+
 export function toServerSignature(sig: ProposalSignature): ServerProposalSignature {
   if (sig.scheme === 'ecdsa') {
     return {
@@ -187,7 +200,7 @@ export function toServerDeltaStatus(status: DeltaStatus): ServerDeltaStatus {
 
 export function toServerProposalMetadata(meta: ProposalMetadata): ServerProposalMetadata {
   return {
-    proposal_type: meta.proposalType === 'unknown' ? undefined : meta.proposalType,
+    proposal_type: meta.proposalType,
     target_threshold: meta.targetThreshold,
     required_signatures: meta.requiredSignatures,
     signer_commitments: meta.signerCommitments,
@@ -197,6 +210,8 @@ export function toServerProposalMetadata(meta: ProposalMetadata): ServerProposal
     new_guardian_pubkey: meta.newGuardianPubkey,
     new_guardian_endpoint: meta.newGuardianEndpoint,
     note_ids: meta.noteIds,
+    consume_notes_metadata_version: meta.consumeNotesMetadataVersion,
+    consume_notes_notes: meta.consumeNotesNotes,
     recipient_id: meta.recipientId,
     faucet_id: meta.faucetId,
     amount: meta.amount,

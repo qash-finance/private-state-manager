@@ -1,6 +1,12 @@
-import type { MidenClient } from '@miden-sdk/miden-sdk';
+import {
+  MidenClient,
+  Word,
+  type AdviceMap,
+  type TransactionRequest,
+} from '@miden-sdk/miden-sdk';
 import {
   AccountInspector,
+  buildP2idTransactionRequest,
   EcdsaSigner,
   FalconSigner,
   MidenWalletSigner,
@@ -102,7 +108,9 @@ function currentAccountNonce(multisig: Multisig): number | null {
 
 function proposalNonce(multisig: Multisig): number | undefined {
   const nonce = currentAccountNonce(multisig);
-  return nonce === null ? undefined : nonce;
+  // Proposal nonce is the account's next nonce (current + 1), matching the Rust
+  // client's `proposal.nonce <= account.nonce()` staleness filter.
+  return nonce === null ? undefined : nonce + 1;
 }
 
 export function filterVisibleProposals(
@@ -118,7 +126,9 @@ export function filterVisibleProposals(
       return false;
     }
 
-    if (accountNonce !== null && proposal.nonce < accountNonce) {
+    // `<=` matches the next-nonce convention: a proposal at nonce N is consumed
+    // once the account reaches nonce N.
+    if (accountNonce !== null && proposal.nonce <= accountNonce) {
       return false;
     }
 
@@ -372,4 +382,80 @@ export async function importProposal(
   const proposal = await multisig.importProposal(json);
   const proposals = listVisibleProposals(multisig);
   return { proposal, proposals };
+}
+
+export interface CustomProposalRecipe {
+  proposalId: string;
+  label: string;
+  senderId: string;
+  recipientId: string;
+  faucetId: string;
+  amount: string;
+  saltHex: string;
+}
+
+function buildRequestFromRecipe(
+  recipe: CustomProposalRecipe,
+  signatureAdviceMap?: AdviceMap,
+): TransactionRequest {
+  return buildP2idTransactionRequest(
+    recipe.senderId,
+    recipe.recipientId,
+    recipe.faucetId,
+    BigInt(recipe.amount),
+    { salt: Word.fromHex(recipe.saltHex), signatureAdviceMap },
+  ).request;
+}
+
+export async function createCustomP2idProposal(
+  multisig: Multisig,
+  recipientId: string,
+  faucetId: string,
+  amount: bigint,
+  label: string,
+): Promise<{ proposal: Proposal; proposals: Proposal[]; recipe: CustomProposalRecipe }> {
+  const senderId = multisig.accountId;
+  const { request, salt } = buildP2idTransactionRequest(
+    senderId,
+    recipientId,
+    faucetId,
+    amount,
+  );
+
+  const created = await createProposalResult(multisig, () =>
+    multisig.createCustomProposal(request.serialize(), label, proposalNonce(multisig)));
+
+  const recipe: CustomProposalRecipe = {
+    proposalId: created.proposal.id,
+    label,
+    senderId,
+    recipientId,
+    faucetId,
+    amount: amount.toString(),
+    saltHex: salt.toHex(),
+  };
+
+  return { ...created, recipe };
+}
+
+export async function prepareAndSubmitCustomProposal(
+  multisig: Multisig,
+  recipe: CustomProposalRecipe,
+): Promise<void> {
+  const bindingRequestBytes = buildRequestFromRecipe(recipe).serialize();
+  const advice = await multisig.prepareCustomExecution(recipe.proposalId, bindingRequestBytes);
+
+  const finalRequest = buildRequestFromRecipe(recipe, advice);
+
+  try {
+    await multisig.submitTransaction(finalRequest);
+  } catch (submitError) {
+    // The local apply step can transiently fail (autoSync race) even when the
+    // on-chain submit succeeded. Re-sync so local state catches up, then surface
+    // the error — a generic nonce bump is not proof THIS submit landed (another
+    // session could advance the account), so the operator should verify via the
+    // refreshed state rather than have a false success swallowed here.
+    await multisig.syncState();
+    throw submitError;
+  }
 }

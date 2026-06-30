@@ -4,11 +4,10 @@ use server::ack::AckRegistry;
 use server::builder::{ServerBuilder, storage::StorageMetadataBuilder};
 use server::canonicalization::CanonicalizationConfig;
 use server::logging::LoggingConfig;
-use server::middleware::{BodyLimitConfig, RateLimitConfig};
+use server::middleware::{BodyLimitConfig, CorsConfig, RateLimitConfig};
 use server::network::NetworkType;
 use std::env;
 use std::path::PathBuf;
-use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() {
@@ -18,7 +17,7 @@ async fn main() {
         .unwrap_or_else(|_| "/var/guardian/keystore".to_string())
         .into();
 
-    let (storage_backend, metadata) = StorageMetadataBuilder::from_env()
+    let (storage_backend, metadata, auditor) = StorageMetadataBuilder::from_env()
         .build()
         .await
         .expect("Failed to initialize storage backends");
@@ -28,10 +27,9 @@ async fn main() {
         .await
         .expect("Failed to initialize ack registry");
 
-    let cors_layer = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors_layer = CorsConfig::from_env()
+        .expect("Failed to initialize CORS config")
+        .layer();
 
     let network_type = NetworkType::from_env_or("GUARDIAN_NETWORK_TYPE", NetworkType::MidenDevnet);
 
@@ -45,6 +43,7 @@ async fn main() {
         .with_body_limit(BodyLimitConfig::from_env())
         .storage(storage_backend)
         .metadata(metadata)
+        .auditor(auditor)
         .ack(ack)
         .http(true, 3000)
         .grpc(true, 50051)

@@ -2,7 +2,7 @@ pub use guardian_shared::ProposalSignature;
 use serde::{Deserialize, Serialize};
 
 /// Cosigner signature entry for delta proposals
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, utoipa::ToSchema)]
 pub struct CosignerSignature {
     pub signature: ProposalSignature,
     pub timestamp: String,
@@ -10,7 +10,7 @@ pub struct CosignerSignature {
 }
 
 /// Delta status state machine
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeltaStatus {
     Pending {
@@ -121,18 +121,47 @@ impl Default for DeltaStatus {
 }
 
 /// Delta object
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Clone, Debug, Default, utoipa::ToSchema)]
 pub struct DeltaObject {
     pub account_id: String,
     pub nonce: u64,
     pub prev_commitment: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_commitment: Option<String>,
+    /// Opaque, schema-free JSON payload describing the state delta.
+    #[schema(value_type = Object)]
     pub delta_payload: serde_json::Value,
     pub ack_sig: String,
     pub ack_pubkey: String,
     pub ack_scheme: String,
     pub status: DeltaStatus,
+    /// Typed dashboard metadata derived at push time. Stored as JSONB
+    /// in the `deltas.metadata` column. `None` for EVM deltas and any
+    /// historical row never reprocessed by the push-time pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::delta_summary::DeltaMetadata>,
+}
+
+impl DeltaObject {
+    /// Return the multisig proposal type tag carried by this delta.
+    ///
+    /// Reads from the typed `metadata.proposal` block when present.
+    /// Falls back to `delta_payload.metadata.proposal_type` for pending
+    /// proposals (the typed column lives only on `deltas`, not
+    /// `delta_proposals`) and for historical canonical multisig rows
+    /// whose source proposal was already deleted when the push-time
+    /// pipeline was introduced.
+    pub fn proposal_type(&self) -> Option<&str> {
+        if let Some(meta) = &self.metadata
+            && let Some(p) = &meta.proposal
+        {
+            return Some(p.proposal_type.as_str());
+        }
+        self.delta_payload
+            .get("metadata")?
+            .get("proposal_type")?
+            .as_str()
+    }
 }
 
 impl<'de> Deserialize<'de> for DeltaObject {
@@ -168,6 +197,8 @@ impl<'de> Deserialize<'de> for DeltaObject {
             canonical_at: Option<String>,
             #[serde(default)]
             discarded_at: Option<String>,
+            #[serde(default)]
+            metadata: Option<crate::delta_summary::DeltaMetadata>,
         }
 
         let helper = DeltaObjectHelper::deserialize(deserializer)?;
@@ -194,6 +225,7 @@ impl<'de> Deserialize<'de> for DeltaObject {
             ack_pubkey: helper.ack_pubkey,
             ack_scheme: helper.ack_scheme,
             status,
+            metadata: helper.metadata,
         })
     }
 }
@@ -211,9 +243,77 @@ mod tests {
     }
 
     #[test]
+    fn proposal_type_reads_from_typed_metadata_when_present() {
+        use crate::delta_summary::{
+            DashboardDeltaCategory, DeltaMetadata, NoteCounts, ProposalMetadata,
+        };
+        let delta = DeltaObject {
+            metadata: Some(DeltaMetadata {
+                category: DashboardDeltaCategory::AssetTransfer,
+                assets: Vec::new(),
+                counterparty: None,
+                note_counts: NoteCounts::default(),
+                proposal: Some(ProposalMetadata {
+                    proposal_type: "p2id".to_string(),
+                    ..ProposalMetadata::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(delta.proposal_type(), Some("p2id"));
+    }
+
+    #[test]
+    fn proposal_type_falls_back_to_delta_payload_metadata_when_typed_column_is_none() {
+        let delta = DeltaObject {
+            metadata: None,
+            delta_payload: serde_json::json!({
+                "tx_summary": { "data": "AAAA" },
+                "metadata": {
+                    "proposal_type": "consume_notes",
+                    "note_ids": ["0xnote1"]
+                },
+                "signatures": []
+            }),
+            ..Default::default()
+        };
+        assert_eq!(delta.proposal_type(), Some("consume_notes"));
+    }
+
+    #[test]
+    fn proposal_type_returns_none_when_neither_source_has_it() {
+        let delta = DeltaObject::default();
+        assert!(delta.proposal_type().is_none());
+    }
+
+    #[test]
+    fn proposal_type_typed_column_wins_over_legacy_path() {
+        use crate::delta_summary::{
+            DashboardDeltaCategory, DeltaMetadata, NoteCounts, ProposalMetadata,
+        };
+        let delta = DeltaObject {
+            metadata: Some(DeltaMetadata {
+                category: DashboardDeltaCategory::AssetTransfer,
+                assets: Vec::new(),
+                counterparty: None,
+                note_counts: NoteCounts::default(),
+                proposal: Some(ProposalMetadata {
+                    proposal_type: "p2id".to_string(),
+                    ..ProposalMetadata::default()
+                }),
+            }),
+            delta_payload: serde_json::json!({
+                "metadata": { "proposal_type": "add_signer" }
+            }),
+            ..Default::default()
+        };
+        assert_eq!(delta.proposal_type(), Some("p2id"));
+    }
+
+    #[test]
     fn test_delta_object_deserialization() {
         let json = r#"{
-            "account_id": "0x2f02fa4c9e787b101bf02bc266db39",
+            "account_id": "0x4a4a4a4a4a4a4a014a4a4a4a4a4a4a",
             "nonce": 0,
             "prev_commitment": "0xdc2820847638d1f15f174ea0657e3228e5b7774be44be1e608e4c64d92eaaaeb",
             "new_commitment": "0x8fa68eabc9817e17900a7f1f705c1ecdeef6ab64c15ca1b66447272fb8fa49b2",

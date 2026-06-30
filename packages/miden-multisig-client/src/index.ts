@@ -39,7 +39,12 @@
  * ```
  */
 
-export { MultisigClient, type MultisigClientConfig } from './client.js';
+export {
+  MultisigClient,
+  type MultisigClientConfig,
+  type RecoveredAccount,
+} from './client.js';
+export { lookupAuthDigest } from './lookupAuth.js';
 export { Multisig, type AccountState } from './multisig.js';
 export { AccountInspector, type DetectedMultisigConfig, type VaultBalance } from './inspector.js';
 export {
@@ -73,6 +78,30 @@ export {
   storageLayoutBuilder,
   StorageLayoutBuilder,
 } from './account/index.js';
+
+export {
+  CONSUME_NOTES_METADATA_VERSION_V2,
+  MAX_CONSUME_NOTES_METADATA_BYTES,
+  isConsumeNotesV1,
+  isConsumeNotesV2,
+} from './types/proposal.js';
+
+export {
+  LEGACY_CONSUME_NOTES_ENABLED,
+} from './multisig/config.js';
+
+export {
+  type ConsumeNotesErrorCode,
+  NoteBindingMismatchError,
+  UnsupportedMetadataVersionError,
+  ConsumeNotesMetadataOversizeError,
+  LegacyConsumeNotesNoteMissingError,
+} from './multisig/consumeNotesErrors.js';
+
+export {
+  noteToBase64,
+  noteFromBase64,
+} from './utils/encoding.js';
 
 export {
   PROCEDURE_ROOTS,

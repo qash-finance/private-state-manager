@@ -16,6 +16,8 @@ export class ProposalMetadataCodec {
         return {
           ...base,
           noteIds: metadata.noteIds,
+          consumeNotesMetadataVersion: metadata.metadataVersion,
+          consumeNotesNotes: metadata.notes,
         };
       case 'p2id':
         return {
@@ -46,8 +48,9 @@ export class ProposalMetadataCodec {
           targetThreshold: metadata.targetThreshold,
           signerCommitments: metadata.targetSignerCommitments,
         };
-      case 'unknown':
-        return base;
+      case 'custom':
+        // Round-trip the original server label rather than the 'custom' bucket.
+        return { ...base, proposalType: metadata.rawProposalType };
     }
   }
 
@@ -82,6 +85,8 @@ export class ProposalMetadataCodec {
           ...base,
           proposalType: 'consume_notes',
           noteIds: guardian.noteIds,
+          metadataVersion: guardian.consumeNotesMetadataVersion as 1 | 2 | undefined,
+          notes: guardian.consumeNotesNotes,
         };
       case 'switch_guardian':
         if (!guardian.newGuardianPubkey || !guardian.newGuardianEndpoint) {
@@ -116,12 +121,18 @@ export class ProposalMetadataCodec {
         }
         return {
           ...base,
-          proposalType: guardian.proposalType,
+          proposalType: guardian.proposalType as 'add_signer' | 'remove_signer' | 'change_threshold',
           targetThreshold: guardian.targetThreshold,
           targetSignerCommitments: guardian.signerCommitments,
         };
       default:
-        throw new Error(`Unsupported proposal type: ${guardian.proposalType as string}`);
+        // Any proposal type the SDK does not model collapses to the 'custom'
+        // bucket while preserving the original label (issue #266).
+        return {
+          ...base,
+          proposalType: 'custom',
+          rawProposalType: guardian.proposalType,
+        };
     }
   }
 
@@ -158,8 +169,10 @@ export class ProposalMetadataCodec {
           throw new Error('p2id proposal metadata is incomplete');
         }
         return metadata;
-      case 'unknown':
-        throw new Error('unknown proposal type is not supported');
+      case 'custom':
+        // Custom proposals are opaque to the SDK; nothing to validate beyond
+        // the base fields. They can be listed/signed/exported, not built here.
+        return metadata;
     }
   }
 }
