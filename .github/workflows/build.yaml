@@ -78,6 +78,7 @@ jobs:
         run: |
           docker build \
             --platform linux/amd64 \
+            --build-arg GUARDIAN_GIT_SHA=${{ github.sha }} \
             -f ${{ inputs.dockerfile }} \
             -t $IMAGE \
             ${{ inputs.context }}

@@ -1,12 +1,14 @@
 use crate::delta_object::{DeltaObject, ProposalSignature};
-use crate::metadata::auth::{Auth, ExtractCredentials};
+use crate::metadata::NetworkConfig;
+use crate::metadata::auth::{Auth, Credentials, ExtractCredentials};
 use crate::services::{
     self, ConfigureAccountParams, GetDeltaParams, GetDeltaProposalParams, GetStateParams,
-    PushDeltaParams,
+    LookupAccountParams, PushDeltaParams,
 };
 use crate::state::AppState;
 use guardian_shared::SignatureScheme;
 use guardian_shared::auth_request_payload::AuthRequestPayload;
+use prost::Message;
 use tonic::{Request, Response, Status};
 
 // Include the generated protobuf code
@@ -32,11 +34,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<ConfigureRequest>,
     ) -> Result<Response<ConfigureResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let credential = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let credential = authenticated_request(&request)?;
 
         let req = request.into_inner();
 
@@ -47,6 +45,11 @@ impl Guardian for GuardianService {
 
         let auth = Auth::try_from(auth_config)
             .map_err(|e| Status::invalid_argument(format!("Invalid auth config: {e}")))?;
+        let network_config = match req.network_config {
+            Some(network_config) => NetworkConfig::try_from(network_config)
+                .map_err(|e| Status::invalid_argument(format!("Invalid network config: {e}")))?,
+            None => NetworkConfig::miden_default(),
+        };
 
         // Parse initial_state JSON
         let initial_state: serde_json::Value = serde_json::from_str(&req.initial_state)
@@ -55,6 +58,7 @@ impl Guardian for GuardianService {
         let params = ConfigureAccountParams {
             account_id: req.account_id.clone(),
             auth,
+            network_config,
             initial_state,
             credential,
         };
@@ -66,12 +70,14 @@ impl Guardian for GuardianService {
                 message: format!("Account '{}' configured successfully", response.account_id),
                 ack_pubkey: response.ack_pubkey,
                 ack_commitment: response.ack_commitment,
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(ConfigureResponse {
                 success: false,
                 message: e.to_string(),
                 ack_pubkey: String::new(),
                 ack_commitment: String::new(),
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -80,11 +86,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let auth = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let auth = authenticated_request(&request)?;
 
         let req = request.into_inner();
 
@@ -102,6 +104,8 @@ impl Guardian for GuardianService {
             ack_pubkey: String::new(),
             ack_scheme: String::new(),
             status: Default::default(),
+            // Derived server-side at push time; never carried inbound.
+            metadata: None,
         };
 
         let params = PushDeltaParams {
@@ -116,12 +120,14 @@ impl Guardian for GuardianService {
                 message: "Delta pushed successfully".to_string(),
                 delta: Some(delta_to_proto(&response.delta)),
                 ack_sig: Some(response.delta.ack_sig),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(PushDeltaResponse {
                 success: false,
                 message: e.to_string(),
                 delta: None,
                 ack_sig: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -130,11 +136,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<GetDeltaRequest>,
     ) -> Result<Response<GetDeltaResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let auth = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let auth = authenticated_request(&request)?;
 
         let req = request.into_inner();
 
@@ -150,11 +152,13 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "Delta retrieved successfully".to_string(),
                 delta: Some(delta_to_proto(&response.delta)),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(GetDeltaResponse {
                 success: false,
                 message: e.to_string(),
                 delta: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -163,11 +167,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<GetDeltaSinceRequest>,
     ) -> Result<Response<GetDeltaSinceResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let auth = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let auth = authenticated_request(&request)?;
 
         let req = request.into_inner();
 
@@ -183,11 +183,13 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "Merged delta retrieved successfully".to_string(),
                 merged_delta: Some(delta_to_proto(&response.merged_delta)),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(GetDeltaSinceResponse {
                 success: false,
                 message: e.to_string(),
                 merged_delta: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -196,11 +198,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let auth = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let auth = authenticated_request(&request)?;
 
         let req = request.into_inner();
 
@@ -215,11 +213,13 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "State retrieved successfully".to_string(),
                 state: Some(state_to_proto(&response.state)),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(GetStateResponse {
                 success: false,
                 message: e.to_string(),
                 state: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -249,11 +249,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<PushDeltaProposalRequest>,
     ) -> Result<Response<PushDeltaProposalResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let credentials = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let credentials = authenticated_request(&request)?;
         let data = request.into_inner();
 
         let params = services::PushDeltaProposalParams {
@@ -270,12 +266,14 @@ impl Guardian for GuardianService {
                 message: "Delta proposal submitted successfully".to_string(),
                 delta: Some(delta_to_proto(&response.delta)),
                 commitment: response.commitment,
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(PushDeltaProposalResponse {
                 success: false,
                 message: e.to_string(),
                 delta: None,
                 commitment: String::new(),
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -284,11 +282,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<GetDeltaProposalsRequest>,
     ) -> Result<Response<GetDeltaProposalsResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let credentials = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let credentials = authenticated_request(&request)?;
         let data = request.into_inner();
 
         let params = services::GetDeltaProposalsParams {
@@ -301,11 +295,13 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "Delta proposals retrieved successfully".to_string(),
                 proposals: response.proposals.iter().map(delta_to_proto).collect(),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(GetDeltaProposalsResponse {
                 success: false,
                 message: e.to_string(),
                 proposals: vec![],
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -314,11 +310,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<GetDeltaProposalRequest>,
     ) -> Result<Response<GetDeltaProposalResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let credentials = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let credentials = authenticated_request(&request)?;
         let data = request.into_inner();
 
         let params = GetDeltaProposalParams {
@@ -332,11 +324,13 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "Delta proposal retrieved successfully".to_string(),
                 proposal: Some(delta_to_proto(&response.proposal)),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(GetDeltaProposalResponse {
                 success: false,
                 message: e.to_string(),
                 proposal: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
@@ -345,11 +339,7 @@ impl Guardian for GuardianService {
         &self,
         request: Request<SignDeltaProposalRequest>,
     ) -> Result<Response<SignDeltaProposalResponse>, Status> {
-        let request_payload = AuthRequestPayload::from_protobuf_message(request.get_ref());
-        let credentials = request
-            .metadata()
-            .extract_credentials()?
-            .with_request_payload(request_payload);
+        let credentials = authenticated_request(&request)?;
         let data = request.into_inner();
 
         let signature = data
@@ -368,14 +358,53 @@ impl Guardian for GuardianService {
                 success: true,
                 message: "Delta proposal signed successfully".to_string(),
                 delta: Some(delta_to_proto(&response.delta)),
+                error_code: String::new(),
             })),
             Err(e) => Ok(Response::new(SignDeltaProposalResponse {
                 success: false,
                 message: e.to_string(),
                 delta: None,
+                error_code: e.code().to_string(),
             })),
         }
     }
+
+    /// Resolve a public-key commitment to the set of account IDs that
+    /// authorize it. Mirror of HTTP `GET /state/lookup`.
+    async fn get_account_by_key_commitment(
+        &self,
+        request: Request<GetAccountByKeyCommitmentRequest>,
+    ) -> Result<Response<GetAccountByKeyCommitmentResponse>, Status> {
+        let credentials = authenticated_request(&request)?;
+        let req = request.into_inner();
+
+        let params = LookupAccountParams {
+            key_commitment: req.key_commitment,
+            credentials,
+        };
+
+        let result = services::lookup_account(&self.app_state, params)
+            .await
+            .map_err(Status::from)?;
+
+        Ok(Response::new(GetAccountByKeyCommitmentResponse {
+            accounts: result
+                .accounts
+                .into_iter()
+                .map(|account_id| AccountRef { account_id })
+                .collect(),
+        }))
+    }
+}
+
+fn authenticated_request<T: Message>(request: &Request<T>) -> Result<Credentials, Status> {
+    let request_bytes = request.get_ref().encode_to_vec();
+    let request_payload = AuthRequestPayload::from_bytes(&request_bytes);
+    Ok(request
+        .metadata()
+        .extract_credentials()?
+        .with_request_payload(request_payload)
+        .with_request_payload_bytes(request_bytes))
 }
 
 // Helper functions to convert between internal types and protobuf types
@@ -543,10 +572,13 @@ mod tests {
             auth: Auth::MidenFalconRpo {
                 cosigner_commitments,
             },
+            network_config: crate::metadata::NetworkConfig::miden_default(),
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
             has_pending_candidate: false,
             last_auth_timestamp: None,
+            paused_at: None,
+            paused_reason: None,
         }
     }
 
@@ -627,7 +659,7 @@ mod tests {
         let (state, _storage, _network, _metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -642,6 +674,7 @@ mod tests {
                     },
                 )),
             }),
+            network_config: None,
             initial_state: serde_json::to_string(&account_json).unwrap(),
         };
 
@@ -659,7 +692,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -714,7 +747,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -757,7 +790,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -788,6 +821,7 @@ mod tests {
                 "2024-11-14T12:00:00Z".to_string(),
                 signer.pubkey_hex.clone(),
             ),
+            metadata: None,
         };
 
         let _storage = storage.with_pull_all_delta_proposals(Ok(vec![pending_delta]));
@@ -809,7 +843,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -843,7 +877,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -873,6 +907,7 @@ mod tests {
                 "2024-11-14T12:00:00Z".to_string(),
                 signer.pubkey_hex.clone(),
             ),
+            metadata: None,
         };
 
         let _storage = storage.with_pull_delta_proposal(Ok(pending_delta));
@@ -896,7 +931,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 
@@ -930,7 +965,7 @@ mod tests {
         let (state, _storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
 
         let _metadata = metadata.with_get(Ok(Some(create_account_metadata(
@@ -960,7 +995,7 @@ mod tests {
         let (state, storage, _network, metadata) = create_test_state();
         let service = create_service(state);
 
-        let account_id = "0x7bfb0f38b0fafa103f86a805594170".to_string();
+        let account_id = "0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b".to_string();
         let signer = TestSigner::new();
         let commitment = signer.commitment_hex.clone();
 

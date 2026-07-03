@@ -13,13 +13,13 @@ import type {
   NoteAsset,
   Proposal,
   ProposalMetadata,
+  ProposalSignatureEntry,
   ProposalType,
 } from './types.js';
 import type { ProcedureName } from './procedures.js';
 import type {
   MidenClient,
   TransactionProver,
-  TransactionRequest,
   WasmWebClient,
 } from '@miden-sdk/miden-sdk';
 import {
@@ -28,8 +28,10 @@ import {
   AdviceMap,
   Endpoint,
   FeltArray,
+  Note,
   RpcClient,
   Signature,
+  TransactionRequest,
   TransactionSummary,
   Word,
 } from '@miden-sdk/miden-sdk';
@@ -41,6 +43,19 @@ import {
   buildConsumeNotesTransactionRequest,
   buildP2idTransactionRequest,
 } from './transaction.js';
+import { buildConsumeNotesTransactionRequestFromNotes } from './transaction/consumeNotes.js';
+import {
+  CONSUME_NOTES_METADATA_VERSION_V2,
+  MAX_CONSUME_NOTES_METADATA_BYTES,
+} from './types/proposal.js';
+import { LEGACY_CONSUME_NOTES_ENABLED } from './multisig/config.js';
+import {
+  ConsumeNotesMetadataOversizeError,
+  LegacyConsumeNotesNoteMissingError,
+  NoteBindingMismatchError,
+  UnsupportedMetadataVersionError,
+} from './multisig/consumeNotesErrors.js';
+import { noteFromBase64, noteToBase64 } from './utils/encoding.js';
 import {
   base64ToUint8Array,
   uint8ArrayToBase64,
@@ -83,6 +98,32 @@ export interface AccountStateVerificationResult {
 /**
  * Represents a multisig account with GUARDIAN integration.
  */
+const BUILTIN_PROPOSAL_TYPES = new Set<string>([
+  'add_signer',
+  'remove_signer',
+  'change_threshold',
+  'update_procedure_threshold',
+  'switch_guardian',
+  'consume_notes',
+  'p2id',
+  // Reserved: the SDK's internal bucket name for unmodeled types. A producer
+  // must not use it as a custom label, or it would collide with the bucket.
+  'custom',
+]);
+
+/**
+ * Deserialize producer-supplied transaction request bytes, wrapping any failure
+ * in a stable message that mirrors the Rust SDK's `deserialize_transaction_request`.
+ */
+function deserializeTransactionRequest(bytes: Uint8Array): TransactionRequest {
+  try {
+    return TransactionRequest.deserialize(bytes);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`failed to decode transaction request: ${detail}`);
+  }
+}
+
 export class Multisig {
   account: Account;
   threshold: number;
@@ -698,19 +739,9 @@ export class Multisig {
       description: `Switch GUARDIAN to ${newGuardianEndpoint}`,
     };
 
-    const proposalId = computeCommitmentFromTxSummary(summaryBase64);
-    const proposal: Proposal = {
-      id: proposalId,
-      accountId: this._accountId,
-      nonce: proposalNonce,
-      status: 'pending',
-      txSummary: summaryBase64,
-      signatures: [],
-      metadata,
-    };
-
-    this.proposals.set(proposal.id, proposal);
-    return proposal;
+    // SwitchGuardian is a regular delta proposal; push it to GUARDIAN so
+    // sign/execute (which fetch from GUARDIAN) can find it.
+    return this.createProposal(proposalNonce, summaryBase64, metadata);
   }
 
   /**
@@ -728,7 +759,19 @@ export class Multisig {
       throw new Error('At least one note ID is required');
     }
 
-    const { request, salt } = await buildConsumeNotesTransactionRequest(webClient, noteIds);
+    // Fetch notes locally (proposer has them per FR-012); embed for v2 verification.
+    const rawClient = await getRawMidenClient(webClient);
+    const fetchedNotes: Note[] = [];
+    for (const noteIdHex of noteIds) {
+      const inputNoteRecord = await rawClient.getInputNote(noteIdHex);
+      if (!inputNoteRecord) {
+        throw new LegacyConsumeNotesNoteMissingError(noteIdHex);
+      }
+      fetchedNotes.push(inputNoteRecord.toNote());
+    }
+    const embeddedNotes = fetchedNotes.map((n) => noteToBase64(n));
+
+    const { request, salt } = buildConsumeNotesTransactionRequestFromNotes(fetchedNotes);
 
     const summary = await executeForSummary(webClient, this._accountId, request);
     const summaryBase64 = uint8ArrayToBase64(summary.serialize());
@@ -737,10 +780,22 @@ export class Multisig {
     const metadata: ProposalMetadata = {
       proposalType: 'consume_notes',
       noteIds,
+      metadataVersion: CONSUME_NOTES_METADATA_VERSION_V2,
+      notes: embeddedNotes,
       saltHex: salt.toHex(),
       requiredSignatures: this.getEffectiveThreshold('consume_notes'),
       description: `Consume ${noteIds.length} note(s)`,
     };
+
+    // FR-011: enforce metadata size cap on the wire-encoded form (what GUARDIAN
+    // actually persists), matching the Rust side which measures
+    // `ProposalMetadataPayload`. Sizing the local in-memory `metadata` would
+    // miss codec divergence.
+    const encoded = ProposalMetadataCodec.toGuardian(metadata);
+    const metadataSize = new TextEncoder().encode(JSON.stringify(encoded)).length;
+    if (metadataSize > MAX_CONSUME_NOTES_METADATA_BYTES) {
+      throw new ConsumeNotesMetadataOversizeError(MAX_CONSUME_NOTES_METADATA_BYTES, metadataSize);
+    }
 
     return this.createProposal(proposalNonce, summaryBase64, metadata);
   }
@@ -814,7 +869,12 @@ export class Multisig {
       );
 
       if (canConsumeNow) {
-        const noteId = inputNote.id().toString();
+        // Miden 0.15: InputNoteRecord.id() is `NoteId | undefined`; skip id-less records.
+        const id = inputNote.id();
+        if (id === undefined) {
+          continue;
+        }
+        const noteId = id.toString();
         const details = inputNote.details();
         const fungibleAssets = details.assets().fungibleAssets();
 
@@ -911,6 +971,24 @@ export class Multisig {
         throw new Error('Switch GUARDIAN proposal metadata is incomplete after execution');
       }
 
+      // Canonicalize the executed delta on the pre-switch GUARDIAN (clears the
+      // pending proposal). Must run before `this.guardian` is repointed below.
+      // Best-effort: an unreachable old GUARDIAN must not block the switch, so
+      // errors are swallowed (mirrors the Rust execute path).
+      try {
+        const normalizedProposalId = normalizeHexWord(proposal.id);
+        const switchDelta = await this.guardian.getDeltaProposal(
+          this._accountId,
+          normalizedProposalId,
+        );
+        await this.guardian.pushDelta({
+          ...switchDelta,
+          deltaPayload: switchDelta.deltaPayload.txSummary,
+        });
+      } catch {
+        // best-effort; see above
+      }
+
       try {
         const webClient = await this.getRawClient();
         await webClient.syncState();
@@ -939,6 +1017,220 @@ export class Multisig {
     proposal.status = 'finalized';
   }
 
+  /**
+   * Submit an integration-built transaction (advice already injected). Mirrors
+   * the Rust `submit_transaction`; used by the custom proposal producer flow
+   * after `prepareCustomExecution` rebuilds its request with the returned advice.
+   */
+  async submitTransaction(request: TransactionRequest): Promise<void> {
+    await this.midenClient.transactions.submit(AccountId.fromHex(this._accountId), request);
+  }
+
+  /**
+   * Create a proposal from a producer-built transaction the SDK does not model
+   * (issue #266 producer API). `transactionRequestBytes` is a serialized TransactionRequest;
+   * `proposalType` is a free-form, non-empty label that must not collide with a
+   * built-in type. The integration keeps its own recipe to execute later via
+   * `prepareCustomExecution`.
+   */
+  async createCustomProposal(
+    transactionRequestBytes: Uint8Array,
+    proposalType: string,
+    nonce?: number,
+  ): Promise<Proposal> {
+    const label = proposalType.trim().toLowerCase();
+    if (label.length === 0) {
+      throw new Error('proposalType must not be empty');
+    }
+    if (!/^[a-z0-9_]+$/.test(label)) {
+      throw new Error(
+        `proposalType '${label}' must be lowercase snake_case ([a-z0-9_]): no spaces, hyphens, or other characters`,
+      );
+    }
+    if (BUILTIN_PROPOSAL_TYPES.has(label)) {
+      throw new Error(
+        `'${label}' is a built-in proposal type; use the typed proposal API instead`,
+      );
+    }
+
+    const webClient = await this.getRawClient();
+    const request = deserializeTransactionRequest(transactionRequestBytes);
+    const summary = await executeForSummary(webClient, this._accountId, request);
+    const summaryBase64 = uint8ArrayToBase64(summary.serialize());
+    const proposalNonce = nonce ?? Date.now();
+
+    const metadata: ProposalMetadata = {
+      proposalType: 'custom',
+      description: '',
+      rawProposalType: label,
+      requiredSignatures: this.getEffectiveThreshold('custom'),
+    };
+
+    return this.createProposal(proposalNonce, summaryBase64, metadata);
+  }
+
+  /**
+   * Assemble the validated execution advice (cosigner signatures + GUARDIAN
+   * acknowledgment) for a ready custom proposal, so an integration can rebuild
+   * its transaction with its own recipe and submit (issue #266 producer API).
+   *
+   * `transactionRequestBytes` is the serialized transaction request; it is used only to verify
+   * (binding check) that it reproduces the signed commitment, before the
+   * acknowledgment is requested. Returns the advice the integration folds into
+   * its rebuilt transaction (`builder.extendAdviceMap(advice)`).
+   */
+  async prepareCustomExecution(
+    proposalId: string,
+    transactionRequestBytes: Uint8Array,
+  ): Promise<AdviceMap> {
+    const normalizedProposalId = normalizeHexWord(proposalId);
+    const delta = await this.guardian.getDeltaProposal(this._accountId, normalizedProposalId);
+    const existing = this.getLocalProposal(proposalId);
+    const proposal = this.proposalFactory().fromDelta(
+      delta,
+      normalizedProposalId,
+      existing?.metadata,
+      existing?.signatures ?? [],
+    );
+
+    if (proposal.metadata.proposalType !== 'custom') {
+      throw new Error(
+        'prepareCustomExecution is only for custom proposals; use executeProposal for built-in types',
+      );
+    }
+
+    const effectiveThreshold = this.getEffectiveThreshold('custom');
+    const signaturesForExecution = new ProposalSignatures(
+      proposal.signatures,
+      this.signerCommitments,
+      `Invalid proposal signatures for ${proposalId}`,
+    ).entries();
+    if (signaturesForExecution.length < effectiveThreshold) {
+      throw new Error(
+        `Proposal is not ready for execution: have ${signaturesForExecution.length} of ${effectiveThreshold} required signatures.`,
+      );
+    }
+
+    const txSummary = TransactionSummary.deserialize(
+      base64ToUint8Array(delta.deltaPayload.txSummary.data),
+    );
+    const signedCommitmentHex = normalizeHexWord(txSummary.toCommitment().toHex());
+
+    const bindingRequest = deserializeTransactionRequest(transactionRequestBytes);
+
+    const webClient = await this.getRawClient();
+    const derived = await executeForSummary(webClient, this._accountId, bindingRequest);
+    const derivedCommitmentHex = normalizeHexWord(derived.toCommitment().toHex());
+    if (derivedCommitmentHex !== signedCommitmentHex) {
+      throw new Error(
+        `Custom proposal binding mismatch: expected ${signedCommitmentHex}, got ${derivedCommitmentHex}`,
+      );
+    }
+
+    return this.assembleCustomAdvice(
+      proposalId,
+      signaturesForExecution,
+      signedCommitmentHex,
+      delta,
+    );
+  }
+
+  private async assembleCustomAdvice(
+    proposalId: string,
+    signaturesForExecution: ProposalSignatureEntry[],
+    normalizedTxCommitmentHex: string,
+    delta: DeltaObject,
+  ): Promise<AdviceMap> {
+    const normalizedSignerCommitments = new Set(
+      this.signerCommitments.map((commitment) => normalizeHexWord(commitment)),
+    );
+    const adviceMap = new AdviceMap();
+    const adviceMapKeys = new Set<string>();
+    const createTxCommitmentWord = (): Word => Word.fromHex(normalizedTxCommitmentHex);
+
+    for (const cosignerSig of signaturesForExecution) {
+      let signerCommitmentHex = normalizeHexWord(cosignerSig.signerId);
+      const ecdsaPublicKey =
+        cosignerSig.signature.scheme === 'ecdsa' ? cosignerSig.signature.publicKey : undefined;
+
+      if (cosignerSig.signature.scheme === 'ecdsa') {
+        if (!ecdsaPublicKey) {
+          throw new Error(
+            `ECDSA proposal signature for ${signerCommitmentHex} is missing publicKey`,
+          );
+        }
+        const derivedCommitment = tryComputeEcdsaCommitmentHex(ecdsaPublicKey);
+        if (derivedCommitment && derivedCommitment !== signerCommitmentHex) {
+          if (!normalizedSignerCommitments.has(derivedCommitment)) {
+            throw new Error(
+              `ECDSA public key commitment mismatch: derived commitment ${derivedCommitment} is not in signerCommitments.`,
+            );
+          }
+          signerCommitmentHex = derivedCommitment;
+        }
+      }
+
+      const signerCommitment = Word.fromHex(signerCommitmentHex);
+      const sigBytes = signatureHexToBytes(
+        cosignerSig.signature.signature,
+        cosignerSig.signature.scheme,
+      );
+      const signature = Signature.deserialize(sigBytes);
+      const { key, values } = buildSignatureAdviceEntry(
+        signerCommitment,
+        createTxCommitmentWord(),
+        signature,
+        ecdsaPublicKey,
+        cosignerSig.signature.scheme === 'ecdsa' ? cosignerSig.signature.signature : undefined,
+      );
+      const keyHex = normalizeHexWord(key.toHex());
+      if (adviceMapKeys.has(keyHex)) {
+        throw new Error(`Duplicate advice-map key detected for proposal ${proposalId}`);
+      }
+      adviceMapKeys.add(keyHex);
+      adviceMap.insert(key, new FeltArray(values));
+    }
+
+    const executionDelta = { ...delta, deltaPayload: delta.deltaPayload.txSummary };
+    const pushResult = await this.guardian.pushDelta(executionDelta);
+    const ackSigHex = pushResult.ackSig;
+    if (!ackSigHex) {
+      throw new Error('GUARDIAN did not return acknowledgment signature');
+    }
+
+    const guardianCommitment = Word.fromHex(normalizeHexWord(this.guardianCommitment));
+    const ackScheme = (pushResult.ackScheme as 'ecdsa' | 'falcon') || this.signer.scheme;
+    const ackPubkey = pushResult.ackPubkey || this.guardianPublicKey;
+    if (ackScheme === 'ecdsa' && !ackPubkey) {
+      throw new Error('GUARDIAN acknowledgment is missing ECDSA public key');
+    }
+    if (ackScheme === 'ecdsa' && ackPubkey) {
+      const derivedCommitment = tryComputeEcdsaCommitmentHex(ackPubkey);
+      if (derivedCommitment && derivedCommitment !== normalizeHexWord(this.guardianCommitment)) {
+        throw new Error('GUARDIAN public key commitment mismatch');
+      }
+    }
+    const ackSigBytes = signatureHexToBytes(ackSigHex, ackScheme);
+    const ackSignature = Signature.deserialize(ackSigBytes);
+    const { key: ackKey, values: ackValues } = buildSignatureAdviceEntry(
+      guardianCommitment,
+      createTxCommitmentWord(),
+      ackSignature,
+      ackScheme === 'ecdsa' ? ackPubkey : undefined,
+      ackScheme === 'ecdsa' ? ackSigHex : undefined,
+    );
+    const ackKeyHex = normalizeHexWord(ackKey.toHex());
+    if (adviceMapKeys.has(ackKeyHex)) {
+      throw new Error(
+        `Duplicate advice-map key detected for GUARDIAN acknowledgment in proposal ${proposalId}`,
+      );
+    }
+    adviceMapKeys.add(ackKeyHex);
+    adviceMap.insert(ackKey, new FeltArray(ackValues));
+
+    return adviceMap;
+  }
+
   private getLocalProposal(proposalId: string): Proposal | undefined {
     const normalizedProposalId = normalizeHexWord(proposalId);
     return this.proposals.get(proposalId) ?? this.proposals.get(normalizedProposalId);
@@ -956,6 +1248,15 @@ export class Multisig {
     await this.verifyProposalMetadataBinding(proposal);
 
     const metadata = proposal.metadata;
+    // Reject custom proposals before any advice assembly or GUARDIAN ack push:
+    // the SDK cannot rebuild an opaque custom transaction, and the rejection
+    // must stay side-effect free (mirrors the Rust early guard in execute_proposal).
+    if (metadata.proposalType === 'custom') {
+      throw new Error(
+        'Cannot execute a custom proposal via executeProposal; use prepareCustomExecution to ' +
+          'get the cosigner + GUARDIAN advice, then submitTransaction with your rebuilt request (issue #266).',
+      );
+    }
     const effectiveThreshold = this.getEffectiveThreshold(metadata.proposalType);
     const signatureContext = `Invalid proposal signatures for ${proposalId}`;
     const signaturesForExecution = new ProposalSignatures(
@@ -1261,8 +1562,22 @@ export class Multisig {
 
   private async verifyProposalMetadataBinding(proposal: Proposal): Promise<string> {
     const txSummaryCommitment = this.ensureProposalCommitmentMatchesSummary(proposal);
-    if (proposal.metadata.proposalType === 'unknown') {
-      throw new Error(`Cannot verify proposal metadata for unknown proposal type: ${proposal.id}`);
+    if (proposal.metadata.proposalType === 'custom') {
+      // Custom proposals (issue #266) have no per-type reconstruction recipe;
+      // the id ↔ tx_summary commitment match above is the only available
+      // integrity guarantee for an opaque proposal.
+      return txSummaryCommitment;
+    }
+
+    if (proposal.metadata.proposalType === 'switch_guardian') {
+      // Exempt from binding re-execution (mirrors the `custom` exemption above).
+      // The WASM `executeForSummary` leaves the guardian-disabling side effect
+      // applied to the in-session account, so re-execution reconstructs a smaller
+      // delta and falsely rejects with "metadata does not match tx_summary". The
+      // native Rust client does not mutate, so this is an intentional divergence.
+      // The id ↔ tx_summary match above plus `verifyGuardianEndpointCommitment`
+      // at propose/execute time still bind the proposal.
+      return txSummaryCommitment;
     }
 
     const summary = TransactionSummary.deserialize(base64ToUint8Array(proposal.txSummary));
@@ -1319,12 +1634,48 @@ export class Multisig {
         return request;
       }
       case 'consume_notes': {
-        const { request } = await buildConsumeNotesTransactionRequest(
-          webClient,
-          metadata.noteIds,
-          { salt, signatureAdviceMap }
-        );
-        return request;
+        // v1/v2 dispatch for issue #229 / FR-009.
+        const version = metadata.metadataVersion;
+        if (version === CONSUME_NOTES_METADATA_VERSION_V2) {
+          const embedded = metadata.notes ?? [];
+          if (embedded.length !== metadata.noteIds.length) {
+            throw new NoteBindingMismatchError(
+              `consume_notes v2: notes.length=${embedded.length} does not match noteIds.length=${metadata.noteIds.length}`,
+            );
+          }
+          const decoded: Note[] = [];
+          for (let i = 0; i < embedded.length; i++) {
+            const note = noteFromBase64(embedded[i], Note);
+            // Normalize both sides; matches the file's other hex comparisons.
+            const embeddedId = normalizeHexWord(note.id().toString());
+            const declaredId = normalizeHexWord(metadata.noteIds[i]);
+            if (embeddedId !== declaredId) {
+              throw new NoteBindingMismatchError(
+                `consume_notes v2: notes[${i}] id ${embeddedId} != noteIds[${i}] ${declaredId}`,
+              );
+            }
+            decoded.push(note);
+          }
+          const { request } = buildConsumeNotesTransactionRequestFromNotes(decoded, {
+            salt,
+            signatureAdviceMap,
+          });
+          return request;
+        }
+        if (version === undefined || version === 1) {
+          if (!LEGACY_CONSUME_NOTES_ENABLED) {
+            // Preserve explicit `1` vs absent so the error tells the
+            // operator which legacy shape was rejected.
+            throw new UnsupportedMetadataVersionError(version);
+          }
+          const { request } = await buildConsumeNotesTransactionRequest(
+            webClient,
+            metadata.noteIds,
+            { salt, signatureAdviceMap },
+          );
+          return request;
+        }
+        throw new UnsupportedMetadataVersionError(version);
       }
       case 'p2id': {
         const { request } = buildP2idTransactionRequest(
@@ -1336,8 +1687,10 @@ export class Multisig {
         );
         return request;
       }
-      case 'unknown':
-        throw new Error('Unsupported proposal type: unknown');
+      case 'custom':
+        throw new Error(
+          `Cannot build a transaction for a custom proposal type: ${metadata.rawProposalType ?? 'custom'}`,
+        );
     }
   }
 

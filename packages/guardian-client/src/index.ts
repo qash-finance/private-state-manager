@@ -18,8 +18,11 @@ export type {
   ConfigureRequest,
   ConfigureResponse,
   PubkeyResponse,
+  StatusResponse,
   DeltaProposalRequest,
   DeltaProposalResponse,
   ProposalsResponse,
   SignProposalRequest,
+  LookupAccount,
+  LookupResponse,
 } from './types.js';

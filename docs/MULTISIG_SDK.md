@@ -2,6 +2,11 @@
 
 An SDK for creating and managing multisignature accounts on the Miden network. Available for both **TypeScript** (web/browser) and **Rust** (native/server) environments.
 
+> New to Guardian? Read [`docs/CONCEPTS.md`](./CONCEPTS.md) for the trust
+> model and state/delta lifecycle, and
+> [`docs/architecture/services.md`](./architecture/services.md) for the
+> server-side surface this SDK targets.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
@@ -10,8 +15,6 @@ An SDK for creating and managing multisignature accounts on the Miden network. A
 - [Rust SDK Guide](#rust-sdk-guide)
 - [Use Cases](#use-cases)
 - [Offline Workflow](#offline-workflow)
-- [Error Handling](#error-handling)
-- [Security Best Practices](#security-best-practices)
 - [Releasing](#releasing)
 
 ---
@@ -30,8 +33,8 @@ npm install @openzeppelin/miden-multisig-client @miden-sdk/miden-sdk
 **Rust (Cargo.toml)**
 ```toml
 [dependencies]
-miden-multisig-client = "0.14.3"
-miden-client = "0.14.3"
+miden-multisig-client = "0.15.0"
+miden-client = "0.15.0"
 ```
 
 ### 5-Minute Example
@@ -171,6 +174,72 @@ GUARDIAN is a coordination server that:
 - **Ready**: Threshold met, can be executed
 - **Finalized**: Executed on-chain or discarded
 
+### Custom Proposal Types
+
+Guardian accepts any non-empty `proposal_type`, not just the first-party
+operations (issue #266). A proposal whose type the SDK does not model is
+exposed as the **custom** bucket — `TransactionType::Custom` in Rust,
+`proposalType: 'custom'` in TypeScript — while the label is preserved
+(Rust `ProposalMetadata.proposal_type`, TypeScript `CustomProposalMetadata.rawProposalType`)
+so it can be displayed. The SDK normalizes the label to lowercase `snake_case`
+(trim + lowercase, then require `[a-z0-9_]+` — the same shape as built-in
+labels), so `b2agg` is accepted, `B2Agg` is lowercased to `b2agg`, and
+`add signer` / `add-signer` are rejected. (Normalization is SDK-side; the server
+itself still accepts any non-empty string.)
+
+Custom proposals can be listed, displayed, signed, and exported/imported.
+
+**Producer API (issue #266).** The integration that owns a custom type builds
+its own transaction and drives the create + execute ends; the SDK never
+executes a transaction it does not understand. The model is **symmetric across
+Rust and TypeScript**:
+
+- **Create** — `propose_custom_transaction(transaction_request_bytes, proposal_type)` (Rust) /
+  `createCustomProposal(transactionRequestBytes, proposalType)` (TS). The bytes are a
+  serialized transaction request; the SDK derives the summary and pushes the
+  proposal with the custom label. They are **not** stored on the server.
+  Cosigners then review and sign through the normal flow.
+- **Execute** — `prepare_custom_execution(proposal_id, transaction_request_bytes)` (Rust) /
+  `prepareCustomExecution(proposalId, transactionRequestBytes)` (TS). The SDK verifies the
+  proposal is ready, binding-checks the request against the signed commitment
+  (before any acknowledgment request), fetches the GUARDIAN ack, and returns the
+  **advice** (cosigner signatures + ack). The integration injects that advice
+  into its own transaction and submits via its own client:
+
+  ```ts
+  // TypeScript: rebuild via the integration's builder (the wasm request is immutable)
+  const advice = await multisig.prepareCustomExecution(proposalId, transactionRequestBytes);
+  const finalReq = myBuilder.extendAdviceMap(advice).build();
+  await multisig.submitTransaction(finalReq);
+  ```
+  ```rust
+  // Rust: inject into the request's advice map, submit via the SDK helper
+  let advice = client.prepare_custom_execution(&proposal_id, &transaction_request_bytes).await?;
+  let mut req = deserialize_transaction_request(&transaction_request_bytes)?;
+  req.advice_map_mut().extend(advice);
+  client.submit_transaction(req).await?;
+  ```
+
+The SDK owns the security-critical pieces (binding check, signature + ack
+assembly, ack-after-binding ordering); the integration owns only the
+transaction recipe + submit. `execute_proposal` on a custom type returns a
+clear error pointing to `prepare_custom_execution`. Because the integration must
+rebuild its transaction to execute, **custom execution is performed by a party
+that holds the recipe** (typically the producer), not by an arbitrary cosigner.
+
+The returned advice is keyed by the signer and GUARDIAN commitments
+(domain-separated digests over the signed `tx_summary`), the same keys the
+SDK's own built-in execution uses. Extending a transaction's advice map with it
+therefore does not collide with the transaction's ordinary inputs; the
+integration extends rather than replaces its advice map.
+
+> **Security:** for first-party types the SDK reconstructs the transaction from
+> metadata and checks it against the signed `tx_summary` commitment. For custom
+> types there is no such reconstruction, so the SDK cannot verify that display
+> metadata (e.g. `description`) matches what the transaction actually does.
+> Cosigners must verify the raw `tx_summary` they are signing — not trust the
+> label or description.
+
 ### Offline Workflow
 
 For air-gapped or offline signing scenarios:
@@ -267,6 +336,36 @@ console.log('Threshold:', detected.threshold);
 console.log('Signers:', detected.signerCommitments);
 console.log('Vault balances:', detected.vaultBalances);
 ```
+
+### Recovering Accounts By Key
+
+Use `recoverByKey` when a wallet has a signing key from an account's
+authorization set but does not know the account ID yet. The helper queries
+Guardian's `/state/lookup` endpoint with proof-of-possession of the key,
+fetches state for each matching account, and returns `(accountId, state)`
+pairs.
+
+```typescript
+const recovered = await client.recoverByKey(signer);
+
+if (recovered.length === 0) {
+  console.log('No account on this Guardian authorizes this key');
+}
+
+for (const { accountId, state } of recovered) {
+  console.log('Recovered account:', accountId);
+  console.log('State commitment:', state.commitment);
+
+  const multisig = await client.load(accountId, signer);
+  // Continue with normal proposal or sync flows.
+}
+```
+
+The signer passed to `recoverByKey` must implement `signLookupMessage`. The
+bundled `FalconSigner`, `EcdsaSigner`, Miden Wallet signer, and Para signer
+support it. Multiple matches are valid: the same key commitment may authorize
+more than one account, and the method returns all matches instead of choosing
+one implicitly.
 
 ### Proposal Operations
 
@@ -375,6 +474,7 @@ await multisig.executeProposal(signedProposal.id);
 |--------|-------------|
 | `create(config, signer)` | Create new multisig account |
 | `load(accountId, signer)` | Load existing account from GUARDIAN |
+| `recoverByKey(signer)` | Discover accounts that authorize the signer's key and fetch each current state |
 | `guardianClient` | Access to underlying GUARDIAN HTTP client |
 
 #### Multisig
@@ -409,6 +509,7 @@ await multisig.executeProposal(signedProposal.id);
 | `publicKey` | Serialized public key (hex) |
 | `signRequest(id, timestamp, requestPayload)` | Sign account ID + timestamp + request payload digest for auth |
 | `signCommitment(hex)` | Sign commitment/word |
+| `signLookupMessage(timestamp, keyCommitment)` | Sign account-less lookup digest for `recoverByKey` |
 
 #### AccountInspector
 
@@ -485,6 +586,34 @@ println!("Threshold: {}", account.threshold()?);
 println!("Nonce: {}", account.nonce());
 println!("GUARDIAN enabled: {}", account.guardian_enabled()?);
 ```
+
+### Recovering Accounts By Key
+
+Use `recover_by_key` when the configured signer is known but the account ID is
+not. The client signs a lookup-bound authentication message, asks Guardian for
+accounts that authorize the signer's commitment, fetches state for each match,
+and returns `RecoveredAccount` values.
+
+```rust
+let recovered = client.recover_by_key().await?;
+
+if recovered.is_empty() {
+    println!("No account on this Guardian authorizes this key");
+}
+
+for entry in recovered {
+    println!("Recovered account: {}", entry.account_id);
+    println!("State commitment: {}", entry.state.commitment);
+
+    let account_id = AccountId::from_hex(&entry.account_id)?;
+    client.pull_account(account_id).await?;
+    // Continue with normal proposal or sync flows.
+}
+```
+
+An empty list means the key is valid but this Guardian has no account metadata
+that authorizes its commitment. Authentication failures, malformed lookup
+responses, and per-account `get_state` failures are returned as errors.
 
 ### Transaction Types
 
@@ -612,6 +741,7 @@ for note in notes {
 | `account_id()` | Get account ID (Option) |
 | `user_commitment()` | Get user's key commitment |
 | `user_commitment_hex()` | Get commitment as hex |
+| `recover_by_key()` | Discover accounts that authorize the configured signer and fetch each current state |
 | `propose_transaction(tx)` | Create and submit proposal |
 | `propose_with_fallback(tx)` | Online or offline proposal |
 | `list_proposals()` | List pending proposals |
@@ -717,7 +847,7 @@ let proposal = client.propose_transaction(tx).await?;
 client.execute_proposal(&proposal.id).await?;
 ```
 
-### Use Case 4: Note Consumption
+### Use Case 3: Note Consumption
 
 Claiming tokens sent to the multisig.
 
@@ -814,13 +944,14 @@ console.log('Notes consumed, funds now in vault');
 
 | SDK Version | miden-client | miden-sdk (npm) | Notes |
 |-------------|--------------|-----------------|-------|
+| 0.15.x | 0.15.0 | ^0.15.0 | Miden 0.15 protocol; v1 account IDs, bech32m addresses |
 | 0.14.x | 0.14.x | ^0.14.0 | Devnet default, MidenClient public API |
 | 0.13.x | 0.13.0 | ^0.13.0 | ECDSA support, wallet signers |
 | 0.12.x | 0.12.5 | ^0.12.5 | Initial release |
 
 ### Breaking Changes
 
-Check the [CHANGELOG](../CHANGELOG.md) for breaking changes between versions.
+Check the [GitHub release notes](https://github.com/OpenZeppelin/guardian/releases) for breaking changes between versions.
 
 ---
 
@@ -839,6 +970,7 @@ cargo test -p guardian-server --lib
 
 # TypeScript
 cd packages/guardian-client && npm test
+cd packages/guardian-evm-client && npm test
 cd packages/miden-multisig-client && npm test
 ```
 
@@ -846,6 +978,7 @@ cd packages/miden-multisig-client && npm test
 
 ```bash
 cd packages/guardian-client && npm run build
+cd packages/guardian-evm-client && npm run build
 cd packages/miden-multisig-client && npm run build
 ```
 
@@ -862,6 +995,7 @@ Update the version in these files:
 | `crates/client/Cargo.toml` | `guardian-shared` dep version | - |
 | `crates/miden-multisig-client/Cargo.toml` | `guardian-client`, `guardian-shared`, `miden-confidential-contracts` dep versions | - |
 | `packages/guardian-client/package.json` | `version` | - |
+| `packages/guardian-evm-client/package.json` | `version` | - |
 | `packages/miden-multisig-client/package.json` | `version` + `@openzeppelin/guardian-client` dep version | - |
 
 The `server`, `miden-rpc-client`, `miden-keystore`, and example crates have their own independent versions and are not published.
@@ -889,12 +1023,14 @@ Wait for each step to finish before proceeding to the next (crates.io index need
 Publish in dependency order:
 
 ```bash
-# 1. Build both packages
+# 1. Build TypeScript packages
 cd packages/guardian-client && npm run build
+cd packages/guardian-evm-client && npm run build
 cd packages/miden-multisig-client && npm run build
 
-# 2. Publish guardian-client first (no internal deps)
+# 2. Publish base clients first (no internal deps)
 cd packages/guardian-client && npm publish --access public
+cd packages/guardian-evm-client && npm publish --access public
 
 # 3. Publish miden-multisig-client (depends on guardian-client)
 cd packages/miden-multisig-client && npm publish --access public
@@ -905,8 +1041,8 @@ cd packages/miden-multisig-client && npm publish --access public
 1. Tag the release:
 
 ```bash
-git tag v0.14.0
-git push origin v0.14.0
+git tag v0.15.0
+git push origin v0.15.0
 ```
 
 2. Create a GitHub release from the tag with release notes.

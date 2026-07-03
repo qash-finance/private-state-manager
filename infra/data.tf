@@ -7,8 +7,13 @@ data "aws_secretsmanager_secret" "ack_falcon" {
 }
 
 data "aws_secretsmanager_secret" "ack_ecdsa" {
-  count = var.deployment_stage == "prod" ? 1 : 0
+  count = var.deployment_stage == "prod" && var.guardian_ack_ecdsa_kms_key_arn == "" ? 1 : 0
   name  = local.ack_ecdsa_secret_name
+}
+
+data "aws_secretsmanager_secret" "storage_encryption" {
+  count = local.managed_storage_encryption_enabled ? 1 : 0
+  name  = local.storage_encryption_secret_name
 }
 
 # Get default VPC if vpc_id is not specified
@@ -25,6 +30,12 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [local.vpc_id]
   }
+}
+
+data "aws_subnet" "selected" {
+  for_each = toset(length(var.subnet_ids) > 0 ? var.subnet_ids : data.aws_subnets.default[0].ids)
+
+  id = each.value
 }
 
 data "aws_vpc" "selected" {
@@ -47,6 +58,12 @@ locals {
   vpc_cidr   = data.aws_vpc.selected.cidr_block
   is_prod    = var.deployment_stage == "prod"
   stage_name = var.deployment_stage
+  subnet_ids_by_zone_id = {
+    for subnet_id in local.subnet_ids : data.aws_subnet.selected[subnet_id].availability_zone_id => subnet_id...
+  }
+  load_balancer_subnet_ids = sort([
+    for zone_id, subnet_ids in local.subnet_ids_by_zone_id : sort(subnet_ids)[0]
+  ])
   unsupported_rds_proxy_zone_ids_by_region = {
     us-east-1 = ["use1-az3"]
     us-west-1 = ["usw1-az2"]
@@ -86,13 +103,18 @@ locals {
   rds_subnet_group_name                        = "${var.stack_name}-postgres-subnets"
   database_secret_name                         = "${var.stack_name}/server/database-url"
   database_credentials_secret_name             = "${var.stack_name}/server/database-credentials"
-  ack_falcon_secret_name                       = "guardian-prod/server/ack-falcon-secret-key"
-  ack_ecdsa_secret_name                        = "guardian-prod/server/ack-ecdsa-secret-key"
+  operator_public_keys_secret_name             = "${var.stack_name}/server/operator-public-keys"
+  evm_allowed_chain_ids_secret_name            = "${var.stack_name}/server/evm-allowed-chain-ids"
+  evm_rpc_urls_secret_name                     = "${var.stack_name}/server/evm-rpc-urls"
+  ack_falcon_secret_name                       = var.guardian_ack_falcon_secret_name != "" ? var.guardian_ack_falcon_secret_name : "${var.stack_name}/server/ack-falcon-secret-key"
+  ack_ecdsa_secret_name                        = var.guardian_ack_ecdsa_secret_name != "" ? var.guardian_ack_ecdsa_secret_name : "${var.stack_name}/server/ack-ecdsa-secret-key"
+  managed_storage_encryption_enabled           = local.is_prod && var.guardian_storage_encryption_secret_name != ""
+  storage_encryption_secret_name               = local.managed_storage_encryption_enabled ? var.guardian_storage_encryption_secret_name : ""
   rds_proxy_name                               = "${var.stack_name}-postgres-proxy"
   rds_proxy_role_name                          = "${var.stack_name}-rds-proxy"
   rds_proxy_security_group_name                = "${var.stack_name}-rds-proxy-sg"
   rds_master_password                          = var.postgres_password != "" ? var.postgres_password : random_password.postgres[0].result
-  effective_rds_instance_class                 = var.rds_instance_class != "" ? var.rds_instance_class : (local.is_prod ? "db.t3.medium" : "db.t3.micro")
+  effective_rds_instance_class                 = var.rds_instance_class != "" ? var.rds_instance_class : (local.is_prod ? "db.r6g.large" : "db.t3.micro")
   effective_rds_allocated_storage              = var.rds_allocated_storage != null ? var.rds_allocated_storage : (local.is_prod ? 50 : 20)
   effective_server_desired_count               = var.server_desired_count != null ? var.server_desired_count : (local.is_prod ? 2 : 1)
   effective_server_autoscaling_enabled         = var.server_autoscaling_enabled != null ? var.server_autoscaling_enabled : local.is_prod
@@ -108,12 +130,23 @@ locals {
   effective_guardian_rate_per_min              = var.guardian_rate_per_min != null ? var.guardian_rate_per_min : (local.is_prod ? 5000 : 60)
   effective_guardian_db_pool_max_size          = var.guardian_db_pool_max_size != null ? var.guardian_db_pool_max_size : (local.is_prod ? 32 : 16)
   effective_guardian_metadata_db_pool_max_size = var.guardian_metadata_db_pool_max_size != null ? var.guardian_metadata_db_pool_max_size : local.effective_guardian_db_pool_max_size
+  managed_evm_allowed_chain_ids_secret_enabled = var.guardian_evm_allowed_chain_ids_secret_arn == "" && var.guardian_evm_allowed_chain_ids != ""
+  evm_allowed_chain_ids_secret_arn             = var.guardian_evm_allowed_chain_ids_secret_arn != "" ? var.guardian_evm_allowed_chain_ids_secret_arn : (local.managed_evm_allowed_chain_ids_secret_enabled ? aws_secretsmanager_secret.evm_allowed_chain_ids[0].arn : "")
+  managed_evm_rpc_urls_secret_enabled          = var.guardian_evm_rpc_urls_secret_arn == "" && var.guardian_evm_rpc_urls != ""
+  evm_rpc_urls_secret_arn                      = var.guardian_evm_rpc_urls_secret_arn != "" ? var.guardian_evm_rpc_urls_secret_arn : (local.managed_evm_rpc_urls_secret_enabled ? aws_secretsmanager_secret.evm_rpc_urls[0].arn : "")
+  managed_operator_public_keys_secret_enabled  = var.guardian_operator_public_keys_secret_arn == "" && length(var.guardian_operator_public_keys) > 0
+  operator_public_keys_secret_arn              = var.guardian_operator_public_keys_secret_arn != "" ? var.guardian_operator_public_keys_secret_arn : (local.managed_operator_public_keys_secret_enabled ? aws_secretsmanager_secret.operator_public_keys[0].arn : "")
 
   direct_database_endpoint = aws_db_instance.postgres.address
   database_proxy_endpoint  = local.effective_rds_proxy_enabled ? aws_db_proxy.postgres[0].endpoint : ""
   database_endpoint        = local.effective_rds_proxy_route_database_url ? local.database_proxy_endpoint : local.direct_database_endpoint
 
-  database_url = "postgres://${urlencode(local.postgres_user)}:${urlencode(local.rds_master_password)}@${local.database_endpoint}:${local.postgres_port}/${local.postgres_db}?sslmode=require"
+  ca_bundle_enabled        = var.rds_ca_bundle_secret_arn != ""
+  ca_bundle_volume_name    = "guardian-db-ca"
+  ca_bundle_mount_dir      = "/etc/guardian/tls"
+  ca_bundle_container_path = "${local.ca_bundle_mount_dir}/rds-combined-ca.pem"
+  database_sslparams       = local.ca_bundle_enabled ? "sslmode=verify-full&sslrootcert=${local.ca_bundle_container_path}" : "sslmode=require"
+  database_url             = "postgres://${urlencode(local.postgres_user)}:${urlencode(local.rds_master_password)}@${local.database_endpoint}:${local.postgres_port}/${local.postgres_db}?${local.database_sslparams}"
 
   # Custom domain configuration
   domain_enabled      = var.domain_name != ""

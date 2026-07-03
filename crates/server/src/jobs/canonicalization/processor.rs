@@ -14,6 +14,15 @@ pub trait Processor: Send + Sync {
     async fn process_account(&self, account_id: &str) -> Result<()>;
 }
 
+/// Record one candidate-processing outcome.
+fn record_candidate_outcome(outcome: crate::metrics::labels::CandidateOutcome) {
+    metrics::counter!(
+        crate::metrics::names::CANONICALIZATION_CANDIDATES_TOTAL,
+        crate::metrics::names::LABEL_OUTCOME => outcome.as_str()
+    )
+    .increment(1);
+}
+
 fn get_candidates(deltas: &[DeltaObject]) -> Vec<DeltaObject> {
     let mut candidates: Vec<DeltaObject> = deltas
         .iter()
@@ -173,6 +182,9 @@ impl DeltasProcessorBase {
                         error = %e,
                         "Delta verification failed during submission grace period; will retry without consuming retry budget"
                     );
+                    record_candidate_outcome(
+                        crate::metrics::labels::CandidateOutcome::GraceDeferred,
+                    );
 
                     return Ok(());
                 }
@@ -197,6 +209,53 @@ impl DeltasProcessorBase {
                         .map_err(|e| {
                             GuardianError::StorageError(format!("Failed to delete delta: {e}"))
                         })?;
+                    record_candidate_outcome(crate::metrics::labels::CandidateOutcome::Discarded);
+
+                    // A discarded candidate can never be canonicalized, so delete its proposal:
+                    // leaving it would strand it as `pending` forever and let clients re-submit a
+                    // stale intent.
+                    let proposal_id = {
+                        let client = self.state.network_client.lock().await;
+                        match client.delta_proposal_id(
+                            &delta.account_id,
+                            delta.nonce,
+                            &delta.delta_payload,
+                        ) {
+                            Ok(id) => Some(id),
+                            Err(e) => {
+                                tracing::warn!(
+                                    account_id = %delta.account_id,
+                                    nonce = delta.nonce,
+                                    error = %e,
+                                    "Could not derive proposal id for discarded delta; \
+                                     its proposal may remain stranded as pending"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    if let Some(ref id) = proposal_id
+                        && let Ok(_existing_proposal) = storage_backend
+                            .pull_delta_proposal(&delta.account_id, id)
+                            .await
+                    {
+                        tracing::warn!(
+                            account_id = %delta.account_id,
+                            proposal_id = %id,
+                            "Deleting matching proposal as its delta was discarded"
+                        );
+                        if let Err(e) = storage_backend
+                            .delete_delta_proposal(&delta.account_id, id)
+                            .await
+                        {
+                            tracing::warn!(
+                                account_id = %delta.account_id,
+                                proposal_id = %id,
+                                error = %e,
+                                "Failed to delete proposal after discard, but continuing"
+                            );
+                        }
+                    }
 
                     // Clear the pending candidate flag after discard
                     if let Err(e) = self
@@ -231,6 +290,9 @@ impl DeltasProcessorBase {
                                 "Failed to update delta status: {e}"
                             ))
                         })?;
+                    record_candidate_outcome(crate::metrics::labels::CandidateOutcome::Retried);
+                    metrics::counter!(crate::metrics::names::CANONICALIZATION_RETRIES_TOTAL)
+                        .increment(1);
                 }
 
                 Ok(())
@@ -313,6 +375,8 @@ impl DeltasProcessorBase {
             );
         }
 
+        // The typed `metadata` blob is populated at push time; this
+        // path just flips the status.
         let mut canonical_delta = delta.clone();
         canonical_delta.status = DeltaStatus::canonical(now.clone());
 
@@ -337,7 +401,6 @@ impl DeltasProcessorBase {
                 GuardianError::StorageError(format!("Failed to update metadata: {e}"))
             })?;
 
-        // Delete matching proposal now that delta is canonical
         let proposal_id = {
             let client = self.state.network_client.lock().await;
             client
@@ -355,6 +418,17 @@ impl DeltasProcessorBase {
                 proposal_id = %id,
                 "Deleting matching proposal as delta is now canonical"
             );
+            // The proposal is finalized the moment its delta became
+            // canonical with a matching proposal found — the delete
+            // below is cleanup, so the event counts regardless of the
+            // delete outcome (failures stay visible via
+            // storage_operations_total{operation="delete_delta_proposal"}).
+            metrics::counter!(
+                crate::metrics::names::PROPOSALS_TOTAL,
+                crate::metrics::names::LABEL_EVENT =>
+                    crate::metrics::labels::ProposalEvent::Finalized.as_str()
+            )
+            .increment(1);
             if let Err(e) = storage_backend
                 .delete_delta_proposal(&delta.account_id, id)
                 .await
@@ -368,6 +442,7 @@ impl DeltasProcessorBase {
             }
         }
 
+        record_candidate_outcome(crate::metrics::labels::CandidateOutcome::Canonicalized);
         Ok(())
     }
 }
@@ -445,10 +520,13 @@ mod tests {
             auth: Auth::MidenFalconRpo {
                 cosigner_commitments: vec![],
             },
+            network_config: crate::metadata::NetworkConfig::miden_default(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             has_pending_candidate: true,
             last_auth_timestamp: None,
+            paused_at: None,
+            paused_reason: None,
         }
     }
 
@@ -474,6 +552,7 @@ mod tests {
             ack_pubkey: String::new(),
             ack_scheme: String::new(),
             status: DeltaStatus::candidate("2024-01-01T00:00:00Z".to_string()),
+            metadata: None,
         }
     }
 
@@ -488,6 +567,7 @@ mod tests {
             ack_pubkey: String::new(),
             ack_scheme: String::new(),
             status: DeltaStatus::canonical("2024-01-01T00:00:00Z".to_string()),
+            metadata: None,
         }
     }
 

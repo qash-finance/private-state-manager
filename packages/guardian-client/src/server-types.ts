@@ -31,7 +31,10 @@ export type ServerProposalType =
   | 'switch_guardian'
   | 'consume_notes'
   | 'p2id'
-  | 'custom';
+  | 'custom'
+  // The server accepts arbitrary proposal types (issue #266); known literals are
+  // kept for autocomplete while `(string & {})` admits any custom label.
+  | (string & {});
 
 export interface ServerProposalMetadata {
   proposal_type?: ServerProposalType;
@@ -44,6 +47,10 @@ export interface ServerProposalMetadata {
   new_guardian_pubkey?: string;
   new_guardian_endpoint?: string;
   note_ids?: string[];
+  /** consume_notes metadata version (issue #229). Absent => v1. */
+  consume_notes_metadata_version?: number;
+  /** v2 embedded notes (base64), index-aligned with `note_ids`. */
+  consume_notes_notes?: string[];
   recipient_id?: string;
   faucet_id?: string;
   amount?: string;
@@ -139,4 +146,21 @@ export interface ServerSignProposalRequest {
 export interface ServerPubkeyResponse {
   commitment: string;
   pubkey?: string;
+}
+
+export interface ServerStatusResponse {
+  status: string;
+  version: string;
+  git_commit: string;
+  environment: string;
+  started_at: string;
+  uptime_seconds: number;
+}
+
+export interface ServerLookupAccount {
+  account_id: string;
+}
+
+export interface ServerLookupResponse {
+  accounts: ServerLookupAccount[];
 }

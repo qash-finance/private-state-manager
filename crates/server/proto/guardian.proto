@@ -33,6 +33,12 @@ service Guardian {
 
   // Sign a delta proposal
   rpc SignDeltaProposal(SignDeltaProposalRequest) returns (SignDeltaProposalResponse);
+
+  // Resolve a public-key commitment to the set of account IDs whose
+  // authorization set contains it. Authentication is by proof-of-possession
+  // against the queried commitment, using the lookup-bound signing primitive
+  // (LookupAuthMessage) — distinct from the per-account request-signing format.
+  rpc GetAccountByKeyCommitment(GetAccountByKeyCommitmentRequest) returns (GetAccountByKeyCommitmentResponse);
 }
 
 // Auth configuration - one of the auth types
@@ -40,6 +46,7 @@ message AuthConfig {
   oneof auth_type {
     MidenFalconRpoAuth miden_falcon_rpo = 1;
     MidenEcdsaAuth miden_ecdsa = 2;
+    EvmEcdsaAuth evm_ecdsa = 3;
   }
 }
 
@@ -53,11 +60,38 @@ message MidenEcdsaAuth {
   repeated string cosigner_commitments = 1;
 }
 
+// EVM ECDSA authentication config
+message EvmEcdsaAuth {
+  repeated string signers = 1;
+}
+
+// Per-account network configuration
+message NetworkConfig {
+  oneof network_type {
+    MidenNetworkConfig miden = 1;
+    EvmNetworkConfig evm = 2;
+  }
+}
+
+// Miden account network config
+message MidenNetworkConfig {
+  string network_type = 1; // "local", "devnet", or "testnet"
+}
+
+// EVM account network config
+message EvmNetworkConfig {
+  uint64 chain_id = 1;
+  string account_address = 2;
+  string multisig_validator_address = 3;
+  reserved 4;
+}
+
 // Configure request
 message ConfigureRequest {
   string account_id = 1;
   AuthConfig auth = 2;
   string initial_state = 3; // JSON string
+  NetworkConfig network_config = 4;
 }
 
 message ConfigureResponse {
@@ -65,6 +99,7 @@ message ConfigureResponse {
   string message = 2;
   string ack_pubkey = 3;
   string ack_commitment = 4;
+  string error_code = 5;
 }
 
 // Push delta request
@@ -80,6 +115,7 @@ message PushDeltaResponse {
   string message = 2;
   DeltaObject delta = 3;
   optional string ack_sig = 4;
+  string error_code = 5;
 }
 
 // Get delta request
@@ -92,6 +128,7 @@ message GetDeltaResponse {
   bool success = 1;
   string message = 2;
   DeltaObject delta = 3;
+  string error_code = 4;
 }
 
 // Get delta since request
@@ -104,6 +141,7 @@ message GetDeltaSinceResponse {
   bool success = 1;
   string message = 2;
   DeltaObject merged_delta = 3;
+  string error_code = 4;
 }
 
 // Get state request
@@ -115,6 +153,7 @@ message GetStateResponse {
   bool success = 1;
   string message = 2;
   AccountState state = 3;
+  string error_code = 4;
 }
 
 // Delta status
@@ -196,6 +235,7 @@ message PushDeltaProposalResponse {
   string message = 2;
   DeltaObject delta = 3;
   string commitment = 4;
+  string error_code = 5;
 }
 
 // Get delta proposals request
@@ -207,6 +247,7 @@ message GetDeltaProposalsResponse {
   bool success = 1;
   string message = 2;
   repeated DeltaObject proposals = 3;
+  string error_code = 4;
 }
 
 // Get a specific delta proposal request
@@ -219,6 +260,7 @@ message GetDeltaProposalResponse {
   bool success = 1;
   string message = 2;
   DeltaObject proposal = 3;
+  string error_code = 4;
 }
 
 // Sign delta proposal request
@@ -232,4 +274,27 @@ message SignDeltaProposalResponse {
   bool success = 1;
   string message = 2;
   DeltaObject delta = 3;
+  string error_code = 4;
+}
+
+// Lookup request: a 0x-prefixed lowercase hex public-key commitment.
+// Authentication is carried in gRPC metadata (x-pubkey, x-signature,
+// x-timestamp), where the signature is over a LookupAuthMessage digest —
+// NOT the per-account AuthRequestMessage digest used by other RPCs.
+message GetAccountByKeyCommitmentRequest {
+  string key_commitment = 1;
+}
+
+// Lookup response: zero, one, or many matching accounts. An empty list is a
+// successful response, NOT an error — distinguishing "no account exists" from
+// "caller does not hold the key" would leak account presence to non-key-holders.
+message GetAccountByKeyCommitmentResponse {
+  repeated AccountRef accounts = 1;
+}
+
+// One account match in a lookup response. Wrapped in its own message so the
+// response shape can be extended (e.g. role tags or per-account metadata)
+// in a forward-compatible way.
+message AccountRef {
+  string account_id = 1;
 }

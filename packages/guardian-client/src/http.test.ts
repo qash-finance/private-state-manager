@@ -72,6 +72,55 @@ describe('GuardianHttpClient', () => {
     });
   });
 
+  describe('getStatus', () => {
+    it('maps the server status response to camelCase', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          status: 'ok',
+          version: '0.1.0',
+          git_commit: 'abc123def456',
+          environment: 'devnet',
+          started_at: '2026-06-17T10:00:00Z',
+          uptime_seconds: 3600,
+        }),
+      });
+
+      const status = await client.getStatus();
+
+      expect(status).toEqual({
+        status: 'ok',
+        version: '0.1.0',
+        gitCommit: 'abc123def456',
+        environment: 'devnet',
+        startedAt: '2026-06-17T10:00:00Z',
+        uptimeSeconds: 3600,
+      });
+      expect(mockFetch).toHaveBeenCalledWith(
+        'http://localhost:3000/status',
+        expect.objectContaining({
+          method: 'GET',
+          headers: expect.objectContaining({
+            'Content-Type': 'application/json',
+          }),
+        })
+      );
+    });
+
+    it('should throw GuardianHttpError on non-ok response', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        text: async () => 'down',
+      });
+
+      const error = await client.getStatus().catch((e) => e);
+      expect(error).toBeInstanceOf(GuardianHttpError);
+      expect(error.status).toBe(503);
+    });
+  });
+
   describe('configure', () => {
     it('should configure account with authentication', async () => {
       client.setSigner(mockSigner);
@@ -579,6 +628,144 @@ describe('GuardianHttpClient', () => {
       );
     });
   });
+
+  // --- lookupAccountByKeyCommitment -----
+
+  describe('lookupAccountByKeyCommitment', () => {
+    const keyCommitmentHex = '0x' + 'aa'.repeat(32);
+
+    function makeLookupSigner() {
+      return {
+        commitment: keyCommitmentHex,
+        publicKey: '0x' + 'bb'.repeat(897),
+        scheme: 'falcon' as const,
+        signAccountIdWithTimestamp: vi.fn(),
+        signRequest: vi.fn(),
+        signCommitment: vi.fn(),
+        signLookupMessage: vi.fn().mockResolvedValue('0x' + 'cc'.repeat(762)),
+      };
+    }
+
+    it('returns the parsed accounts list on a happy path', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          accounts: [{ account_id: '0x7bfb0f38b0fafa103f86a805594170' }],
+        }),
+      });
+
+      const result = await client.lookupAccountByKeyCommitment(keyCommitmentHex);
+
+      expect(result.accounts).toHaveLength(1);
+      expect(result.accounts[0].accountId).toBe('0x7bfb0f38b0fafa103f86a805594170');
+      expect(signer.signLookupMessage).toHaveBeenCalledTimes(1);
+      expect(signer.signLookupMessage).toHaveBeenCalledWith(
+        keyCommitmentHex,
+        expect.any(Number)
+      );
+    });
+
+    it('treats an empty list as a successful response, not an error', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ accounts: [] }),
+      });
+
+      const result = await client.lookupAccountByKeyCommitment(keyCommitmentHex);
+      expect(result.accounts).toEqual([]);
+    });
+
+    it('returns multi-match results in order', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          accounts: [
+            { account_id: '0xaaa1' },
+            { account_id: '0xbbb2' },
+          ],
+        }),
+      });
+
+      const result = await client.lookupAccountByKeyCommitment(keyCommitmentHex);
+      expect(result.accounts.map((a) => a.accountId)).toEqual(['0xaaa1', '0xbbb2']);
+    });
+
+    it('attaches x-pubkey, x-signature, x-timestamp headers and uses /state/lookup with the query string', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ accounts: [] }),
+      });
+
+      await client.lookupAccountByKeyCommitment(keyCommitmentHex);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toBe(
+        `http://localhost:3000/state/lookup?key_commitment=${encodeURIComponent(keyCommitmentHex)}`
+      );
+      expect(init.method).toBe('GET');
+      expect(init.headers['x-pubkey']).toBe(signer.publicKey);
+      expect(init.headers['x-signature']).toMatch(/^0x/);
+      expect(init.headers['x-timestamp']).toMatch(/^\d+$/);
+    });
+
+    it('throws a clear error when no signer is configured', async () => {
+      // No setSigner() call.
+      await expect(
+        client.lookupAccountByKeyCommitment(keyCommitmentHex)
+      ).rejects.toThrow(/No signer configured/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('throws a clear error when the signer does not implement signLookupMessage', async () => {
+      // Default mockSigner from the outer describe does NOT implement
+      // signLookupMessage — the HTTP client must reject up front rather than
+      // sending a request the server will reject.
+      client.setSigner(mockSigner);
+      await expect(
+        client.lookupAccountByKeyCommitment(keyCommitmentHex)
+      ).rejects.toThrow(/signLookupMessage/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('propagates HTTP errors from the server through GuardianHttpError', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        text: async () => '{"code":"authentication_failed","error":"..."}',
+      });
+
+      const err = await client
+        .lookupAccountByKeyCommitment(keyCommitmentHex)
+        .catch((e) => e);
+      expect(err).toBeInstanceOf(GuardianHttpError);
+      expect(err.status).toBe(401);
+    });
+
+    it('rejects malformed server responses (missing accounts array)', async () => {
+      const signer = makeLookupSigner();
+      client.setSigner(signer);
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({}),
+      });
+
+      await expect(
+        client.lookupAccountByKeyCommitment(keyCommitmentHex)
+      ).rejects.toThrow(/Malformed/);
+    });
+  });
 });
 
 describe('GuardianHttpError', () => {
@@ -593,5 +780,87 @@ describe('GuardianHttpError', () => {
     expect(error.message).toContain('404');
     expect(error.message).toContain('Not Found');
     expect(error.name).toBe('GuardianHttpError');
+  });
+
+  describe('error envelope contract (account-paused path)', () => {
+    let client: GuardianHttpClient;
+    beforeEach(() => {
+      client = new GuardianHttpClient('http://localhost:3000');
+      mockFetch.mockReset();
+    });
+
+    it('surfaces 409 GUARDIAN_ACCOUNT_PAUSED with a parseable error envelope on pushDeltaProposal', async () => {
+      client.setSigner(mockSigner);
+
+      // The server's GuardianError::AccountPaused → IntoResponse contract.
+      // Locks client/server in lockstep: a regression to the legacy
+      // "(400, {delta: {account_id: 'error text'}})" shape would break this.
+      const envelope = {
+        success: false,
+        code: 'GUARDIAN_ACCOUNT_PAUSED',
+        error: 'Account is paused: compliance review',
+        paused_at: '2026-05-20T10:00:00Z',
+        paused_reason: 'compliance review',
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        text: async () => JSON.stringify(envelope),
+      });
+
+      const request = {
+        accountId: '0x' + 'a'.repeat(30),
+        nonce: 1,
+        deltaPayload: { txSummary: { data: '' }, signatures: [] },
+      };
+
+      const error = await client
+        .pushDeltaProposal(request)
+        .catch((e) => e as GuardianHttpError);
+
+      expect(error).toBeInstanceOf(GuardianHttpError);
+      expect((error as GuardianHttpError).status).toBe(409);
+
+      const parsed = JSON.parse((error as GuardianHttpError).body);
+      expect(parsed.success).toBe(false);
+      expect(parsed.code).toBe('GUARDIAN_ACCOUNT_PAUSED');
+      expect(typeof parsed.error).toBe('string');
+      expect(parsed.paused_at).toBe('2026-05-20T10:00:00Z');
+      expect(parsed.paused_reason).toBe('compliance review');
+      // Negative assertion: legacy "stuff error into delta.account_id" shape.
+      expect(parsed.delta).toBeUndefined();
+    });
+
+    it('surfaces 401 AUTHENTICATION_FAILED with a parseable error envelope', async () => {
+      client.setSigner(mockSigner);
+      const envelope = {
+        success: false,
+        code: 'authentication_failed',
+        error: 'Invalid signature',
+      };
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        text: async () => JSON.stringify(envelope),
+      });
+
+      const error = await client
+        .pushDeltaProposal({
+          accountId: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          deltaPayload: { txSummary: { data: '' }, signatures: [] },
+        })
+        .catch((e) => e as GuardianHttpError);
+
+      expect(error).toBeInstanceOf(GuardianHttpError);
+      expect((error as GuardianHttpError).status).toBe(401);
+      const parsed = JSON.parse((error as GuardianHttpError).body);
+      expect(parsed.success).toBe(false);
+      expect(parsed.code).toBe('authentication_failed');
+      expect(parsed.delta).toBeUndefined();
+    });
   });
 });

@@ -6,7 +6,6 @@
 use axum::{
     Json,
     body::Body,
-    extract::ConnectInfo,
     http::{Request, Response, StatusCode},
     response::IntoResponse,
 };
@@ -15,7 +14,6 @@ use std::{
     collections::HashMap,
     env,
     future::Future,
-    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
@@ -84,7 +82,10 @@ impl Default for RateLimitConfig {
     }
 }
 
-fn env_flag(key: &str, default_value: bool) -> bool {
+/// Parse a boolean env flag: unset → `default_value`; `0`/`false`/
+/// `no`/`off` (case-insensitive) → false; anything else → true.
+/// Shared by env-driven configs (rate limiting, metrics).
+pub(crate) fn env_flag(key: &str, default_value: bool) -> bool {
     env::var(key)
         .ok()
         .map(|value| {
@@ -343,6 +344,12 @@ where
             match limited {
                 None => inner.call(req).await,
                 Some((limit_type, key)) => {
+                    metrics::counter!(
+                        crate::metrics::names::RATE_LIMIT_REJECTIONS_TOTAL,
+                        crate::metrics::names::LABEL_LIMIT_TYPE => limit_type.as_str()
+                    )
+                    .increment(1);
+
                     let retry_after = match limit_type {
                         RateLimitType::Burst => 1,
                         RateLimitType::Sustained => 60,
@@ -379,37 +386,10 @@ where
     }
 }
 
-/// Extract client IP from request, preferring forwarding headers from the ingress proxy.
+/// Rate-limit keying needs a non-empty string per request; the
+/// shared extractor's `None` becomes `"unknown"` here.
 fn extract_client_ip<B>(req: &Request<B>) -> String {
-    if let Some(ip) = extract_forwarded_for_ip(req) {
-        return ip;
-    }
-
-    if let Some(ip) = extract_real_ip(req) {
-        return ip;
-    }
-
-    if let Some(connect_info) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return connect_info.0.ip().to_string();
-    }
-
-    "unknown".to_string()
-}
-
-fn extract_forwarded_for_ip<B>(req: &Request<B>) -> Option<String> {
-    let forwarded = req.headers().get("x-forwarded-for")?;
-    let value = forwarded.to_str().ok()?;
-
-    value
-        .split(',')
-        .map(str::trim)
-        .find_map(|entry| entry.parse::<IpAddr>().ok().map(|ip| ip.to_string()))
-}
-
-fn extract_real_ip<B>(req: &Request<B>) -> Option<String> {
-    let real_ip = req.headers().get("x-real-ip")?;
-    let value = real_ip.to_str().ok()?;
-    value.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+    super::client_ip::extract_client_ip(req).unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Extract account_id or signer pubkey for enhanced rate limit keying
@@ -442,6 +422,7 @@ fn extract_enhanced_key<B>(req: &Request<B>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::ConnectInfo;
     use axum::http::header::HeaderValue;
     use std::net::{IpAddr, SocketAddr};
 

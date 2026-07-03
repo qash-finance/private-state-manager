@@ -81,6 +81,38 @@ The configuration is automatically detected from the account's on-chain storage:
 const multisig = await client.load(accountId, signer);
 ```
 
+### Recover An Account By Key
+
+When the wallet only holds a signing key from the account's authorization
+set, it does not yet know the account ID. `recoverByKey` queries Guardian's
+`/state/lookup` endpoint with proof-of-possession of the key, fetches state
+for each matching account, and returns `(accountId, state)` pairs.
+
+```typescript
+const recovered = await client.recoverByKey(signer);
+
+if (recovered.length === 0) {
+  // No account on this Guardian operator authorizes the key.
+} else {
+  for (const { accountId, state } of recovered) {
+    const multisig = await client.load(accountId, signer);
+    // ...
+  }
+}
+```
+
+The `Signer` passed to `recoverByKey` MUST implement `signLookupMessage`
+(the bundled `FalconSigner` and `EcdsaSigner` both do). The lookup endpoint
+authenticates by proof-of-possession of the queried commitment — same key
+that already authenticates per-account requests, so revealing the account ID
+does not grant any new capability. See the design doc for the security
+analysis.
+
+Multiple matches are returned uniformly: a key may legitimately authorize
+several accounts, and the helper surfaces all of them rather than silently
+picking one. The returned list is empty (not an error) when no account
+authorizes the queried commitment.
+
 ### Fetch Account State
 
 ```typescript
@@ -165,6 +197,53 @@ const signedJson = await multisig.signProposalOffline(imported.id);
 console.log(signedJson);
 ```
 
+### Custom Proposal Types
+
+GUARDIAN accepts any non-empty `proposalType`, so an integration can propose a
+transaction the SDK does not model (an agglayer bridge note, an arbitrary dApp
+transaction) under its own label. The SDK normalizes the label to lowercase
+`snake_case` (trims and lowercases it, then requires `[a-z0-9_]+` — the same
+shape as built-in labels like `add_signer`), so `'B2Agg'` becomes `b2agg` and
+`'add signer'` / `'add-signer'` are rejected. Such a proposal buckets to
+`proposalType: 'custom'` and keeps its normalized label in
+`CustomProposalMetadata.rawProposalType`. It can be listed, signed, and
+exported/imported through the normal flow, but the SDK cannot build its on-chain
+transaction — the integration owns that recipe and submits it itself.
+
+```typescript
+import { buildP2idTransactionRequest } from '@openzeppelin/miden-multisig-client';
+
+// Producer: build a transaction and propose it under a custom label.
+const { request, salt } = buildP2idTransactionRequest(senderId, recipientId, faucetId, amount);
+const proposal = await multisig.createCustomProposal(request.serialize(), 'b2agg');
+
+// Cosigners review and sign through the usual signProposal flow.
+
+// Producer (once threshold is met): bind-check the request and fetch the
+// validated advice (cosigner signatures + GUARDIAN ack). `prepareCustomExecution`
+// verifies the request against the signed commitment *before* the ack request.
+const advice = await multisig.prepareCustomExecution(proposal.id, request.serialize());
+
+// The browser TransactionRequest is immutable, so rebuild from the same recipe
+// (inputs + salt) with the advice, then submit.
+const { request: finalRequest } = buildP2idTransactionRequest(
+  senderId, recipientId, faucetId, amount, { salt, signatureAdviceMap: advice },
+);
+await multisig.submitTransaction(finalRequest);
+```
+
+The integration keeps only its own recipe (build inputs + salt) so it can
+reproduce the exact transaction at execute time — the SDK does not store the
+serialized request. The binding check guarantees the rebuilt transaction matches the
+commitment the cosigners signed.
+
+> **Rust ↔ TS parity:** both SDKs expose the same producer surface —
+> `createCustomProposal` / `propose_custom_transaction`, `prepareCustomExecution` /
+> `prepare_custom_execution`, and `submitTransaction` / `submit_transaction`. The
+> only difference is advice injection: Rust mutates the request's advice map in
+> place (`request.advice_map_mut().extend(advice)`), while the immutable browser
+> `TransactionRequest` is rebuilt from the recipe with the advice.
+
 ## Transaction Utilities
 
 The package also exports utility functions for building transactions:
@@ -189,6 +268,73 @@ const bytes = hexToUint8Array('deadbeef');
 const sigBytes = signatureHexToBytes(signatureHex);
 // => Uint8Array with the Falcon Poseidon2 auth prefix
 ```
+
+## Consume-notes metadata versions
+
+`consume_notes` proposals come in two metadata shapes. The
+`metadataVersion` field on `ConsumeNotesProposalMetadata` is the
+discriminator.
+
+- **v1 (legacy)** — `metadataVersion` absent. The proposal carries
+  only `noteIds`; verification rebuilds the transaction request by
+  fetching each note from the cosigner's **own local Miden store**
+  (IndexedDB in the browser). If the verifier does not have the note
+  locally (cursor advanced past the block, store was cleared via
+  `clearMidenDatabase()`, private-note transport pruned the blob),
+  verification throws `LegacyConsumeNotesNoteMissingError` and the
+  cosigner cannot sign. This is the failure tracked by
+  [issue #229](https://github.com/OpenZeppelin/guardian/issues/229).
+- **v2 (self-contained)** — `metadataVersion: 2` plus a `notes` array
+  of base64-encoded `Note.serialize()` bytes, aligned by index with
+  `noteIds`. Verification rebuilds the request from the embedded notes
+  alone — no `getInputNote`, no network call. Restores the same
+  "rebuild from signed metadata" invariant every other proposal type
+  already satisfied (and that audit finding **M-08** remediated for
+  `p2id`).
+
+`createConsumeNotesProposal` always emits v2 starting with this
+release; the proposer is the one party guaranteed to hold the notes
+locally. The per-proposal v2 payload is capped at
+`MAX_CONSUME_NOTES_METADATA_BYTES` (256 KiB) and the size is enforced
+at creation time so the failure surfaces to the proposer before any
+signature collection begins.
+
+```typescript
+import {
+  MAX_CONSUME_NOTES_METADATA_BYTES,
+  CONSUME_NOTES_METADATA_VERSION_V2,
+  ConsumeNotesMetadataOversizeError,
+  LegacyConsumeNotesNoteMissingError,
+  NoteBindingMismatchError,
+  UnsupportedMetadataVersionError,
+  isConsumeNotesV2,
+} from '@openzeppelin/miden-multisig-client';
+```
+
+### Error taxonomy
+
+Each error class exposes a stable `.code` string identical to the Rust
+SDK's `MultisigError::code()` value, so cross-SDK tests and operator
+dashboards can branch on one taxonomy.
+
+| Error class | `.code` | When |
+|---|---|---|
+| `NoteBindingMismatchError` | `consume_notes_note_binding_mismatch` | v2: `notes.length !== noteIds.length`, or `note.id().toString() !== noteIds[i]` |
+| `UnsupportedMetadataVersionError` | `consume_notes_unsupported_metadata_version` | Unrecognized version (including v1 on a cut-over build) |
+| `ConsumeNotesMetadataOversizeError` | `consume_notes_metadata_oversize` | v2 metadata serialization exceeds 256 KiB at creation |
+| `LegacyConsumeNotesNoteMissingError` | `consume_notes_legacy_note_missing` | v1 path: local store does not contain the referenced note |
+
+### Cut-over policy
+
+The `LEGACY_CONSUME_NOTES_ENABLED` build-time constant (default `true`
+in this transitional release) gates whether this build accepts v1
+metadata for verification. A future cut-over release will flip the
+default to `false`, at which point v1 proposals are refused with
+`UnsupportedMetadataVersionError(undefined)` on every code path.
+Deployments should drain or re-propose any v1 `consume_notes`
+proposals in flight before upgrading past the cut-over client version.
+Tracked by spec
+[`006-consume-notes-metadata`](../../speckit/features/006-consume-notes-metadata/spec.md).
 
 ## Testing
 
