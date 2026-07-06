@@ -88,7 +88,57 @@ fn single_query_value(url: &Url, key: &str) -> Result<Option<String>, String> {
     Ok(found)
 }
 
+/// Detect the libpq / Cloud SQL unix-socket DSN form, e.g.
+/// `postgresql://USER:PASS@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE`.
+///
+/// These DSNs carry an EMPTY authority host — the real connection target is a
+/// local unix domain socket whose directory lives in the `host=` query
+/// parameter. `url::Url::parse` rejects that shape with `ParseError::EmptyHost`
+/// for the non-special `postgres`/`postgresql` schemes as soon as credentials
+/// are present (verified against url 2.5.8), which is what broke Cloud Run boot
+/// after the #272 DB-TLS-verification change started routing every DATABASE_URL
+/// through `Url::parse`.
+///
+/// TLS is not applicable over a local unix socket, so callers treat this form
+/// as [`TlsPlan::Disable`] and hand the raw DSN straight to the driver — the
+/// exact pre-#272 behavior the serving prod revision relies on. Host-bearing
+/// (TCP) URLs return `false` here and keep the full #272 strict-TLS handling.
+fn is_unix_socket_url(database_url: &str) -> bool {
+    // Scheme must be postgres:// or postgresql:// (URL schemes are case-insensitive).
+    let rest = match database_url.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("postgres")
+                || scheme.eq_ignore_ascii_case("postgresql") =>
+        {
+            rest
+        }
+        _ => return false,
+    };
+
+    // The authority is everything up to the first '/', '?' or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+
+    // Strip optional userinfo: a literal '@' inside userinfo is percent-encoded,
+    // so the LAST '@' reliably separates credentials from the host[:port].
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, host_port)) => host_port,
+        None => authority,
+    };
+
+    // Empty host (with or without a trailing ":port") == unix-socket form.
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    host.is_empty()
+}
+
 fn parse_tls_plan(database_url: &str) -> Result<TlsPlan, String> {
+    // Cloud SQL / libpq unix-socket DSNs have an empty authority host that
+    // url::Url::parse cannot represent. TLS is meaningless over a local socket,
+    // so short-circuit to Disable before the strict URL parse below.
+    if is_unix_socket_url(database_url) {
+        return Ok(TlsPlan::Disable);
+    }
+
     let url = Url::parse(database_url).map_err(|err| {
         format!(
             "DATABASE_URL must be a postgres:// or postgresql:// URL \
@@ -168,6 +218,13 @@ fn rebuild_url(
     sslmode: &str,
     sslrootcert: Option<&str>,
 ) -> Result<String, String> {
+    // Unix-socket DSNs (empty authority host) can't round-trip through
+    // url::Url::parse and need no sslmode rewrite — TLS is N/A over a local
+    // socket. Pass them through verbatim so the raw DSN reaches the driver.
+    if is_unix_socket_url(database_url) {
+        return Ok(database_url.to_string());
+    }
+
     let mut url =
         Url::parse(database_url).map_err(|error| format!("Invalid DATABASE_URL: {error}"))?;
     let preserved: Vec<(String, String)> = url
@@ -1608,6 +1665,74 @@ mod tests {
         assert!(
             parse_tls_plan("postgres://guardian:pw@a.example.com,b.example.com/guardian").is_err()
         );
+    }
+
+    // ---- Cloud SQL / libpq unix-socket DSN regression (Cloud Run boot) ----
+    //
+    // Reproduces the prod outage: after #272 started routing every DATABASE_URL
+    // through url::Url::parse, the Cloud SQL unix-socket DSN (empty authority
+    // host + `?host=/cloudsql/...`) failed with EmptyHost, so storage init
+    // panicked at boot. The DSN below uses only sanitized placeholders — never
+    // a real secret.
+    const UNIX_SOCKET_URL: &str =
+        "postgresql://USER:PASS@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE";
+
+    #[test]
+    fn unix_socket_dsn_is_detected() {
+        assert!(is_unix_socket_url(UNIX_SOCKET_URL));
+        assert!(is_unix_socket_url(
+            "postgres://USER:PASS@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE"
+        ));
+        // No-credentials variant (url::Url::parse accepts this one, but we
+        // still want identical passthrough handling).
+        assert!(is_unix_socket_url(
+            "postgresql:///DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE"
+        ));
+    }
+
+    #[test]
+    fn tcp_dsn_is_not_a_unix_socket() {
+        // Host-bearing URLs must NOT be misclassified — #272 strict TLS still
+        // applies to them.
+        assert!(!is_unix_socket_url(
+            "postgres://guardian:pw@db.example.com:5432/guardian?sslmode=require"
+        ));
+        assert!(!is_unix_socket_url(
+            "postgresql://guardian:pw@db.example.com/guardian"
+        ));
+        assert!(!is_unix_socket_url("mysql://guardian:pw@/guardian"));
+    }
+
+    #[test]
+    fn unix_socket_dsn_is_disable_plan() {
+        // Before the fix this returned Err("...empty host").
+        assert_eq!(parse_tls_plan(UNIX_SOCKET_URL).unwrap(), TlsPlan::Disable);
+    }
+
+    #[test]
+    fn unix_socket_dsn_passes_through_raw_to_driver() {
+        let plan = parse_tls_plan(UNIX_SOCKET_URL).unwrap();
+        // The raw DSN must reach diesel/tokio-postgres unchanged: no sslmode
+        // injection, no percent-encoding of the socket path.
+        assert_eq!(
+            sanitized_async_url(UNIX_SOCKET_URL, &plan).unwrap(),
+            UNIX_SOCKET_URL
+        );
+        assert_eq!(
+            normalized_sync_url(UNIX_SOCKET_URL, &plan).unwrap(),
+            UNIX_SOCKET_URL
+        );
+        // A local unix socket carries no TLS client config.
+        assert!(build_tls_client_config(&plan).unwrap().is_none());
+    }
+
+    #[test]
+    fn unix_socket_dsn_builds_connection_manager() {
+        // Mirrors the crashing prod path: build_postgres_pool ->
+        // make_connection_manager. Before the fix this was Err and storage init
+        // panicked at main.rs. Constructing the manager does not open a
+        // connection, so this stays offline-safe.
+        assert!(make_connection_manager(UNIX_SOCKET_URL).is_ok());
     }
 
     #[test]
