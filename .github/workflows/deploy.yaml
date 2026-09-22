@@ -90,11 +90,39 @@ jobs:
             EXTRA_FLAGS="--use-http2"
           fi
 
+          # ACK signing keys must come from a stable source. With
+          # GUARDIAN_ACK_SECRET_PROVIDER unset the server regenerates the ACK
+          # keypair on every restart, which silently rotates the guardian's
+          # commitment and orphans every multisig account bound to it.
+          #
+          # The upstream prod profile reads these from AWS Secrets Manager; on
+          # GCP we use the `file` provider, backed by Secret Manager volumes
+          # mounted at the paths below. Those volumes are part of the service
+          # definition, not set here: `gcloud run deploy` cannot express the
+          # file mode, and the server rejects any ACK secret file readable by
+          # group or other (it requires `mode & 0o077 == 0`, i.e. 0400/0600).
+          #
+          # They are preserved across deploys because `--image` leaves volumes
+          # untouched. If the service is ever recreated from scratch, re-add:
+          #
+          #   volumes:
+          #   - name: ack-falcon
+          #     secret:
+          #       secretName: guardian-ack-falcon
+          #       items: [{ key: latest, path: falcon, mode: 256 }]   # 0400
+          #   - name: ack-ecdsa
+          #     secret:
+          #       secretName: guardian-ack-ecdsa
+          #       items: [{ key: latest, path: ecdsa,  mode: 256 }]
+          #
+          # mounted at /var/guardian/ack-falcon and /var/guardian/ack-ecdsa,
+          # then `gcloud run services replace`. Generate the secrets with the
+          # repo's own `ack-keygen` binary (hex-encoded Falcon + ECDSA keys).
           gcloud run deploy $SERVICE \
             --image ${{ steps.img.outputs.uri }} \
             --region ${{ env.REGION }} \
             --platform managed \
-            --update-env-vars GUARDIAN_NETWORK_TYPE=MidenTestnet \
+            --update-env-vars GUARDIAN_NETWORK_TYPE=MidenTestnet,GUARDIAN_ACK_SECRET_PROVIDER=file,GUARDIAN_ACK_FALCON_SECRET_PATH=/var/guardian/ack-falcon/falcon,GUARDIAN_ACK_ECDSA_SECRET_PATH=/var/guardian/ack-ecdsa/ecdsa \
             $EXTRA_FLAGS
 
       # --- Slack notifications ---
