@@ -18,14 +18,6 @@ on:
         options:
           - staging
           - production
-      service_name:
-        description: "Which service to deploy (leave empty for all)"
-        required: false
-        type: choice
-        options:
-          - ""
-          - server
-          - grpc
       image:
         description: "Full image URI (leave empty for latest)"
         required: false
@@ -35,21 +27,8 @@ env:
 
 jobs:
   deploy:
-    name: Deploy ${{ matrix.service }} (${{ inputs.environment }})
+    name: Deploy server (${{ inputs.environment }})
     runs-on: ubuntu-latest
-    strategy:
-      # One service failing must not cancel the other. qash-psm-grpc failing
-      # took the healthy qash-psm-server deploy down with it, which is how a
-      # successful server rollout came back reported as cancelled.
-      fail-fast: false
-      matrix:
-        # Defaults to the server alone. qash-psm-grpc exists but has never been
-        # given a DATABASE_URL, the ACK key volumes, or the Cloud SQL
-        # annotation, so it panics on boot with "DATABASE_URL environment
-        # variable is required". Nothing in Qash calls it: the web app reaches
-        # the guardian over HTTP only. Deploy it explicitly with
-        # service_name=grpc once it is actually configured.
-        service: ${{ inputs.service_name && fromJson(format('["{0}"]', inputs.service_name)) || fromJson('["server"]') }}
     permissions:
       contents: read
       id-token: write
@@ -94,20 +73,15 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          SERVICE="${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}"
+          SERVICE="${{ steps.env.outputs.service_prefix }}-server"
 
-          # The container port is stated here rather than inherited from
-          # whatever the service already carries. main.rs serves HTTP on 3000
-          # and gRPC on 50051, neither of which is Cloud Run's 8080 default, so
-          # a service that loses its port setting lands on 8080, nothing
-          # listens, and the startup probe fails with "container failed to
-          # start and listen on the port defined by PORT=8080". That is exactly
-          # how qash-psm-grpc broke: containerPort 8080 against a binary
-          # serving 50051, while qash-psm-server still had its 3000.
+          # The container port is stated rather than inherited from whatever the
+          # service already carries. main.rs serves HTTP on 3000, not Cloud
+          # Run's 8080 default, so a service that loses its port setting lands
+          # on 8080, nothing listens, and the startup probe fails with
+          # "container failed to start and listen on the port defined by
+          # PORT=8080".
           EXTRA_FLAGS="--port=3000"
-          if [ "${{ matrix.service }}" = "grpc" ]; then
-            EXTRA_FLAGS="--port=50051 --use-http2"
-          fi
 
           # ACK signing keys must come from a stable source. With
           # GUARDIAN_ACK_SECRET_PROVIDER unset the server regenerates the ACK
@@ -153,7 +127,7 @@ jobs:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
             :rocket: *[${{ inputs.environment }}] Deployed*
-            Service: `${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}` | Image: `${{ steps.img.outputs.uri }}`
+            Service: `${{ steps.env.outputs.service_prefix }}-server` | Image: `${{ steps.img.outputs.uri }}`
             Repo: ${{ github.repository }} | Branch: ${{ github.ref_name }}
             By: ${{ github.actor }}
         env:
@@ -167,7 +141,7 @@ jobs:
           channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
           slack-message: |
             :x: *[${{ inputs.environment }}] Deploy Failed*
-            Service: `${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}` | Branch: ${{ github.ref_name }}
+            Service: `${{ steps.env.outputs.service_prefix }}-server` | Branch: ${{ github.ref_name }}
             Repo: ${{ github.repository }}
             By: ${{ github.actor }} | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         env:
@@ -182,7 +156,7 @@ jobs:
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no Discord webhook configured"; exit 0; fi
           payload=$(jq -n \
             --arg envname "${{ inputs.environment }}" \
-            --arg svc "${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}" \
+            --arg svc "${{ steps.env.outputs.service_prefix }}-server" \
             --arg img "${{ steps.img.outputs.uri }}" \
             --arg repo "${{ github.repository }}" \
             --arg branch "${{ github.ref_name }}" \
@@ -202,7 +176,7 @@ jobs:
           logs_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           payload=$(jq -n \
             --arg envname "${{ inputs.environment }}" \
-            --arg svc "${{ steps.env.outputs.service_prefix }}-${{ matrix.service }}" \
+            --arg svc "${{ steps.env.outputs.service_prefix }}-server" \
             --arg repo "${{ github.repository }}" \
             --arg branch "${{ github.ref_name }}" \
             --arg actor "${{ github.actor }}" \
