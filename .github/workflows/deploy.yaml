@@ -38,8 +38,18 @@ jobs:
     name: Deploy ${{ matrix.service }} (${{ inputs.environment }})
     runs-on: ubuntu-latest
     strategy:
+      # One service failing must not cancel the other. qash-psm-grpc failing
+      # took the healthy qash-psm-server deploy down with it, which is how a
+      # successful server rollout came back reported as cancelled.
+      fail-fast: false
       matrix:
-        service: ${{ inputs.service_name && fromJson(format('["{0}"]', inputs.service_name)) || fromJson('["server","grpc"]') }}
+        # Defaults to the server alone. qash-psm-grpc exists but has never been
+        # given a DATABASE_URL, the ACK key volumes, or the Cloud SQL
+        # annotation, so it panics on boot with "DATABASE_URL environment
+        # variable is required". Nothing in Qash calls it: the web app reaches
+        # the guardian over HTTP only. Deploy it explicitly with
+        # service_name=grpc once it is actually configured.
+        service: ${{ inputs.service_name && fromJson(format('["{0}"]', inputs.service_name)) || fromJson('["server"]') }}
     permissions:
       contents: read
       id-token: write
