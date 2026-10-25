@@ -11,7 +11,7 @@
  * } from '@openzeppelin/miden-multisig-client';
  * import { MidenClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
  *
- * const midenClient = await MidenClient.createDevnet();
+ * const midenClient = await MidenClient.createDevnet({ useWorker: false });
  * const secretKey = AuthSecretKey.rpoFalconWithRNG(undefined);
  *
  * // Store in miden-sdk's keystore
@@ -31,8 +31,8 @@
  *   },
  * });
  *
- * // Get GUARDIAN pubkey for config
- * const guardianCommitment = await client.guardianClient.getPubkey();
+ * // Get GUARDIAN's ACK commitment for the account's signature scheme
+ * const { commitment: guardianCommitment } = await client.guardianClient.getPubkey(signer.scheme);
  *
  * // Create multisig account
  * const config = { threshold: 2, signerCommitments: [signer.commitment, ...], guardianCommitment };
@@ -57,24 +57,53 @@ export type { ProverConfig, ProverRetryPolicy } from './prover/config.js';
 export type { RpcConfig, RpcRetryPolicy } from './rpc/config.js';
 export { lookupAuthDigest } from './lookupAuth.js';
 export {
+  SESSION_GRANT_SCOPE,
+  describeSessionGrant,
+  sessionGrantDigest,
+  sessionLogoutDigest,
+  sessionRevokeAllDigest,
+} from './session/grant.js';
+export {
+  GuardianSession,
+  IndexedDbSessionKeyStore,
+  type GuardianSessionOptions,
+  WebCryptoSessionKey,
+  type SessionKeyStore,
+  type StoredSessionKey,
+} from './session/key.js';
+export {
+  GuardianSessionsUnsupportedError,
+  SessionGrantDeclinedError,
+  endGuardianSession,
+  resumeGuardianSession,
+  revokeAllGuardianSessions,
+  startGuardianSession,
+  type StartSessionOptions,
+} from './session/manager.js';
+export {
   Multisig,
   type AccountState,
+  type SyncStateResult,
   type CreateProposalOptions,
   type CreateSignerProposalOptions,
   type CreateP2idProposalOptions,
 } from './multisig.js';
 export { AccountInspector, type DetectedMultisigConfig, type VaultBalance } from './inspector.js';
 export {
-  chainAnchorFromBase64,
-  chainAnchorToBase64,
-  executeForSummary,
-  executeForSummaryAt,
-  summaryAuthArg,
+  ChainBehindBoundBlockError,
+  executeForSummaryAtTip,
+  summaryApprovalExpirationBlockNum,
+  summaryBoundBlockNum,
+  summarySalt,
   buildUpdateSignersTransactionRequest,
   buildUpdateProcedureThresholdTransactionRequest,
   buildUpdateGuardianTransactionRequest,
   buildConsumeNotesTransactionRequest,
+  buildConsumeNotesTransactionRequestFromNotes,
   buildP2idTransactionRequest,
+  requestBoundBlockNum,
+  requestSaltHex,
+  MAX_APPROVAL_EXPIRATION_DELTA,
   parseP2idNoteType,
   p2idNoteTypeToMetadata,
   type P2idTransactionOptions,
@@ -85,7 +114,10 @@ export {
 // serialized summary exactly as import verification does. Returns normalized
 // hex, directly comparable to `ExportedProposal.commitment` / `Proposal.id`.
 export { computeCommitmentFromTxSummary } from './multisig/helpers.js';
-export type { SignatureOptions } from './transaction/options.js';
+export type {
+  MultisigRequestOptions,
+  SignatureOptions,
+} from './transaction/options.js';
 
 export { GuardianHttpClient, GuardianHttpError } from '@openzeppelin/guardian-client';
 export type { GuardianErrorMeta } from '@openzeppelin/guardian-client';
@@ -134,9 +166,12 @@ export type {
 export {
   FalconSigner,
   EcdsaSigner,
+  Eip712Signer,
+  LedgerSigner,
   ParaSigner,
   MidenWalletSigner,
   type ParaSigningContext,
+  type Eip1193SignerProvider,
   type WalletSigningContext,
 } from './signer.js';
 export { PublicKeyFormat } from './utils/key.js';
@@ -157,6 +192,8 @@ export {
   MAX_CONSUME_NOTES_METADATA_BYTES,
   isConsumeNotesV1,
   isConsumeNotesV2,
+  isProposalActionable,
+  type ProposalVerification,
   isP2idNoteVisibility,
   type P2idNoteVisibility,
   MAX_P2IDE_BLOCK_HEIGHT,
@@ -173,12 +210,16 @@ export {
   UnsupportedMetadataVersionError,
   ConsumeNotesMetadataOversizeError,
   LegacyConsumeNotesNoteMissingError,
+  ConsumeNoteNotAuthenticatedError,
 } from './multisig/consumeNotesErrors.js';
 
 export {
   type AuthArgErrorCode,
-  ProposalAuthArgUnresolvableError,
+  BoundBlockMismatchError,
+  BoundBlockNotDeclaredError,
+  MultisigAuthArgsMissingError,
   ProposalSaltMalformedError,
+  TransactionSummaryLayoutError,
 } from './multisig/authArgErrors.js';
 
 export {

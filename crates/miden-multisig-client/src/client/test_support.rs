@@ -6,11 +6,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use guardian_client::{
+    AccountState, DeltaObject as ProtoDeltaObject, DeltaStatus, GetStateResponse, PendingStatus,
+    delta_status,
+};
+use guardian_shared::SignatureScheme;
 use miden_client::Serializable;
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note_transport::NoteTransportClient;
-use miden_client::rpc::{Endpoint, NodeRpcClient};
+use miden_client::rpc::Endpoint;
 use miden_client::testing::mock::MockRpcApi;
 use miden_client::testing::note_transport::{MockNoteTransportApi, MockNoteTransportNode};
 use miden_client_sqlite_store::SqliteStore;
@@ -28,20 +34,17 @@ use miden_standards::note::P2idNote;
 use miden_tx::utils::sync::RwLock;
 
 use super::MultisigClient;
-use crate::keystore::GuardianKeyStore;
+use crate::keystore::{GuardianKeyStore, KeyManager};
 use crate::prover::ProverConfig;
 use crate::rpc::RpcConfig;
+use crate::transaction::word_to_hex;
 
-/// Core offline constructor: SQLite store in `dir`, `node` as the inner
-/// Miden client's RPC, optional note transport, and an unreachable GUARDIAN
-/// endpoint. Returns the store handle for tests that seed records directly.
-///
-/// The multisig client's direct node channel is left endpoint-built (and
-/// unreachable) — use [`offline_client_with_node`] to inject `node` there
-/// too.
+const BASE64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
+
 pub(crate) async fn offline_client_parts(
     dir: &Path,
-    node: Arc<dyn NodeRpcClient>,
+    node: Arc<MockRpcApi>,
     transport: Option<Arc<dyn NoteTransportClient>>,
 ) -> (MultisigClient, Arc<SqliteStore>) {
     offline_client_parts_with_keystore(dir, node, transport, Arc::new(GuardianKeyStore::generate()))
@@ -50,12 +53,13 @@ pub(crate) async fn offline_client_parts(
 
 /// [`offline_client_parts`] with an injected keystore, for tests that need
 /// the client's signer commitment known up front (e.g. to build a multisig
-/// account whose cosigner set contains this client's key).
+/// account whose cosigner set contains this client's key) or that need a
+/// signer of a specific scheme.
 pub(crate) async fn offline_client_parts_with_keystore(
     dir: &Path,
-    node: Arc<dyn NodeRpcClient>,
+    node: Arc<MockRpcApi>,
     transport: Option<Arc<dyn NoteTransportClient>>,
-    keystore: Arc<GuardianKeyStore>,
+    keystore: Arc<dyn KeyManager>,
 ) -> (MultisigClient, Arc<SqliteStore>) {
     let store = Arc::new(
         SqliteStore::new(dir.join("store.sqlite3"))
@@ -65,6 +69,10 @@ pub(crate) async fn offline_client_parts_with_keystore(
     let keystore_dir = dir.join("keys");
     std::fs::create_dir_all(&keystore_dir).expect("keystore dir");
 
+    // A sync stores the protocol configuration each header commits to. Seed the
+    // mock chain's one so a test that executes before its first sync resolves the
+    // same fee asset the chain does.
+    let protocol_config = node.protocol_config();
     let mut builder = ClientBuilder::<FilesystemKeyStore>::new()
         .rpc(node)
         .store(store.clone())
@@ -74,9 +82,14 @@ pub(crate) async fn offline_client_parts_with_keystore(
         builder = builder.note_transport(transport);
     }
     let miden_client = builder.build().await.expect("miden client builds");
+    miden_client
+        .seed_protocol_config(protocol_config)
+        .await
+        .expect("mock protocol config is stored");
 
     let client = MultisigClient::new(
         miden_client,
+        store.clone(),
         keystore,
         "http://localhost:1".to_string(),
         dir.to_path_buf(),
@@ -103,10 +116,7 @@ pub(crate) async fn offline_client(
 /// Fully offline MultisigClient with `node` injected into both the inner
 /// Miden client and the direct node channel, so node-backed primitives and
 /// store syncs see the same mock chain.
-pub(crate) async fn offline_client_with_node(
-    dir: &Path,
-    node: Arc<dyn NodeRpcClient>,
-) -> MultisigClient {
+pub(crate) async fn offline_client_with_node(dir: &Path, node: Arc<MockRpcApi>) -> MultisigClient {
     offline_client_with_node_parts(dir, node).await.0
 }
 
@@ -114,7 +124,7 @@ pub(crate) async fn offline_client_with_node(
 /// for tests that seed records directly.
 pub(crate) async fn offline_client_with_node_parts(
     dir: &Path,
-    node: Arc<dyn NodeRpcClient>,
+    node: Arc<MockRpcApi>,
 ) -> (MultisigClient, Arc<SqliteStore>) {
     let (mut client, store) = offline_client_parts(dir, node.clone(), None).await;
     client.set_node_rpc_client(node);
@@ -203,4 +213,78 @@ pub(crate) fn p2id_note_for(target: &Account, seed: u32, note_type: NoteType) ->
         .build()
         .expect("p2id note builds")
         .into()
+}
+
+/// A real 1-of-1 multisig-guardian account whose cosigner is `signer` — the
+/// same construction `MultisigClient::create_account` performs, minus the
+/// GUARDIAN pubkey fetch (the guardian commitment is fixed by the test).
+pub(crate) fn multisig_account(signer: Word, guardian_commitment: Word, seed: u8) -> Account {
+    multisig_account_with_scheme(signer, guardian_commitment, seed, SignatureScheme::Falcon)
+}
+
+/// [`multisig_account`] for a given signer scheme, so a test can pair the
+/// account with a keystore of the same scheme.
+pub(crate) fn multisig_account_with_scheme(
+    signer: Word,
+    guardian_commitment: Word,
+    seed: u8,
+    scheme: SignatureScheme,
+) -> Account {
+    let config = MultisigGuardianConfig::new(1, vec![signer], guardian_commitment)
+        .with_signature_scheme(scheme);
+    MultisigGuardianBuilder::new(config)
+        .with_seed([seed; 32])
+        .build()
+        .expect("multisig account builds")
+}
+
+/// The canned `get_state` a mock GUARDIAN serves for `account`: the same
+/// commitment the client holds, so guardian sync is a no-op.
+pub(crate) fn registered_state(account: &Account) -> GetStateResponse {
+    GetStateResponse {
+        success: true,
+        message: String::new(),
+        state: Some(AccountState {
+            account_id: account.id().to_string(),
+            state_json: serde_json::json!({
+                "data": BASE64.encode(account.to_bytes()),
+            })
+            .to_string(),
+            commitment: word_to_hex(&account.to_commitment()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }),
+    }
+}
+
+/// Wraps a delta payload as the pending proto `DeltaObject` a GUARDIAN
+/// listing would serve.
+pub(crate) fn pending_proto_delta(
+    account: &Account,
+    nonce: u64,
+    delta_payload: String,
+    proposer_hex: &str,
+) -> ProtoDeltaObject {
+    ProtoDeltaObject {
+        account_id: account.id().to_string(),
+        nonce,
+        prev_commitment: word_to_hex(&account.to_commitment()),
+        delta_payload,
+        new_commitment: String::new(),
+        ack_sig: String::new(),
+        candidate_at: String::new(),
+        canonical_at: None,
+        discarded_at: None,
+        status: Some(DeltaStatus {
+            status: Some(delta_status::Status::Pending(PendingStatus {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                proposer_id: proposer_hex.to_string(),
+                cosigner_sigs: vec![],
+            })),
+            discard_reason: String::new(),
+            retain_reason: String::new(),
+        }),
+        ack_pubkey: None,
+        ack_scheme: None,
+    }
 }

@@ -92,6 +92,7 @@ export class ProposalFactory {
       txSummary: delta.deltaPayload.txSummary.data,
       signatures,
       metadata: resolvedMetadata,
+      verification: { status: 'unchecked' },
     };
   }
 
@@ -117,6 +118,10 @@ export class ProposalFactory {
             `Invalid imported proposal signatures: ECDSA signature for ${signature.commitment} is missing publicKey`,
           );
         }
+        if (signature.messageFormat !== undefined &&
+          (scheme !== 'ecdsa' || signature.messageFormat !== 'eip712')) {
+          throw new Error('Invalid imported proposal signatures: unsupported message format');
+        }
 
         return {
           signerId: signature.commitment,
@@ -126,6 +131,7 @@ export class ProposalFactory {
                   scheme,
                   signature: signature.signatureHex,
                   publicKey: signature.publicKey,
+                  ...(signature.messageFormat ? { messageFormat: signature.messageFormat } : {}),
                 }
               : {
                   scheme,
@@ -148,6 +154,7 @@ export class ProposalFactory {
       txSummary: exported.txSummaryBase64,
       signatures,
       metadata,
+      verification: { status: 'unchecked' },
     };
   }
 

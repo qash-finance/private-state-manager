@@ -127,6 +127,10 @@ pub(crate) fn decode_status_reason(status: &DeltaStatus) -> Option<&'static str>
             reason: Some(RetainReason::Diverged),
             ..
         } => Some("diverged"),
+        DeltaStatus::Retained {
+            reason: Some(RetainReason::Orphaned),
+            ..
+        } => Some("orphaned"),
         DeltaStatus::Discarded {
             reason: Some(DiscardReason::ClientAbandoned),
             ..
@@ -418,11 +422,13 @@ mod tests {
         let ack = AckRegistry::new(keystore_dir).await.expect("ack");
 
         AppState {
+            miden_sessions: std::sync::Arc::new(crate::session::MidenSessions::default()),
             storage: Arc::new(storage),
             metadata: Arc::new(metadata_store),
             network_client: Arc::new(MockNetworkClient::new()),
             ack,
             canonicalization: None,
+            release_sweep: None,
             clock: Arc::new(MockClock::default()),
             dashboard: Arc::new(crate::dashboard::DashboardState::default()),
             auditor: Arc::new(crate::audit::LogAuditor::new()),
@@ -522,11 +528,13 @@ mod tests {
         std::fs::create_dir_all(&keystore_dir).expect("keystore dir");
         let ack = AckRegistry::new(keystore_dir).await.expect("ack");
         let state = AppState {
+            miden_sessions: std::sync::Arc::new(crate::session::MidenSessions::default()),
             storage: Arc::new(storage),
             metadata: Arc::new(metadata),
             network_client: Arc::new(MockNetworkClient::new()),
             ack,
             canonicalization: None,
+            release_sweep: None,
             clock: Arc::new(MockClock::default()),
             dashboard: Arc::new(crate::dashboard::DashboardState::default()),
             auditor: Arc::new(crate::audit::LogAuditor::new()),
@@ -610,11 +618,13 @@ mod tests {
         std::fs::create_dir_all(&keystore_dir).expect("keystore dir");
         let ack = AckRegistry::new(keystore_dir).await.expect("ack");
         let state = AppState {
+            miden_sessions: std::sync::Arc::new(crate::session::MidenSessions::default()),
             storage: Arc::new(svc),
             metadata: Arc::new(metadata),
             network_client: Arc::new(MockNetworkClient::new()),
             ack,
             canonicalization: None,
+            release_sweep: None,
             clock: Arc::new(MockClock::default()),
             dashboard: Arc::new(crate::dashboard::DashboardState::default()),
             auditor: Arc::new(crate::audit::LogAuditor::new()),

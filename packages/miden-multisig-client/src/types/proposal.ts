@@ -38,11 +38,17 @@ interface BaseProposalMetadata {
   saltHex?: string;
   requiredSignatures?: number;
   /**
-   * Base64-serialized Miden `ChainAnchor` pinning the reference block the
-   * proposal's transaction summary was built at. Required to verify or
-   * execute the proposal: since protocol 0.16 the signed summary binds the
-   * reference block commitment, so it only reproduces when re-executed at
-   * that block.
+   * The block the proposal's transaction summary binds: the proposer's sync
+   * height when it built the request, or the block a custom producer's request
+   * names. Not signed: this SDK reads the block from the summary and refuses a
+   * proposal whose value disagrees (`BoundBlockMismatchError`), as the Rust SDK
+   * does. Every proposal this SDK creates writes it.
+   */
+  boundBlockNum?: number;
+  /**
+   * Legacy: the base64 Miden `ChainAnchor` 0.18 clients wrote instead of
+   * `boundBlockNum`. This SDK never sets or reads it; the codec passes it
+   * through so an old proposal exports and imports unchanged.
    */
   chainAnchor?: string;
 }
@@ -162,6 +168,36 @@ export interface Proposal {
   txSummary: string;
   signatures: ProposalSignatureEntry[];
   metadata: ProposalMetadata;
+  /**
+   * Result of the last summary-binding check on this value. Only the check
+   * itself writes `verified`; a freshly parsed or imported proposal is
+   * `unchecked`. `syncProposals` surfaces failed proposals instead of
+   * failing wholesale (issue #462); `signProposal` and `executeProposal`
+   * re-verify and refuse them.
+   */
+  verification: ProposalVerification;
+}
+
+/**
+ * Outcome of checking a proposal's metadata against its signed summary.
+ * `failed.retryable` is true when the failure came from a transient node or
+ * RPC error, or from chain state this client had not caught up with, so the
+ * same proposal may verify on a later sync; false when the proposal itself
+ * cannot be reproduced (tampered metadata, for example) and it has to be
+ * re-proposed.
+ */
+export type ProposalVerification =
+  | { status: 'unchecked' }
+  | { status: 'verified' }
+  | { status: 'failed'; retryable: boolean; message: string };
+
+/**
+ * True when the proposal is both verified and has met its signature
+ * threshold, i.e. it can be executed. `status` alone keeps meaning
+ * "threshold met": a fully signed proposal can still be dead.
+ */
+export function isProposalActionable(proposal: Proposal): boolean {
+  return proposal.verification.status === 'verified' && proposal.status === 'ready';
 }
 
 export interface TransactionProposal {
@@ -185,6 +221,7 @@ export interface ExportedProposal {
     signatureHex: string;
     scheme?: SignatureScheme;
     publicKey?: string;
+    messageFormat?: 'eip712';
     timestamp?: string;
   }>;
   metadata: ProposalMetadata;

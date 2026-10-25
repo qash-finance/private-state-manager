@@ -41,6 +41,14 @@ pub struct ApiErrorMeta {
     /// Pause reason. Present only for `GUARDIAN_ACCOUNT_PAUSED`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_reason: Option<String>,
+    /// Rejected signature scheme. Present only for
+    /// `signature_scheme_not_allowed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// Signature schemes this Guardian accepts for new accounts. Present
+    /// only for `signature_scheme_not_allowed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_schemes: Option<Vec<String>>,
     /// RFC 3339 timestamp of the guardian-switch release. Present only
     /// for `GUARDIAN_ACCOUNT_RELEASED`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +200,7 @@ impl Modify for CommonResponsesAddon {
         crate::api::http::get_delta_since,
         crate::api::http::get_delta_history,
         crate::api::http::get_state,
+        crate::api::http::get_canonical_nonce,
         crate::api::http::lookup,
         crate::api::http::get_pubkey,
         crate::api::http::status,
@@ -201,6 +210,9 @@ impl Modify for CommonResponsesAddon {
         crate::api::http::get_delta_proposal,
         crate::api::http::sign_delta_proposal,
         crate::api::http::abandon_candidate,
+        crate::api::http::create_session,
+        crate::api::http::revoke_session,
+        crate::api::http::revoke_all_sessions,
     ),
     components(schemas(ApiErrorResponse, ApiErrorMeta, crate::services::StatusResponse)),
     modifiers(&ClientSecurityAddon, &CommonResponsesAddon),
@@ -222,6 +234,8 @@ pub struct ClientApiDoc;
         crate::api::dashboard::logout_operator,
         crate::api::dashboard::list_operator_accounts,
         crate::api::dashboard::get_dashboard_info_handler,
+        crate::api::dashboard::get_dashboard_stats_handler,
+        crate::api::dashboard::request_dashboard_stats_refresh_handler,
         crate::api::dashboard::get_dashboard_session_handler,
         crate::api::dashboard::get_operator_account,
         crate::api::dashboard::get_operator_account_snapshot,
@@ -408,6 +422,27 @@ mod tests {
             "GET / is an alias of GET /status: their documented contracts must \
              agree on parameters, security, response codes, and body schemas"
         );
+    }
+
+    #[test]
+    fn eip712_request_header_is_documented_on_authenticated_routes() {
+        let json = serde_json::to_value(client_openapi()).unwrap();
+        let signing_params = json["paths"]["/delta/proposal"]["put"]["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(signing_params.iter().any(|param| {
+            param["name"] == "x-auth-format"
+                && param["in"] == "header"
+                && param["required"] == false
+        }));
+        let lookup_params = json["paths"]["/state/lookup"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(lookup_params.iter().any(|param| {
+            param["name"] == "x-auth-format"
+                && param["in"] == "header"
+                && param["required"] == false
+        }));
     }
 
     #[test]

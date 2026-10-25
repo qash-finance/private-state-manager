@@ -27,14 +27,14 @@ The multisig sdk has as peer dependency on the miden-sdk, you will need to insta
 
 **TypeScript (npm)**
 ```bash
-npm install @openzeppelin/miden-multisig-client @miden-sdk/miden-sdk@0.16.0
+npm install @openzeppelin/miden-multisig-client@0.18.3 @miden-sdk/miden-sdk@0.17.3
 ```
 
 **Rust (Cargo.toml)**
 ```toml
 [dependencies]
-miden-multisig-client = "0.17.0"
-miden-client = "=0.16.0"
+miden-multisig-client = "=0.18.3"
+miden-client = "=0.17.3"
 ```
 
 ### 5-Minute Example
@@ -47,8 +47,8 @@ Create a 1-of-3 multisig account, propose a transfer, collect signatures, and ex
 import { MidenClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
 import { MultisigClient, FalconSigner } from '@openzeppelin/miden-multisig-client';
 
-// 1. Setup clients
-const midenClient = await MidenClient.createDevnet();
+// 1. Setup clients (for useWorker, see "Installation & Setup" below)
+const midenClient = await MidenClient.createDevnet({ useWorker: false });
 const secretKey = AuthSecretKey.rpoFalconWithRNG(undefined);
 const signer = new FalconSigner(secretKey);
 const client = new MultisigClient(midenClient, {
@@ -58,8 +58,8 @@ const client = new MultisigClient(midenClient, {
 // Both endpoints are required; construction throws when either is omitted.
 // midenRpcEndpoint must point at the same network as the injected MidenClient.
 
-// 2. Get GUARDIAN server public key
-const guardianCommitment = await client.guardianClient.getPubkey();
+// 2. Get GUARDIAN's ACK commitment for the account's signature scheme
+const { commitment: guardianCommitment } = await client.guardianClient.getPubkey(signer.scheme);
 
 // 3. Create 1-of-3 multisig account
 const config = {
@@ -89,6 +89,22 @@ await multisig.executeProposal(proposal.id);
 
 console.log('Transfer executed!');
 ```
+
+### EIP-712 wallet signing (TypeScript)
+
+`Eip712Signer` accepts a compatible EIP-1193 provider, including a Ledger
+wallet. Connect it to discover the public key, then use it with the same
+`client.load`, proposal creation, `signProposal`, and `executeProposal` calls as
+other signers. `LedgerSigner` remains an alias.
+
+Guardian request authentication uses the `x-auth-format: eip712` header and
+signs `GuardianRequest`. Proposal approvals use `message_format: eip712` on
+the ECDSA signature and sign `MidenTransaction`. These are separate messages
+and signatures; enabling one format does not replace the other.
+
+The proposal ID is the transaction-summary commitment, while the wallet signs
+an EIP-712 digest derived from it. See the TypeScript package README for a
+call-by-call example of the wallet prompts.
 
 ### Prover endpoint and retry policy
 
@@ -217,10 +233,13 @@ The Guardian server exposes the same policy for its own node reads via
 ### Note transport endpoint
 
 Private notes are relayed through a note transport service that is separate
-from the node RPC. On the testnet and devnet presets both SDKs derive the
-transport endpoint automatically; a custom node endpoint has no derivable
-transport service, so it must be set explicitly — otherwise private-note
-relay is disabled.
+from the node RPC. On the devnet and testnet presets both SDKs derive the
+transport endpoint automatically, and the Rust SDK also derives it for Cedar
+(`MidenCedar::endpoint()`) and mainnet (`Endpoint::mainnet()`). The web SDK
+has no Cedar or mainnet preset or shorthand yet, so a browser client on either
+network passes its transport URL explicitly. A custom node endpoint has
+no derivable transport service, so it must be set explicitly; otherwise
+private-note relay is disabled.
 
 In Rust the endpoint lives on the builder, next to the node endpoint:
 
@@ -245,6 +264,7 @@ import { MultisigClient } from '@openzeppelin/miden-multisig-client';
 const midenClient = await MidenClient.create({
   rpcUrl: 'https://my-node.internal:57291',
   noteTransportUrl: 'https://my-transport.internal',
+  useWorker: false,
 });
 
 const client = new MultisigClient(midenClient, {
@@ -315,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 A multisig account requires **M-of-N** signatures to authorize transactions:
 - **Threshold (M)**: Minimum signatures required
 - **Signers (N)**: Total number of authorized cosigners
-- **Commitment**: Each signer's Falcon public key commitment (32 bytes, 64 hex chars)
+- **Commitment**: Each signer's public-key commitment (32 bytes, 64 hex chars)
 
 ### Guardian
 
@@ -343,19 +363,81 @@ GUARDIAN is a coordination server that:
 - **Ready**: Threshold met, can be executed
 - **Finalized**: Executed on-chain or discarded
 
-#### Chain-anchored execution
+#### Tip execution and the bound block
 
-Since Miden protocol 0.16 a signed transaction summary binds the reference
-block commitment, so a summary produced at one block cannot be reproduced by
-re-executing at a later one. Proposals therefore carry a **chain anchor**
-(`chain_anchor` in the proposal metadata): a serialized Miden `ChainAnchor`
-capturing the reference block the proposer executed at. Cosigners verify and
-the executor executes against that anchor, so everyone reproduces the exact
-summary the signatures authorize regardless of their own sync height. The
-anchor is validated on receipt — its internal consistency at deserialization,
-and its block commitment against the one signed into the summary — before
-anything executes against it. A proposal without an anchor cannot be verified
-or executed.
+Since Miden protocol 0.17 a multisig transaction summary binds the block its
+auth args name (the **bound block**), not the block the transaction executes
+against. The proposer binds its sync height, and every request rebuilt from
+the proposal binds the same block and declares it
+(`TransactionRequestBuilder::block_numbers` / `withBlockNumbers`), which puts
+it in the transaction's partial blockchain. Cosigners verify and the executor
+executes **at the chain tip** and still reproduce the exact summary the
+signatures authorize. An execution runs at the Miden client's sync height, so
+the SDK syncs the client before it verifies, signs, or executes a proposal.
+Foreign accounts, the fee faucet among them, therefore load at the tip, and a
+proposal stays verifiable and executable however long it waits for signatures
+(issue #462). A client whose node has not reached the bound block yet fails with
+a retryable error.
+
+Proposals record the bound block in their metadata as `bound_block_num`
+(`boundBlockNum` in TypeScript). It is not signed, so both SDKs read the block
+from the signed summary, when they create a proposal and when they verify one,
+and refuse a proposal whose `bound_block_num` disagrees, whatever its type,
+before it is signed or executed. The TypeScript SDK reads it from the
+serialized summary (`summaryBoundBlockNum`), because the JavaScript
+`TransactionSummary` exposes no block number. Proposals made by 0.18.0 clients
+carry a `chain_anchor` instead and no `bound_block_num`; both SDKs take their
+block from the summary and never read the anchor. Proposal creation syncs up to
+the bound block when the client is behind it and derives the summary at the
+tip, so a request may bind any block up to the client's sync height.
+
+#### Authenticated note consumption
+
+The bound block pins the block, but a `consume_notes` summary also depends on
+*how* each input note is consumed. miden-client decides that per note, at
+execution time and from the local store alone: a note whose record carries
+its inclusion proof is consumed **authenticated**, anything else
+**unauthenticated**, and the two commit differently into the summary
+(`hash(nullifier || note_id_or_ZERO)`). Left to the store, a proposer that
+had synced the notes and a cosigner on a fresh store would therefore sign
+different commitments (issue #409).
+
+Authenticated is the canonical mode. `createConsumeNotesProposal` /
+`TransactionType::consume_notes` authenticates the notes in the proposer's
+store before the summary is derived, and every verifier
+(`syncProposals`, `signProposal`, `executeProposal`, and their Rust
+counterparts) authenticates the proposal's embedded notes before it
+rebuilds: notes already authenticated locally are left alone, the rest get
+their inclusion proofs from the Miden node in one round trip and are
+imported as committed. Verification therefore needs the node, and a
+consume-notes proposal can only be created for notes already committed on
+chain; a note that cannot be authenticated fails with
+`ConsumeNoteNotAuthenticatedError` (`consume_notes_note_not_authenticated`)
+naming the note, rather than with a summary mismatch.
+> **Mixed versions.** A 0.18.0 client refuses a proposal without a
+> `chain_anchor`, so it cannot sign or execute a proposal a later client made,
+> and a signer set that mixes versions stalls. Later clients accept proposals
+> 0.18.0 clients made. Upgrade every party that signs or executes. A listing
+> keeps working either way: a proposal that cannot be verified is returned with
+> `verification` set to `failed` rather than failing the whole sync.
+
+#### Proposal verification status
+
+Every proposal a listing returns carries the outcome of its summary-binding
+check: `verification` on the TS `Proposal` (`{ status: 'unchecked' }`,
+`{ status: 'verified' }`, or `{ status: 'failed', retryable, message }`) and
+`ProposalVerification` on the Rust one (`Unchecked`, `Verified`,
+`Failed { retryable, message }`). Only the check itself writes `verified`;
+a freshly parsed or imported proposal is `unchecked`. `failed` with
+`retryable: true` means the re-execution hit a transient node error and
+the same proposal may verify on the next sync; `retryable: false` means
+the proposal cannot be reproduced (tampered metadata, for example) and has
+to be re-proposed. Verification is kept out of `status`
+on purpose: a proposal can be fully signed and dead at the same time, so
+`status: 'ready'` keeps meaning "threshold met" and
+`isProposalActionable(proposal)` / `proposal.is_actionable()` answers
+"verified and ready". Signing and executing re-verify the one proposal
+they act on and refuse a failed one with the real error.
 
 ### Custom Proposal Types
 
@@ -383,14 +465,32 @@ Rust and TypeScript**:
   proposal with the custom label. They are **not** stored on the server.
   Cosigners then review and sign through the normal flow.
 
-  On a chain whose `verification_base_fee` is non-zero, the request must declare
-  its fee conversion salt. Call `fee_conversion_salt(salt)` in Rust or
-  `withFeeConversionSalt(salt)` in TypeScript. The Miden client derives the native
-  1:1 conversion info from the execution reference header and commits it to the
-  auth argument. The typed proposal builders do this for you. A custom producer
-  must retain the original salt and use it again when rebuilding the request.
-  Do not pass `summaryAuthArg(summary)` to `withFeeConversionSalt`: the summary
-  contains the derived commitment, not the original salt.
+  Since Miden 0.17 the request must carry the multisig auth args: the block its
+  summary binds together with the approval expiration, the salt, and the native
+  1:1 fee conversion info, committed into the auth argument with the preimage in
+  the advice map. In TypeScript, start from
+  `client.feeAwareTransactionRequestBuilder(account, { feeConversionSalt,
+  boundBlockNum, approvalExpirationDelta })` (the delta is 1 to 65535 blocks,
+  the furthest a transaction can expire after its reference block) and never call
+  `withFeeConversionSalt` or `withAuthArg` on it. In Rust, build them with
+  `client.multisig_auth_args(salt, bound_block_num, approval_expiration_delta)`
+  and attach them with `builder.multisig_auth_args(&auth_args)` from
+  `TransactionRequestBuilderExt`; do not
+  declare `fee_conversion_salt`, which would let miden-client commit its own
+  auth arg over them. The typed proposal builders do this for you. A custom producer may build its request at any block up to its sync height:
+  `propose_custom_transaction` / `createCustomProposal` sync up to the block the
+  request binds when the client is behind it and derive the summary at the tip.
+  It must retain the original salt and rebuild at the block the proposal binds
+  (`proposal.tx_summary.block_number()` / `proposal.metadata.boundBlockNum`, or
+  `requestBoundBlockNum(request)` on the request it built) with the expiration
+  the summary binds;
+  `summarySalt(summary)` / `summary_salt(&summary)` read the salt the cosigners
+  signed over for a cross-check. The request has to declare its bound block,
+  since proposals execute at the tip: both builders above do, and a request
+  that binds a block without declaring it is refused with
+  `BoundBlockNotDeclaredError` / `MultisigError::BoundBlockNotDeclared`.
+  Serialize the request with a client on the SDK's `miden-client` pin
+  (see [`MIDEN_COMPATIBILITY.md`](./MIDEN_COMPATIBILITY.md)).
 - **Execute** — `prepare_custom_execution(proposal_id, transaction_request_bytes)` (Rust) /
   `prepareCustomExecution(proposalId, transactionRequestBytes)` (TS). The SDK verifies the
   proposal is ready, binding-checks the request against the signed commitment
@@ -432,14 +532,26 @@ integration extends rather than replaces its advice map.
 > Cosigners must verify the raw `tx_summary` they are signing — not trust the
 > label or description.
 
-### Offline Workflow
+### Side-channel (offline) workflow
 
-For air-gapped or offline signing scenarios:
+For moving a proposal between cosigners as a document instead of through
+GUARDIAN's pending set.
+
+> **This is off-channel signature collection, not air-gapped operation.**
+> Nothing here avoids the chain: executing any proposal, `switch_guardian`
+> included, submits a transaction to the Miden network. What `switch_guardian`
+> alone avoids is the *current* GUARDIAN, which is the point of it, since the
+> flow exists for leaving a GUARDIAN that will not cooperate. Even that path
+> reaches the network to verify the new endpoint and to sync before it builds
+> the proposal. For every other type the signing step reproduces the
+> transaction to verify the summary, so the signer needs a synced store (and,
+> for `consume_notes`, the node), and execution needs an acknowledgement from
+> GUARDIAN. A transfer executed this way still reaches GUARDIAN.
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
 │  Proposer   │         │  Cosigner   │         │  Executor   │
-│  (Online)   │         │ (Air-gapped)│         │  (Online)   │
+│  (Online)   │         │ (Off-channel)│        │  (Online)   │
 └──────┬──────┘         └──────┬──────┘         └──────┬──────┘
        │                       │                       │
        │  Export proposal.json │                       │
@@ -471,7 +583,7 @@ import {
 } from '@openzeppelin/miden-multisig-client';
 
 // Initialize Miden client (connects to Miden node)
-const midenClient = await MidenClient.createDevnet();
+const midenClient = await MidenClient.createDevnet({ useWorker: false });
 
 // Create signer from secret key
 const secretKey = AuthSecretKey.rpoFalconWithRNG(undefined);
@@ -484,11 +596,85 @@ const client = new MultisigClient(midenClient, {
 });
 ```
 
+The SDK does all of its local work through the injected `MidenClient` and never
+opens a second client on its store, so pass the client your application executes
+transactions with: miden-client keeps account state in memory per client, and a
+second live client writing the same store can persist a storage root computed
+from state it never saw. `midenRpcEndpoint` serves only the SDK's direct node
+reads (on-chain commitments and note inclusion proofs).
+
+In a browser, create that client with `useWorker: false`, which runs its WASM
+work on the page's main thread. In the default worker mode, transactions
+execute and apply in a Web Worker that never sees the account state the SDK
+writes with `accounts.insert`, so a device's local copy of the account breaks
+after `MultisigClient.load` or a `syncState()` import. The symptoms and
+recovery are in
+[TROUBLESHOOTING.md](./TROUBLESHOOTING.md#account-data-wasnt-found-or-incomplete-storage-map-in-a-browser),
+the upstream status in
+[MIDEN_COMPATIBILITY.md](./MIDEN_COMPATIBILITY.md#open-upstream-items). Node.js
+clients have no worker and are unaffected.
+
+#### Cedar
+
+`@miden-sdk/miden-sdk` 0.17.3 has no Cedar preset and no `'cedar'` shorthand,
+so a Cedar client names its endpoints explicitly:
+
+```typescript
+const midenClient = await MidenClient.create({
+  rpcUrl: 'https://rpc.cedar.miden.io',
+  proverUrl: 'https://tx-prover.cedar.miden.io',
+  noteTransportUrl: 'https://transport.cedar.miden.io',
+  autoSync: true,
+  useWorker: false,
+});
+
+const client = new MultisigClient(midenClient, {
+  guardianEndpoint: 'https://your-guardian-host',
+  midenRpcEndpoint: 'https://rpc.cedar.miden.io',
+});
+```
+
+Cedar addresses use the `mm` prefix, today the same as mainnet's. In Rust,
+`MidenCedar::endpoint()` selects the Cedar prover and note transport automatically. miden-client does
+not know Cedar, so its `Client::network_id()` returns the generic custom id
+`mcst` for a Cedar endpoint; encode Cedar addresses with
+`MidenCedar::network_id()` (`mm`) instead.
+
+#### Mainnet
+
+`@miden-sdk/miden-sdk` 0.17.3 has no `createMainnet()` preset and no
+`'mainnet'` shorthand for `rpcUrl`, `proverUrl`, or `noteTransportUrl` either,
+so a mainnet client names its endpoints the same way:
+
+```typescript
+const midenClient = await MidenClient.create({
+  rpcUrl: 'https://rpc.mainnet.miden.io',
+  proverUrl: 'https://tx-prover.mainnet.miden.io',
+  noteTransportUrl: 'https://transport.mainnet.miden.io',
+  autoSync: true,
+  useWorker: false,
+});
+
+const client = new MultisigClient(midenClient, {
+  guardianEndpoint: 'https://your-guardian-host',
+  midenRpcEndpoint: 'https://rpc.mainnet.miden.io',
+  prover: {
+    retry: { maxAttempts: 4 },
+  },
+});
+```
+
+`createTestnet` and `createDevnet` set exactly these three endpoints plus
+`autoSync`, so the explicit Cedar and mainnet forms are equivalent. Without
+`noteTransportUrl`, private notes cannot be relayed between cosigners. Leave
+`prover.url` unset so the SDK keeps the Cedar or mainnet prover injected into
+the `MidenClient`; a `url` there overrides it.
+
 ### Creating Accounts
 
 ```typescript
-// Get GUARDIAN server's public key commitment
-const guardianCommitment = await client.guardianClient.getPubkey();
+// Get GUARDIAN's ACK commitment for the account's signature scheme
+const { commitment: guardianCommitment } = await client.guardianClient.getPubkey(signer.scheme);
 
 // Define multisig configuration
 const config: MultisigConfig = {
@@ -512,6 +698,13 @@ console.log('Threshold:', multisig.threshold);
 console.log('Signers:', multisig.signerCommitments);
 ```
 
+`getPubkey` returns `{ commitment, pubkey }` for one signature scheme and
+defaults to Falcon when no scheme is passed, including on a Guardian that only
+admits ECDSA accounts (`GUARDIAN_ALLOWED_ACCOUNT_SCHEMES=ecdsa`): both ACK keys
+stay loaded for existing accounts. Always pass the scheme of the account you
+are creating, usually `signer.scheme`. A Falcon commitment in an ECDSA account
+is refused at registration with an authorization error, not a scheme mismatch.
+
 ### Loading Existing Accounts
 
 ```typescript
@@ -527,6 +720,15 @@ console.log('Threshold:', detected.threshold);
 console.log('Signers:', detected.signerCommitments);
 console.log('Vault balances:', detected.vaultBalances);
 ```
+
+`load()` reconciles GUARDIAN's account with the local store under the same
+rule `syncState()` uses: it keeps local state when GUARDIAN is behind (a pushed
+delta not yet canonicalized), adopts GUARDIAN's when it is ahead and matches the
+on-chain commitment, and throws on divergence. Loading an account that has
+transacted into an empty store reads its commitment from the Miden node, so the
+node must be reachable, and it throws while GUARDIAN's canonical state still
+lags the chain; retry once GUARDIAN has canonicalized. The Rust `pull_account`
+does not reconcile (see below).
 
 ### Delta History
 
@@ -610,14 +812,19 @@ flag.
 
 #### The transport-drain strategy
 
-A fresh store has no note-transport cursor — and in a store shared with
-other accounts, sync may have advanced the cursor past private notes
-addressed to the recovered account. The drain rescans the full transport
-backlog for every tracked note tag (running as many transport syncs as the
-upstream per-sync tag backfill cap requires), regardless of the stored
-cursor, and never regresses it. It is idempotent, and a failed drain
-restores the covered-tags bookkeeping so normal sync keeps working exactly
-as before the attempt.
+The note transport keeps one cursor per tracked note tag, and a tag
+without one is served from the first retained note. A recovered account's
+tag has no cursor yet, on a fresh device and in a store shared with other
+accounts alike, so its whole retained backlog is fetched. Each transport
+fetch reads a bounded number of pages; the drain keeps fetching until a
+fetch moves no tag's cursor, at most 64 fetches. A fetch whose pages hold
+only notes the store already has, or notes no tracked account can consume,
+still moves the cursor, so a store upgraded from 0.18.0 (whose tags all
+restart from the first retained note) walks past the history it holds to
+the notes behind it. It is idempotent: imports dedupe and cursors only move
+forward. A backlog whose cursors still move after 64 fetches is reported
+`failed` with `retryable: true`, and a rerun continues from the stored
+cursors.
 
 Transport problems land in `report.transport`, never as exceptions:
 `unavailable` means no transport endpoint is configured or the transport
@@ -638,7 +845,11 @@ them from GUARDIAN (isolating per-proposal parse or binding failures as
 `invalid` outcomes instead of failing the whole step), validates each
 embedded note against the proposal's declared note ids, fetches on-chain
 inclusion proofs, and imports per note — so it works for private notes too;
-the node never needs to hold the note body.
+the node never needs to hold the note body. Binding verification itself
+already authenticates a proposal's embedded notes into the store (see
+*Authenticated note consumption*), so a proposal that verified reports its
+notes as already present here; the import step still covers notes whose
+proposal failed verification for an unrelated reason.
 
 Each unique embedded note gets a `NoteImportOutcome` in
 `report.proposalImport` (`imported`, `already-present`, `already-consumed`,
@@ -725,7 +936,9 @@ notes are not imported here.
 
 Every `create*Proposal` method takes a single trailing options object (issue
 #387). All of them accept an optional `nonce` that identifies the proposal
-(defaults to `Date.now()`); method-specific options are listed with each
+(defaults to the store account's nonce plus one, the nonce the executed
+transaction will have, as the Rust SDK labels proposals; through 0.18.0
+the default was `Date.now()`); method-specific options are listed with each
 method below. Passing a legacy positional `nonce` number where the options
 object is expected throws instead of silently applying defaults.
 
@@ -790,14 +1003,13 @@ await multisig.exportNoteToFile(noteId);
 const importedNoteId = await multisig.importNoteFromBytes(noteFileBytes);
 ```
 
-> **Note:** every cosigner device that verifies or signs the consume-notes
-> proposal needs the note in its local store with the on-chain inclusion
-> proof — deliver the note file to each of them (import + sync), not just to
-> the proposer. A cosigner whose store lacks the authenticated note rebuilds
-> the transaction differently (the input-notes commitment distinguishes
-> authenticated from unauthenticated consumption) and rejects the proposal
-> with `metadata does not match tx_summary`. The sender's own device heals
-> itself: it already knows the full note, so a post-commit sync is enough.
+> **Note:** only the proposer needs the note file. The proposal embeds the
+> note, and every cosigner device that verifies or signs it authenticates
+> that embedded note from the node's inclusion proof before rebuilding (see
+> *Authenticated note consumption* above), so the store contents of the other
+> devices no longer matter. The proposer must wait for the note to commit on
+> chain before proposing: an uncommitted note cannot be authenticated and
+> proposal creation fails with `ConsumeNoteNotAuthenticatedError`.
 
 #### Consume Notes (Claim Received Funds)
 
@@ -865,9 +1077,20 @@ const proposal = await multisig.createRemoveSignerProposal(
 
 ```typescript
 const proposal = await multisig.createChangeThresholdProposal(
-  newThreshold           // New threshold value
+  newThreshold           // New account-wide threshold, 1..=signer count
 );
 ```
+
+This moves the **account-wide default** threshold, the "N" in N-of-M. It is not
+the per-procedure override that `createUpdateProcedureThresholdProposal` sets.
+Where an override exists it takes precedence for the procedure it names, so
+lowering the default does not lower an overridden procedure, and this call is
+itself gated by whatever threshold governs `update_signers`. The signer set is
+not a parameter: membership changes go through `createAddSignerProposal` and
+`createRemoveSignerProposal`.
+
+The Rust equivalent is `TransactionType::update_signers(threshold, commitments)`,
+passing the account's current signer set unchanged.
 
 #### Switch GUARDIAN Provider
 
@@ -893,11 +1116,29 @@ const exported = await multisig.createSwitchGuardianProposalOffline(
 
 ### Signing & Executing Proposals
 
+> **The two SDKs differ on who has signed a new proposal.** On ordinary
+> creation the Rust SDK attaches the proposer's signature and the TypeScript SDK
+> does not, so the same 2-of-3 flow needs one more signature collected on the
+> TypeScript path. The exception is
+> `createSwitchGuardianProposalOffline`, which signs as it exports and so
+> carries the proposer's signature on both SDKs. Neither convention is wrong,
+> but threshold arithmetic written against one SDK is wrong against the other,
+> and arithmetic written against ordinary creation is wrong for the offline
+> switch. Offer the proposal to every cosigner and let `signaturesCollected`
+> decide, rather than assuming who has already signed.
+
 ```typescript
 // List all pending proposals
 const proposals = await multisig.syncProposals();
 
 for (const proposal of proposals) {
+  if (proposal.verification.status === 'failed') {
+    // The signed summary could not be reproduced from the metadata (for
+    // example, the metadata was tampered with). Signing and executing refuse it.
+    const { retryable, message } = proposal.verification;
+    console.log(`${proposal.id}: ${retryable ? 'retry later' : 're-propose'} — ${message}`);
+    continue;
+  }
   console.log(`${proposal.id}: ${proposal.status.type}`);
 
   if (proposal.status.type === 'pending') {
@@ -921,7 +1162,8 @@ if (signed.status.type === 'ready') {
 const json = multisig.exportProposalToJson(proposalId);
 // Share via file, QR code, etc.
 
-// On air-gapped machine: import and sign
+// On the cosigner's machine: import and sign. Needs a synced store
+// unless this is a switch_guardian proposal.
 const imported = multisig.importProposal(json);
 const signedJson = multisig.signProposalOffline(proposalId);
 
@@ -960,6 +1202,46 @@ support it. Multiple matches are valid: the same key commitment may authorize
 more than one account, and the method returns all matches instead of choosing
 one implicitly.
 
+### Signing Requests With a Session
+
+Every Guardian request is otherwise signed by the wallet, which means a prompt
+per request on a hardware wallet. When the Guardian advertises `sessions` on
+`GET /status`, the wallet can sign one session grant; a non-extractable
+WebCrypto P-256 key (the delegated signer) then signs reads, proposal listing
+and proposal create/sign until the session ends. Transaction approvals,
+account registration, delta pushes, candidate abandons and account lookup
+still use the wallet.
+
+```typescript
+import { IndexedDbSessionKeyStore, describeSessionGrant } from '@openzeppelin/miden-multisig-client';
+
+const store = new IndexedDbSessionKeyStore();
+const onEnded = (reason) => {
+  // 'expired' | 'revoked' | 'rejected': requests are wallet-signed again.
+  // 'logout': the app ended the session itself.
+};
+const session =
+  (await client.resumeSession(signer, store, { onEnded })) ??
+  (await client.startSession(signer, {
+    store,
+    onEnded,
+    confirm: (grant) => showToUser(describeSessionGrant(grant)), // required for raw wallets
+  }));
+
+await client.endSession(store); // this session
+await client.revokeAllSessions(signer, store); // every session of the signer, wallet-signed
+```
+
+The grant covers every account the signer cosigns on this Guardian until it
+expires. Its `origin` is written by the page and unverified; the trustworthy
+signal is the wallet's own indicator of the requesting site. Raw (Falcon, raw
+ECDSA) wallets show only a hash, so `startSession` requires `confirm`, which
+helps on an honest page but not against a phishing page. Revoke-all ends the
+sessions already registered; a page can register a grant it got signed for up
+to about 10 minutes, so run `revokeAllSessions` again 10 minutes later when a
+key may be compromised. The full protocol is in `spec/api.md` (Session
+Authentication).
+
 ### API Reference
 
 #### MultisigClient
@@ -969,6 +1251,10 @@ one implicitly.
 | `create(config, signer)` | Create new multisig account |
 | `load(accountId, signer)` | Load existing account from GUARDIAN |
 | `recoverByKey(signer)` | Discover accounts that authorize the signer's key and fetch each current state |
+| `startSession(signer, { ttlSeconds?, origin?, confirm?, store?, onEnded? }?)` | Sign one session grant; the delegated signer then signs session-eligible requests. Logs out a session this client already holds |
+| `resumeSession(signer, store, { onEnded? }?)` | Reuse a stored session key without a wallet prompt; `null` when none or about to expire |
+| `endSession(store?)` | Log out the current session and forget its stored key |
+| `revokeAllSessions(signer, store?)` | Wallet-signed: revoke every session of the signer on this Guardian |
 | `guardianClient` | Access to underlying GUARDIAN HTTP client |
 
 #### Multisig
@@ -979,12 +1265,13 @@ one implicitly.
 | `threshold` | Get current threshold |
 | `signerCommitments` | Get list of signer commitments |
 | `fetchState()` | Fetch latest state from GUARDIAN |
+| `syncState()` | Reconcile the local store with GUARDIAN; pre-checks GUARDIAN's canonical nonce (`getCanonicalNonce`) and skips the state fetch when that nonce is below the local nonce, or equal to it at the same commitment. Returns `{ source: 'guardian', state }` or `{ source: 'local', localNonce, guardianNonce }` |
 | `registerOnGuardian()` | Register new account with GUARDIAN |
-| `syncProposals()` | Sync proposals from GUARDIAN |
+| `syncProposals()` | Sync proposals from GUARDIAN, pruning ones it no longer reports (TS-only cache reconciliation; the Rust `list_proposals` builds a fresh list per call and has no cache to prune) |
 | `abandonCandidate(nonce)` | Record an abandon intent for a stuck candidate (worker resolves after a short quarantine) |
 | `abandonStatus(nonce)` | Poll the abandon resolution: `waiting` / `landed` / `abandoned` / `unexpected` |
 | `deltaHistory({ limit?, cursor? }?)` | One page of canonical delta history, newest-first, with decoded note summaries |
-| `listProposals()` | Get cached proposals |
+| `listProposals()` | Get proposals from the most recent sync plus not-yet-reported local creates/imports |
 | `createP2idProposal(recipient, faucet, amount, { nonce, noteType, reclaimHeight, timelockHeight }?)` | Create transfer proposal (`noteType`: `NoteType.Public` (default) or `NoteType.Private`; presence of `reclaimHeight`/`timelockHeight` creates a P2IDE note, issue #366) |
 | `createConsumeNotesProposal(noteIds, { nonce }?)` | Create note consumption proposal |
 | `getP2idNoteId(proposal)` | Compute the note ID a P2ID proposal creates (call before executing) |
@@ -996,7 +1283,7 @@ one implicitly.
 | `preservePreSwitchProposalNotes()` | Pre-switch slice of the flow (issue #417): import notes embedded in the old GUARDIAN's pending proposals before repointing; run automatically by `executeProposal` on the switch path; returns the report or `undefined` |
 | `createAddSignerProposal(commitment, { nonce, newThreshold }?)` | Create add signer proposal (`newThreshold` defaults to the current threshold) |
 | `createRemoveSignerProposal(commitment, { nonce, newThreshold }?)` | Create remove signer proposal (`newThreshold` defaults to min of current threshold and remaining signer count) |
-| `createChangeThresholdProposal(threshold, { nonce }?)` | Create threshold change proposal |
+| `createChangeThresholdProposal(threshold, { nonce }?)` | Change the account-wide threshold (not a per-procedure override) |
 | `createUpdateProcedureThresholdProposal(procedure, threshold, { nonce }?)` | Create per-procedure threshold override proposal (`threshold: 0` clears the override) |
 | `createSwitchGuardianProposal(endpoint, pubkey, { nonce }?)` | Create GUARDIAN switch proposal |
 | `createSwitchGuardianProposalOffline(endpoint, pubkey, { nonce }?)` | Create GUARDIAN switch proposal without contacting the current GUARDIAN; returns a signed `ExportedProposal` for side-channel cosigning (issue #433) |
@@ -1019,6 +1306,8 @@ one implicitly.
 | `signRequest(id, timestamp, requestPayload)` | Sign account ID + timestamp + request payload digest for auth |
 | `signCommitment(hex)` | Sign commitment/word |
 | `signLookupMessage(timestamp, keyCommitment)` | Sign account-less lookup digest for `recoverByKey` |
+| `signSessionGrant(grant)` | Sign a session grant digest for `startSession` |
+| `signSessionRevokeAll(signerCommitment, timestamp)` | Sign the account-less revoke-all digest for `revokeAllSessions` |
 
 #### AccountInspector
 
@@ -1103,7 +1392,10 @@ println!("Signers: {:?}", account.cosigner_commitments_hex());
 // Pull account from GUARDIAN (as a cosigner)
 let account = client.pull_account(account_id).await?;
 
-// Sync with Miden network
+// Sync with the Miden network, then with GUARDIAN. The GUARDIAN step
+// asks for the canonical nonce first and fetches the full state only
+// when GUARDIAN is ahead of the local account or has diverged from it
+// (same nonce, different commitment).
 client.sync().await?;
 
 // Inspect account
@@ -1111,6 +1403,11 @@ println!("Threshold: {}", account.threshold()?);
 println!("Nonce: {}", account.nonce());
 println!("GUARDIAN commitment: {:?}", account.guardian_commitment()?);
 ```
+
+Unlike the TypeScript `load()`, `pull_account` overwrites the local store with
+GUARDIAN's state unconditionally, by design: it is for joining an account or
+discarding a store known to be bad. Use `sync_from_guardian` to refresh an
+account you intend to keep.
 
 ### Delta History
 
@@ -1202,14 +1499,19 @@ flag.
 
 #### The transport-drain strategy
 
-A fresh store has no note-transport cursor — and in a store shared with
-other accounts, sync may have advanced the cursor past private notes
-addressed to the recovered account. The drain rescans the full transport
-backlog for every tracked note tag (running as many transport syncs as the
-upstream per-sync tag backfill cap requires), regardless of the stored
-cursor, and never regresses it. It is idempotent, and a failed drain
-restores the covered-tags bookkeeping so normal sync keeps working exactly
-as before the attempt.
+The note transport keeps one cursor per tracked note tag, and a tag
+without one is served from the first retained note. A recovered account's
+tag has no cursor yet, on a fresh device and in a store shared with other
+accounts alike, so its whole retained backlog is fetched. Each transport
+fetch reads a bounded number of pages; the drain keeps fetching until a
+fetch moves no tag's cursor, at most 64 fetches. A fetch whose pages hold
+only notes the store already has, or notes no tracked account can consume,
+still moves the cursor, so a store upgraded from 0.18.0 (whose tags all
+restart from the first retained note) walks past the history it holds to
+the notes behind it. It is idempotent: imports dedupe and cursors only move
+forward. A backlog whose cursors still move after 64 fetches is reported
+`failed` with `retryable: true`, and a rerun continues from the stored
+cursors.
 
 Transport problems land in `report.transport`, never as errors:
 `Unavailable` means no transport endpoint is configured or the transport
@@ -1230,7 +1532,11 @@ them from GUARDIAN (isolating per-proposal parse or binding failures as
 `Invalid` outcomes instead of failing the whole step), validates each
 embedded note against the proposal's declared note ids, fetches on-chain
 inclusion proofs, and imports per note — so it works for private notes too;
-the node never needs to hold the note body.
+the node never needs to hold the note body. Binding verification itself
+already authenticates a proposal's embedded notes into the store (see
+*Authenticated note consumption*), so a proposal that verified reports its
+notes as already present here; the import step still covers notes whose
+proposal failed verification for an unrelated reason.
 
 Each unique embedded note gets a `NoteImportOutcome` in
 `report.proposal_import` (`Imported`, `AlreadyPresent`, `AlreadyConsumed`,
@@ -1382,6 +1688,13 @@ match client.propose_with_fallback(tx).await? {
 let proposals = client.list_proposals().await?;
 
 for proposal in &proposals {
+    if let ProposalVerification::Failed { retryable, message } = &proposal.verification {
+        // The signed summary could not be reproduced from the metadata (for
+        // example, the metadata was tampered with). Signing and executing refuse it.
+        let hint = if *retryable { "retry later" } else { "re-propose" };
+        println!("{}: {hint} — {message}", proposal.id);
+        continue;
+    }
     match &proposal.status {
         ProposalStatus::Pending => {
             let (signatures_collected, signatures_required) = proposal.signature_counts();
@@ -1412,7 +1725,8 @@ client.execute_proposal(&proposal_id).await?;
 let exported = client.create_proposal_offline(tx).await?;
 std::fs::write("proposal.json", exported.to_json()?)?;
 
-// On air-gapped machine: load and sign
+// On the cosigner's machine: load and sign. Needs a synced store
+// unless this is a switch_guardian proposal.
 let json = std::fs::read_to_string("proposal.json")?;
 let mut exported: ExportedProposal = serde_json::from_str(&json)?;
 client.sign_imported_proposal(&mut exported)?;
@@ -1506,6 +1820,30 @@ An empty list means the key is valid but this Guardian has no account metadata
 that authorizes its commitment. Authentication failures, malformed lookup
 responses, and per-account `get_state` failures are returned as errors.
 
+### Signing Requests With a Session
+
+`start_session` has the key manager sign one session grant; a delegated P-256
+key then signs the state and delta reads and the proposal list, get, create
+and sign requests of every later operation until the session ends.
+Registration, delta pushes, candidate abandons, lookup and transaction
+approvals keep using the key manager.
+
+```rust
+let info = client
+    .start_session(StartSessionOptions {
+        network: "devnet".to_string(),
+        ttl: Duration::from_secs(3600),
+    })
+    .await?;
+client.sync().await?;
+client.end_session().await?;
+```
+
+A session Guardian ends or no longer accepts is dropped, after which
+`session()` returns `None`; there is no callback. `revoke_all_sessions` is
+wallet-signed; run it again 10 minutes later when a key may be compromised
+(see the TypeScript guide above).
+
 ### API Reference
 
 #### MultisigClient
@@ -1522,6 +1860,10 @@ responses, and per-account `get_state` failures are returned as errors.
 | `user_commitment()` | Get user's key commitment |
 | `user_commitment_hex()` | Get commitment as hex |
 | `recover_by_key()` | Discover accounts that authorize the configured signer and fetch each current state |
+| `start_session(options)` | Sign one session grant; later reads and proposal requests are signed by the session key. Logs out a session it replaces |
+| `session()` | The active session (`SessionInfo`), or `None` |
+| `end_session()` | Log out the current session |
+| `revoke_all_sessions()` | Key-manager-signed: revoke every session of this key on the Guardian |
 | `propose_transaction(tx)` | Create and submit proposal |
 | `propose_with_fallback(tx)` | Online or offline proposal |
 | `list_proposals()` | List pending proposals |
@@ -1673,7 +2015,7 @@ console.log('Notes consumed, funds now in vault');
 │                         OFFLINE SIGNING FLOW                         │
 └─────────────────────────────────────────────────────────────────────┘
 
-  PROPOSER (Online)           COSIGNER (Air-gapped)        EXECUTOR (Online)
+  PROPOSER (Online)           COSIGNER (Off-channel)       EXECUTOR (Online)
   ─────────────────           ────────────────────         ────────────────
         │                            │                            │
         │ create_proposal_offline()  │                            │
@@ -1736,8 +2078,8 @@ reset stored data: see
 [`MIDEN_COMPATIBILITY.md`](./MIDEN_COMPATIBILITY.md).
 
 Guardian's version and Miden's are not aligned (Guardian 0.16.x runs on Miden
-0.15; Miden 0.16 lands in Guardian 0.17.x), so read that matrix rather than
-matching the numbers. Per-release breaking changes are also in the
+0.15; Miden 0.16 lands in Guardian 0.17.x; Miden 0.17 lands in Guardian 0.18.x),
+so read that matrix rather than matching the numbers. Per-release breaking changes are also in the
 [GitHub release notes](https://github.com/OpenZeppelin/guardian/releases).
 
 ### Contract version pinning
@@ -1756,9 +2098,9 @@ it returns. That settles the linkage question that used to matter here. `auth_tx
 `miden::standards::fee`, so its root depends on whether the standards package is linked
 statically (the callee's MAST is inlined) or dynamically (an external reference is left) —
 compiling an equivalent source locally links dynamically and roots differently, which is
-why a locally built component could not be classified by `AccountComponentInterface::from_procedures`
-and never had fee conversion info attached. Taking the component from upstream removes the
-choice, so the pinned roots describe upstream's build and nothing else.
+why a locally built component could not be classified by `AccountComponentInterface::from_procedures`.
+Taking the component from upstream removes the choice, so the pinned roots describe upstream's
+build and nothing else. The request builders set the three-word multisig auth args themselves.
 
 The exact versions for each Guardian release are in
 [`MIDEN_COMPATIBILITY.md`](./MIDEN_COMPATIBILITY.md#support-matrix); they are not
@@ -1798,7 +2140,7 @@ the mapping is in
 [`MIDEN_COMPATIBILITY.md`](./MIDEN_COMPATIBILITY.md#support-matrix).
 
 Compatibility there is about the on-chain account, not Guardian's stored state.
-Adopting a new Miden line has twice required an irreversible server-side reset, so
+Adopting a new Miden line has three times required an irreversible server-side reset, so
 even an account whose contract version still matches must be re-registered
 afterwards. See
 [`MIDEN_COMPATIBILITY.md`](./MIDEN_COMPATIBILITY.md#data-resets).

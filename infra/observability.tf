@@ -9,7 +9,8 @@
 # below becomes one CloudWatch custom metric. Dimension sets are chosen
 # from Guardian's closed label sets (statuses, outcomes, small enums) to
 # keep the count bounded; high-cardinality labels (route, method,
-# operation) are deliberately rolled up, and zero-dimension rollups are
+# operation outside failed storage operations) are deliberately rolled
+# up, and zero-dimension rollups are
 # declared only where a widget or alarm actually consumes them.
 
 locals {
@@ -25,13 +26,13 @@ locals {
   # low-traffic multi-task fleet they dilute the observed rate — e.g.
   # six tasks contribute ~60 successful probes per 5-minute period, so
   # three real failures read as ~4.8% and stay under the default 5%
-  # threshold. Treat the rate alarms as sustained-fault signals; an
-  # absolute server-error alarm is the follow-up if low-volume
-  # detection is needed.
+  # threshold. Treat the rate alarms as sustained-fault signals; the
+  # absolute complement for low-volume detection is the log-based
+  # server-log-errors alarm in log_alarms.tf.
   http_error_statuses = ["500", "501", "502", "503", "504"]
   grpc_error_codes    = ["internal", "unavailable", "unknown", "data_loss", "deadline_exceeded"]
 
-  # The eight Prometheus histograms. The awsemf exporter delta-converts
+  # The nine Prometheus histograms. The awsemf exporter delta-converts
   # cumulative counters but NOT histograms (their sum/count would be
   # republished as process-lifetime totals every scrape, making
   # CloudWatch Average lifetime-weighted — hours of cheap health checks
@@ -47,6 +48,7 @@ locals {
     "guardian_canonicalization_fast_run_duration_seconds",
     "guardian_canonicalization_reconcile_run_duration_seconds",
     "guardian_canonicalization_candidate_age_seconds",
+    "guardian_release_sweep_rotation_duration_seconds",
   ]
 
   http_error_rate_expression = "100 * (${join(" + ", [for s in local.http_error_statuses : "FILL(h${s}, 0)"])}) / FILL(hall, 1)"
@@ -172,6 +174,17 @@ locals {
             dimensions = [["outcome"]]
           },
           {
+            # Per-operation breakdown for failed storage operations only:
+            # the label matcher keeps the ok series rolled up, so the
+            # metric count grows with the set of operations that actually
+            # fail rather than with every storage method.
+            metric_name_selectors = ["^guardian_storage_operations_total$"]
+            label_matchers = [
+              { label_names = ["outcome"], regex = "^error$" }
+            ]
+            dimensions = [["operation", "outcome"]]
+          },
+          {
             metric_name_selectors = [
               "^guardian_miden_rpc_duration_seconds$",
               "^guardian_miden_rpc_retries_total$",
@@ -204,6 +217,17 @@ locals {
               "^guardian_canonicalization_pass_accounts$",
             ]
             dimensions = [[]]
+          },
+          {
+            metric_name_selectors = [
+              "^guardian_release_sweep_rotations_total$",
+              "^guardian_release_sweep_accounts_total$",
+            ]
+            dimensions = [["outcome"]]
+          },
+          {
+            metric_name_selectors = ["^guardian_release_sweep_rotation_duration_seconds$"]
+            dimensions            = [[]]
           },
           {
             metric_name_selectors = [
@@ -267,7 +291,7 @@ resource "aws_cloudwatch_dashboard" "server" {
   dashboard_name = local.dashboard_name
 
   dashboard_body = jsonencode({
-    widgets = [
+    widgets = concat([
       # --- Row 0: request volume, errors, latency --------------------------
       {
         type = "metric", x = 0, y = 0, width = 8, height = 6
@@ -301,11 +325,12 @@ resource "aws_cloudwatch_dashboard" "server" {
       {
         type = "metric", x = 16, y = 0, width = 8, height = 6
         properties = {
-          title  = "Request latency (avg seconds)"
+          title  = "Request latency (seconds)"
           region = var.aws_region, view = "timeSeries", period = 300
           metrics = [
             ["${local.metrics_namespace}", "guardian_http_request_duration_seconds", { stat = "Average", label = "HTTP avg" }],
             ["${local.metrics_namespace}", "guardian_grpc_request_duration_seconds", { stat = "Average", label = "gRPC avg" }],
+            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", aws_lb.main.arn_suffix, { stat = "p99", label = "ALB p99" }],
           ]
         }
       },
@@ -505,7 +530,22 @@ resource "aws_cloudwatch_dashboard" "server" {
           ]
         }
       },
-    ]
+      ], var.cloudwatch_log_alarms_enabled ? [
+      # Metric-filter counts from the server log group (log_alarms.tf), not
+      # scraped metrics; present only when the filters are deployed.
+      {
+        type = "metric", x = 16, y = 36, width = 8, height = 6
+        properties = {
+          title  = "Server log lines by level"
+          region = var.aws_region, view = "timeSeries", period = 300
+          yAxis  = { left = { min = 0 } }
+          metrics = [
+            [local.log_metrics_namespace, local.log_error_metric_name, { stat = "Sum", label = "ERROR", color = "#d62728" }],
+            [local.log_metrics_namespace, local.log_warn_metric_name, { stat = "Sum", label = "WARN", color = "#ff7f0e" }],
+          ]
+        }
+      },
+    ] : [])
   })
 }
 
@@ -513,19 +553,38 @@ resource "aws_cloudwatch_dashboard" "server" {
 # All application-metric alarms treat missing data as notBreaching except
 # the metrics-missing alarm, whose entire job is to catch the pipeline
 # going dark (server metrics disabled, sidecar dead, or scrape failing).
+# The log-based alarm lives in log_alarms.tf and follows the same rules.
+#
+# Every description ends with local.alarm_description_links: the stack
+# name plus console deep links to the dashboard and the server log group,
+# so a Slack notification (which carries the description, the alarm link,
+# and a metric graph) is enough to start debugging. All inputs are static
+# per stack, so the suffix never causes plan churn; worst case stays well
+# under the 1024-character description limit.
+
+locals {
+  cloudwatch_console_base = "https://console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}"
+  dashboard_console_url   = "${local.cloudwatch_console_base}#dashboards:name=${local.dashboard_name}"
+  # The console encodes log-group paths twice ("/" -> "$252F").
+  server_logs_console_url = "${local.cloudwatch_console_base}#logsV2:log-groups/log-group/${replace(local.server_log_group_name, "/", "$252F")}"
+  alarm_description_links = " | Stack: ${var.stack_name} | Dashboard: ${local.dashboard_console_url} | Logs: ${local.server_logs_console_url} (streams ecs/* server, adot/* sidecar)"
+  # Variant for the log-based alarm (log_alarms.tf), which also exists with
+  # the metrics pipeline off: no dashboard or sidecar to link to then.
+  log_alarm_description_links = local.cloudwatch_metrics_enabled ? local.alarm_description_links : " | Stack: ${var.stack_name} | Logs: ${local.server_logs_console_url} (streams ecs/* server)"
+}
 
 resource "aws_cloudwatch_metric_alarm" "http_error_rate" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-http-5xx-rate"
-  alarm_description   = "Guardian HTTP 5xx responses exceed ${var.alarm_error_rate_threshold_percent}% of requests"
+  alarm_description   = "Guardian HTTP 5xx responses exceed ${var.alarm_error_rate_threshold_percent}% of requests${local.alarm_description_links}"
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.alarm_error_rate_threshold_percent
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   metric_query {
     id          = "errorRate"
@@ -563,14 +622,14 @@ resource "aws_cloudwatch_metric_alarm" "grpc_error_rate" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-grpc-error-rate"
-  alarm_description   = "Guardian gRPC server-fault responses (${join(", ", local.grpc_error_codes)}) exceed ${var.alarm_error_rate_threshold_percent}% of requests"
+  alarm_description   = "Guardian gRPC server-fault responses (${join(", ", local.grpc_error_codes)}) exceed ${var.alarm_error_rate_threshold_percent}% of requests${local.alarm_description_links}"
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.alarm_error_rate_threshold_percent
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   metric_query {
     id          = "errorRate"
@@ -612,7 +671,7 @@ resource "aws_cloudwatch_metric_alarm" "http_latency" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-http-latency"
-  alarm_description   = "Guardian average HTTP request latency exceeds ${var.alarm_latency_threshold_seconds}s (fleet average across all routes, including ALB health checks)"
+  alarm_description   = "Guardian average HTTP request latency exceeds ${var.alarm_latency_threshold_seconds}s (fleet average across all routes, including ALB health checks)${local.alarm_description_links}"
   namespace           = local.metrics_namespace
   metric_name         = "guardian_http_request_duration_seconds"
   statistic           = "Average"
@@ -622,22 +681,44 @@ resource "aws_cloudwatch_metric_alarm" "http_latency" {
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
+}
+
+# Tail latency from the ALB, which excludes health-check probes and
+# reports percentiles; the app histograms reach CloudWatch as sum/count
+# only, so they cannot back a percentile alarm.
+resource "aws_cloudwatch_metric_alarm" "alb_p99_latency" {
+  count = local.cloudwatch_metrics_enabled ? 1 : 0
+
+  alarm_name          = "${var.stack_name}-alb-p99-latency"
+  alarm_description   = "Guardian p99 target response time at the ALB exceeds ${var.alarm_p99_latency_threshold_seconds}s (HTTP and gRPC, health checks excluded)${local.alarm_description_links}"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "TargetResponseTime"
+  dimensions          = { LoadBalancer = aws_lb.main.arn_suffix }
+  extended_statistic  = "p99"
+  period              = 300
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.alarm_p99_latency_threshold_seconds
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 }
 
 resource "aws_cloudwatch_metric_alarm" "canonicalization_failures" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-canonicalization-failures"
-  alarm_description   = "Guardian canonicalization passes (full, fast, or reconcile) are erroring or completing with failed accounts"
+  alarm_description   = "Guardian canonicalization passes (full, fast, or reconcile) are erroring or completing with failed accounts${local.alarm_description_links}"
   comparison_operator = "GreaterThanThreshold"
   threshold           = 0
   evaluation_periods  = 2
   datapoints_to_alarm = 2
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   metric_query {
     id          = "failures"
@@ -672,7 +753,7 @@ resource "aws_cloudwatch_metric_alarm" "metrics_missing" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-metrics-missing"
-  alarm_description   = "Guardian application metrics stopped arriving in CloudWatch (metrics endpoint down, ADOT sidecar dead, or scrape failing — check the adot log stream)"
+  alarm_description   = "Guardian application metrics stopped arriving in CloudWatch (metrics endpoint down, ADOT sidecar dead, or scrape failing — check the adot log stream)${local.alarm_description_links}"
   namespace           = local.metrics_namespace
   metric_name         = "guardian_build_info"
   statistic           = "Maximum"
@@ -682,15 +763,15 @@ resource "aws_cloudwatch_metric_alarm" "metrics_missing" {
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "breaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 }
 
 resource "aws_cloudwatch_metric_alarm" "metrics_refresh_failures" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-metrics-refresh-failures"
-  alarm_description   = "Guardian slow-aggregate metrics refresher attempts are failing; delta/proposal/account gauges are stale"
+  alarm_description   = "Guardian slow-aggregate metrics refresher attempts are failing; delta/proposal/account gauges are stale${local.alarm_description_links}"
   namespace           = local.metrics_namespace
   metric_name         = "guardian_metrics_refresh_failures_total"
   statistic           = "Sum"
@@ -700,8 +781,8 @@ resource "aws_cloudwatch_metric_alarm" "metrics_refresh_failures" {
   evaluation_periods  = 2
   datapoints_to_alarm = 2
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 }
 
 # Complements the failures alarm: a refresher that hangs (or dies) makes
@@ -713,14 +794,14 @@ resource "aws_cloudwatch_metric_alarm" "metrics_refresh_stale" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name          = "${var.stack_name}-metrics-refresh-stale"
-  alarm_description   = "Guardian slow-aggregate refresh timestamp stopped advancing; delta/proposal/account gauges are stale (hung or dead refresher)"
+  alarm_description   = "Guardian slow-aggregate refresh timestamp stopped advancing; delta/proposal/account gauges are stale (hung or dead refresher)${local.alarm_description_links}"
   comparison_operator = "LessThanOrEqualToThreshold"
   threshold           = 0
   evaluation_periods  = 2
   datapoints_to_alarm = 2
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   metric_query {
     id          = "staleness"
@@ -744,7 +825,7 @@ resource "aws_cloudwatch_metric_alarm" "ecs_cpu_high" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name        = "${var.stack_name}-ecs-cpu-high"
-  alarm_description = "Guardian ECS service average CPU utilization exceeds ${var.alarm_cpu_threshold_percent}%"
+  alarm_description = "Guardian ECS service average CPU utilization exceeds ${var.alarm_cpu_threshold_percent}%${local.alarm_description_links}"
   namespace         = "AWS/ECS"
   metric_name       = "CPUUtilization"
   dimensions = {
@@ -758,8 +839,8 @@ resource "aws_cloudwatch_metric_alarm" "ecs_cpu_high" {
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   lifecycle {
     precondition {
@@ -776,7 +857,7 @@ resource "aws_cloudwatch_metric_alarm" "ecs_memory_high" {
   count = local.cloudwatch_metrics_enabled ? 1 : 0
 
   alarm_name        = "${var.stack_name}-ecs-memory-high"
-  alarm_description = "Guardian ECS service average memory utilization exceeds ${var.alarm_memory_threshold_percent}%"
+  alarm_description = "Guardian ECS service average memory utilization exceeds ${var.alarm_memory_threshold_percent}%${local.alarm_description_links}"
   namespace         = "AWS/ECS"
   metric_name       = "MemoryUtilization"
   dimensions = {
@@ -790,8 +871,8 @@ resource "aws_cloudwatch_metric_alarm" "ecs_memory_high" {
   evaluation_periods  = 3
   datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_actions
-  ok_actions          = var.alarm_actions
+  alarm_actions       = local.effective_alarm_actions
+  ok_actions          = local.effective_alarm_actions
 
   lifecycle {
     precondition {

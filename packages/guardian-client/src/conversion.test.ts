@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
+  fromServerCanonicalNonce,
   fromServerCosignerSignature,
   fromServerConfigureResponse,
   fromServerDeltaObject,
@@ -34,6 +36,23 @@ import type {
 
 describe('conversion', () => {
   describe('fromServer conversions (server → camelCase)', () => {
+    it('fromServerCanonicalNonce maps the head and rejects unsafe nonces', () => {
+      expect(
+        fromServerCanonicalNonce({
+          account_id: '0xabc',
+          nonce: 5,
+          commitment: '0x' + 'c'.repeat(64),
+        }),
+      ).toEqual({ accountId: '0xabc', nonce: 5, commitment: '0x' + 'c'.repeat(64) });
+
+      expect(() =>
+        fromServerCanonicalNonce({ account_id: '0xabc', nonce: -1, commitment: '0x' }),
+      ).toThrow('Invalid canonical nonce');
+      expect(() =>
+        fromServerCanonicalNonce({ account_id: '0xabc', nonce: 1.5, commitment: '0x' }),
+      ).toThrow('Invalid canonical nonce');
+    });
+
     it('converts CosignerSignature', () => {
       const server: ServerCosignerSignature = {
         signer_id: '0xabc',
@@ -393,6 +412,37 @@ describe('conversion', () => {
       });
     });
 
+    it('preserves the EIP-712 approval format without changing raw signatures', () => {
+      const eip = toServerSignProposalRequest({
+        accountId: '0xaccount',
+        commitment: '0xcommit',
+        signature: {
+          scheme: 'ecdsa',
+          signature: '0xsig',
+          publicKey: '0xkey',
+          messageFormat: 'eip712',
+        },
+      });
+      expect(eip.signature).toEqual({
+        scheme: 'ecdsa',
+        signature: '0xsig',
+        public_key: '0xkey',
+        message_format: 'eip712',
+      });
+      expect(fromServerCosignerSignature({
+        signer_id: '0xsigner',
+        signature: eip.signature,
+        timestamp: '2026-01-01T00:00:00Z',
+      }).signature).toMatchObject({ messageFormat: 'eip712' });
+
+      const raw = toServerSignProposalRequest({
+        accountId: '0xaccount',
+        commitment: '0xcommit',
+        signature: { scheme: 'ecdsa', signature: '0xsig', publicKey: '0xkey' },
+      });
+      expect(raw.signature).not.toHaveProperty('message_format');
+    });
+
     it('converts ExecutionDelta', () => {
       const delta: ExecutionDelta = {
         accountId: '0xaccount',
@@ -454,7 +504,7 @@ describe('conversion', () => {
       expect(result.salt).toBe(original.salt);
     });
 
-    it('chainAnchor survives roundtrip as chain_anchor on the wire', () => {
+    it('a legacy chainAnchor survives roundtrip as chain_anchor on the wire', () => {
       const original: ProposalMetadata = {
         proposalType: 'add_signer',
         targetThreshold: 2,
@@ -467,6 +517,22 @@ describe('conversion', () => {
 
       const result = fromServerProposalMetadata(server);
       expect(result.chainAnchor).toBe('bW9jay1jaGFpbi1hbmNob3I=');
+    });
+
+    it('boundBlockNum survives roundtrip as bound_block_num on the wire', () => {
+      const original: ProposalMetadata = {
+        proposalType: 'add_signer',
+        targetThreshold: 2,
+        signerCommitments: ['0xabc'],
+        boundBlockNum: 42,
+      };
+
+      const server = toServerProposalMetadata(original);
+      expect(server.bound_block_num).toBe(42);
+      expect(server.chain_anchor).toBeUndefined();
+
+      const result = fromServerProposalMetadata(server);
+      expect(result.boundBlockNum).toBe(42);
     });
 
     it('p2id noteType survives roundtrip as note_type on the wire (issue #322)', () => {
@@ -502,6 +568,21 @@ describe('conversion', () => {
       const result = fromServerProposalMetadata(server);
       expect(result.reclaimHeight).toBe(12345);
       expect(result.timelockHeight).toBe(700);
+    });
+
+    describe('shared proposal metadata wire sample (issue #538)', () => {
+      const fixture = JSON.parse(
+        readFileSync(
+          new URL('../../../fixtures/miden-multisig-client/proposal-metadata-wire.json', import.meta.url),
+          'utf-8',
+        ),
+      ) as Record<'current' | 'legacy', { wire: ServerProposalMetadata; guardian: ProposalMetadata }>;
+      const onTheWire = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+
+      it.each(['current', 'legacy'] as const)('maps the %s sample both ways', (sample) => {
+        expect(onTheWire(fromServerProposalMetadata(fixture[sample].wire))).toEqual(fixture[sample].guardian);
+        expect(onTheWire(toServerProposalMetadata(fixture[sample].guardian))).toEqual(fixture[sample].wire);
+      });
     });
   });
 });

@@ -7,6 +7,8 @@ import type {
   AbandonStatus,
   ConfigureRequest,
   ConfigureResponse,
+  CreateSessionRequest,
+  CreateSessionResponse,
   DeltaObject,
   DeltaProposalRequest,
   DeltaProposalResponse,
@@ -16,16 +18,20 @@ import type {
   LookupResponse,
   PubkeyResponse,
   PushDeltaResponse,
+  SessionEndReason,
+  SessionRequestSigner,
   SignProposalRequest,
   SignatureScheme,
   Signer,
   StateObject,
   StatusResponse,
+  CanonicalNonce,
 } from './types.js';
 import { RequestAuthPayload } from './auth-request.js';
 import type {
   ServerAbandonCandidateRequest,
   ServerAbandonCandidateResponse,
+  ServerCanonicalNonceResponse,
   ServerDeltaObject,
   ServerDeltaProposalResponse,
   ServerHistoryPage,
@@ -34,16 +40,23 @@ import type {
   ServerPubkeyResponse,
   ServerStateObject,
   ServerConfigureResponse,
+  ServerCreateSessionResponse,
   ServerPushDeltaResponse,
+  ServerRevokeAllSessionsRequest,
+  ServerRevokeAllSessionsResponse,
+  ServerRevokeSessionResponse,
   ServerStatusResponse,
 } from './server-types.js';
 import {
+  fromServerCanonicalNonce,
   fromServerConfigureResponse,
+  fromServerCreateSessionResponse,
   fromServerDeltaObject,
   fromServerHistoryPage,
   fromServerLookupResponse,
   fromServerStateObject,
   toServerConfigureRequest,
+  toServerCreateSessionRequest,
   toServerDeltaProposalRequest,
   toServerExecutionDelta,
   toServerSignProposalRequest,
@@ -60,6 +73,17 @@ export interface GuardianErrorMeta {
   pausedAt?: string;
   pausedReason?: string | null;
   releasedAt?: string;
+  /**
+   * Signature scheme the server refused for a new account registration.
+   * Present only when `code === 'signature_scheme_not_allowed'`.
+   */
+  scheme?: string;
+  /**
+   * Schemes this Guardian accepts for new accounts
+   * (`GUARDIAN_ALLOWED_ACCOUNT_SCHEMES`). Present only when
+   * `code === 'signature_scheme_not_allowed'`.
+   */
+  allowedSchemes?: string[];
 }
 
 interface ParsedGuardianError {
@@ -111,6 +135,13 @@ function parseGuardianErrorBody(body: string): ParsedGuardianError | undefined {
   }
   if (typeof rawMeta.paused_at === 'string') meta.pausedAt = rawMeta.paused_at;
   if (typeof rawMeta.released_at === 'string') meta.releasedAt = rawMeta.released_at;
+  if (typeof rawMeta.scheme === 'string') meta.scheme = rawMeta.scheme;
+  if (
+    Array.isArray(rawMeta.allowed_schemes) &&
+    rawMeta.allowed_schemes.every((x): x is string => typeof x === 'string')
+  ) {
+    meta.allowedSchemes = rawMeta.allowed_schemes;
+  }
   if (typeof rawMeta.paused_reason === 'string' || rawMeta.paused_reason === null) {
     meta.pausedReason = rawMeta.paused_reason as string | null;
   }
@@ -206,10 +237,45 @@ function parseRetryAfterSeconds(header: string | null | undefined): number | und
 }
 
 /**
+ * A session is set aside this long before it expires, so a request never
+ * reaches the server already expired; requests then fall back to the wallet.
+ */
+const SESSION_EXPIRY_MARGIN_MS = 30_000;
+
+/** Codes that end a session-signed request's session for good. */
+const SESSION_END_REASONS: Record<string, SessionEndReason> = {
+  session_expired: 'expired',
+  session_revoked: 'revoked',
+  authentication_failed: 'rejected',
+};
+
+/**
+ * Which key signs a per-account request. Mirrors the server: requests are
+ * wallet-signed unless the route is session-eligible.
+ */
+type AuthMode = 'session' | 'wallet';
+
+function authHeaders(
+  publicKey: string,
+  signature: string,
+  timestamp: number,
+  format?: 'eip712' | 'session'
+): Record<string, string> {
+  return {
+    'x-pubkey': publicKey,
+    'x-signature': signature,
+    'x-timestamp': timestamp.toString(),
+    ...(format ? { 'x-auth-format': format } : {}),
+  };
+}
+
+/**
  * Minimal HTTP client for GUARDIAN server.
  */
 export class GuardianHttpClient {
   private signer: Signer | null = null;
+  private session: SessionRequestSigner | null = null;
+  private readonly endedSessions = new WeakSet<SessionRequestSigner>();
   private readonly baseUrl: string;
   private lastTimestamp = 0;
 
@@ -233,6 +299,121 @@ export class GuardianHttpClient {
     this.signer = signer;
   }
 
+  /**
+   * Sign session-eligible requests (reads, proposal list/get, proposal
+   * create/sign) with a registered delegated signer instead of the wallet.
+   * Every other route, including `configure`, `pushDelta`,
+   * `abandonCandidate`, account lookup and `revokeAllSessions`, uses the
+   * wallet signer. Pass `null` to stop using the session.
+   */
+  setSession(session: SessionRequestSigner | null): void {
+    this.session = session;
+  }
+
+  /**
+   * The session in use, or `null` when none is set, no wallet signer is set,
+   * the session was granted by another wallet than the current signer, or it
+   * is about to expire. A session reaching its expiry margin is dropped and
+   * told so.
+   */
+  getSession(): SessionRequestSigner | null {
+    const session = this.session;
+    if (!session) {
+      return null;
+    }
+    if (session.expiresAt * 1000 - SESSION_EXPIRY_MARGIN_MS <= Date.now()) {
+      this.endSession(session, 'expired');
+      return null;
+    }
+    if (
+      !this.signer ||
+      this.signer.commitment.toLowerCase() !== session.signerCommitment.toLowerCase()
+    ) {
+      return null;
+    }
+    return session;
+  }
+
+  /**
+   * Stops using `session` if it is still the current one, and tells it why
+   * once. A newer session set meanwhile stays in use.
+   */
+  private endSession(session: SessionRequestSigner, reason: SessionEndReason): void {
+    if (this.session === session) {
+      this.session = null;
+    }
+    if (!this.endedSessions.has(session)) {
+      this.endedSessions.add(session);
+      session.onEnded?.(reason);
+    }
+  }
+
+  /** Register a wallet-signed session grant (`POST /session`). */
+  async createSession(request: CreateSessionRequest): Promise<CreateSessionResponse> {
+    const response = await this.fetch('/session', {
+      method: 'POST',
+      body: JSON.stringify(toServerCreateSessionRequest(request)),
+    });
+    return fromServerCreateSessionResponse((await response.json()) as ServerCreateSessionResponse);
+  }
+
+  /**
+   * Revoke a session on the server (`POST /session/logout`), the current one
+   * by default, and stop using it. Returns whether the server still had it
+   * active; `false` when there is none. On error the session stays in use.
+   */
+  async revokeSession(session: SessionRequestSigner | null = this.session): Promise<boolean> {
+    if (!session) {
+      return false;
+    }
+    const timestamp = this.nextTimestamp();
+    const signature = await session.signLogout(timestamp);
+    const response = await this.fetch('/session/logout', {
+      method: 'POST',
+      headers: authHeaders(session.publicKey, signature, timestamp),
+    });
+    const data = (await response.json()) as ServerRevokeSessionResponse;
+    this.endSession(session, 'logout');
+    return data.revoked;
+  }
+
+  /**
+   * Revoke every session of the wallet signer on the server
+   * (`POST /session/revoke-all`), including sessions started elsewhere, and
+   * stop using the session that was current when the call was made. A
+   * session started while the call is in flight was issued after it and
+   * stays in use. Signed by the wallet. Returns how many sessions the server
+   * revoked.
+   */
+  async revokeAllSessions(): Promise<number> {
+    const signer = this.signer;
+    if (!signer) {
+      throw new Error('No signer configured. Call setSigner() first.');
+    }
+    if (!signer.signSessionRevokeAll) {
+      throw new Error('This signer cannot sign Guardian session revocations');
+    }
+    const revoking = this.session;
+    const timestamp = this.nextTimestamp();
+    const signature = await signer.signSessionRevokeAll(signer.commitment, timestamp);
+    const body: ServerRevokeAllSessionsRequest = { signer_commitment: signer.commitment };
+    const response = await this.fetch('/session/revoke-all', {
+      method: 'POST',
+      headers: authHeaders(signer.publicKey, signature, timestamp, signer.requestAuthFormat),
+      body: JSON.stringify(body),
+    });
+    const data = (await response.json()) as ServerRevokeAllSessionsResponse;
+    if (revoking?.signerCommitment.toLowerCase() === signer.commitment.toLowerCase()) {
+      this.endSession(revoking, 'logout');
+    }
+    return data.revoked;
+  }
+
+  /**
+   * Guardian's ACK commitment for one signature scheme (`GET /pubkey`).
+   * Omitting `scheme` returns the Falcon key even on a server that admits only
+   * ECDSA accounts, so pass the scheme of the account the commitment is for.
+   */
   async getPubkey(scheme?: SignatureScheme): Promise<PubkeyResponse> {
     const query = scheme ? `?scheme=${scheme}` : '';
     const response = await this.fetch(`/pubkey${query}`, { method: 'GET' });
@@ -253,11 +434,19 @@ export class GuardianHttpClient {
       environment: data.environment,
       startedAt: data.started_at,
       uptimeSeconds: data.uptime_seconds,
+      ...(data.sessions
+        ? {
+            sessions: {
+              maxTtlSeconds: data.sessions.max_ttl_seconds,
+            },
+          }
+        : {}),
     };
   }
 
   async configure(request: ConfigureRequest): Promise<ConfigureResponse> {
     const serverRequest = toServerConfigureRequest(request);
+    // Configuration changes who the account trusts: always the wallet.
     const response = await this.fetchAuthenticated('/configure', {
       method: 'POST',
       body: JSON.stringify(serverRequest),
@@ -271,9 +460,26 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestQuery);
     const response = await this.fetchAuthenticated(`/state?${params}`, {
       method: 'GET',
-    }, accountId, requestQuery);
+    }, accountId, requestQuery, 'session');
     const server = (await response.json()) as ServerStateObject;
     return fromServerStateObject(server);
+  }
+
+  /**
+   * Nonce and commitment of the latest canonical state, without the state
+   * blob (`GET /state/nonce`). A client can skip `getState` when the
+   * returned nonce is below its local account nonce, or equal to it with
+   * the same commitment; an equal nonce at a different commitment means the
+   * local account diverged from GUARDIAN, so it fetches the state.
+   */
+  async getCanonicalNonce(accountId: string): Promise<CanonicalNonce> {
+    const requestQuery = { account_id: accountId };
+    const params = new URLSearchParams(requestQuery);
+    const response = await this.fetchAuthenticated(`/state/nonce?${params}`, {
+      method: 'GET',
+    }, accountId, requestQuery, 'session');
+    const server = (await response.json()) as ServerCanonicalNonceResponse;
+    return fromServerCanonicalNonce(server);
   }
 
   /**
@@ -298,7 +504,7 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestQuery);
     const response = await this.fetchAuthenticated(`/delta/proposal?${params}`, {
       method: 'GET',
-    }, accountId, requestQuery);
+    }, accountId, requestQuery, 'session');
     const data = (await response.json()) as ServerProposalsResponse;
     return data.proposals.map(fromServerDeltaObject);
   }
@@ -308,7 +514,7 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestQuery);
     const response = await this.fetchAuthenticated(`/delta/proposal/single?${params}`, {
       method: 'GET',
-    }, accountId, requestQuery);
+    }, accountId, requestQuery, 'session');
     const data = (await response.json()) as ServerDeltaObject;
     return fromServerDeltaObject(data);
   }
@@ -318,7 +524,7 @@ export class GuardianHttpClient {
     const response = await this.fetchAuthenticated('/delta/proposal', {
       method: 'POST',
       body: JSON.stringify(serverRequest),
-    }, request.accountId, serverRequest);
+    }, request.accountId, serverRequest, 'session');
     const server = (await response.json()) as ServerDeltaProposalResponse;
     return {
       delta: fromServerDeltaObject(server.delta),
@@ -341,6 +547,7 @@ export class GuardianHttpClient {
    */
   async abandonCandidate(accountId: string, nonce: number): Promise<AbandonCandidateResponse> {
     const serverRequest: ServerAbandonCandidateRequest = { account_id: accountId, nonce };
+    // Abandoning changes the account's canonical chain: always the wallet.
     const response = await this.fetchAuthenticated('/delta/candidate/abandon', {
       method: 'POST',
       body: JSON.stringify(serverRequest),
@@ -400,13 +607,14 @@ export class GuardianHttpClient {
     const response = await this.fetchAuthenticated('/delta/proposal', {
       method: 'PUT',
       body: JSON.stringify(serverRequest),
-    }, request.accountId, serverRequest);
+    }, request.accountId, serverRequest, 'session');
     const server = (await response.json()) as ServerDeltaObject;
     return fromServerDeltaObject(server);
   }
 
   async pushDelta(delta: ExecutionDelta): Promise<PushDeltaResponse> {
     const serverDelta = toServerExecutionDelta(delta);
+    // Guardian's ACK commits the account to this transition: always the wallet.
     const response = await this.fetchAuthenticated('/delta', {
       method: 'POST',
       body: JSON.stringify(serverDelta),
@@ -434,7 +642,7 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestQuery);
     const response = await this.fetchAuthenticated(`/delta?${params}`, {
       method: 'GET',
-    }, accountId, requestPayload);
+    }, accountId, requestPayload, 'session');
     const server = (await response.json()) as ServerDeltaObject;
     return fromServerDeltaObject(server);
   }
@@ -451,7 +659,7 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestQuery);
     const response = await this.fetchAuthenticated(`/delta/since?${params}`, {
       method: 'GET',
-    }, accountId, requestPayload);
+    }, accountId, requestPayload, 'session');
     const server = (await response.json()) as ServerDeltaObject;
     return fromServerDeltaObject(server);
   }
@@ -478,7 +686,7 @@ export class GuardianHttpClient {
     const params = new URLSearchParams(requestPayload);
     const response = await this.fetchAuthenticated(`/delta/history?${params}`, {
       method: 'GET',
-    }, accountId, requestPayload);
+    }, accountId, requestPayload, 'session');
     const server = (await response.json()) as ServerHistoryPage;
     return fromServerHistoryPage(server);
   }
@@ -523,8 +731,8 @@ export class GuardianHttpClient {
     if (!this.signer.signLookupMessage) {
       throw new Error(
         'Signer does not implement signLookupMessage. Account recovery by key requires a ' +
-          'signer that produces signatures over LookupAuthMessage::to_word; the canonical ' +
-          'helper lives in @openzeppelin/miden-multisig-client.'
+          'signer that signs the lookup hash in raw or EIP-712 format; the canonical ' +
+          'lookup-hash helper lives in @openzeppelin/miden-multisig-client.'
       );
     }
 
@@ -535,12 +743,7 @@ export class GuardianHttpClient {
       ...init,
       headers: {
         ...init.headers,
-        // Sent for API consistency with per-account requests; the server's
-        // lookup path derives the pubkey from the signature itself and
-        // ignores this header for verification.
-        'x-pubkey': this.signer.publicKey,
-        'x-signature': signature,
-        'x-timestamp': timestamp.toString(),
+        ...authHeaders(this.signer.publicKey, signature, timestamp, this.signer.requestAuthFormat),
       },
     });
   }
@@ -550,29 +753,40 @@ export class GuardianHttpClient {
     init: RequestInit,
     accountId: string,
     requestPayload: unknown,
+    mode: AuthMode = 'wallet',
     retries = 2
   ): Promise<Response> {
-    if (!this.signer) {
-      throw new Error('No signer configured. Call setSigner() first.');
-    }
-
     const timestamp = this.nextTimestamp();
     const authPayload = RequestAuthPayload.fromRequest(requestPayload);
-    const signature = this.signer.signRequest
-      ? await this.signer.signRequest(accountId, timestamp, authPayload)
-      : await this.signer.signAccountIdWithTimestamp(accountId, timestamp);
+    const session = mode === 'session' ? this.getSession() : null;
+    const headers = session
+      ? authHeaders(
+          session.publicKey,
+          await session.signRequest(accountId, timestamp, authPayload),
+          timestamp,
+          'session'
+        )
+      : await this.walletAuthHeaders(accountId, timestamp, authPayload);
 
     try {
       return await this.fetch(path, {
         ...init,
         headers: {
           ...init.headers,
-          'x-pubkey': this.signer.publicKey,
-          'x-signature': signature,
-          'x-timestamp': timestamp.toString(),
+          ...headers,
         },
       });
     } catch (err) {
+      // A session Guardian ended or no longer accepts (unknown key after a
+      // restart, rotated Guardian key or network) is dead for good: stop
+      // using it so the caller can start a new one; meanwhile the wallet
+      // signs again.
+      if (session && err instanceof GuardianHttpError) {
+        const reason = SESSION_END_REASONS[err.code ?? ''];
+        if (reason) {
+          this.endSession(session, reason);
+        }
+      }
       // Replay rejections are transient: the request was correctly signed
       // but lost the server's per-signer timestamp CAS. Retry with a fresh
       // timestamp and signature, branching only on the dedicated
@@ -585,9 +799,23 @@ export class GuardianHttpClient {
         err.code === 'authentication_replay'
       ) {
         await new Promise((resolve) => setTimeout(resolve, 50));
-        return this.fetchAuthenticated(path, init, accountId, requestPayload, retries - 1);
+        return this.fetchAuthenticated(path, init, accountId, requestPayload, mode, retries - 1);
       }
       throw err;
     }
+  }
+
+  private async walletAuthHeaders(
+    accountId: string,
+    timestamp: number,
+    authPayload: RequestAuthPayload
+  ): Promise<Record<string, string>> {
+    if (!this.signer) {
+      throw new Error('No signer configured. Call setSigner() first.');
+    }
+    const signature = this.signer.signRequest
+      ? await this.signer.signRequest(accountId, timestamp, authPayload)
+      : await this.signer.signAccountIdWithTimestamp(accountId, timestamp);
+    return authHeaders(this.signer.publicKey, signature, timestamp, this.signer.requestAuthFormat);
   }
 }

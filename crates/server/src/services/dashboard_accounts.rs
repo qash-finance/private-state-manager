@@ -126,13 +126,43 @@ pub async fn list_dashboard_accounts_paged(
     let has_more = metadatas.len() > limit_us;
     metadatas.truncate(limit_us);
 
-    // Single batched state read instead of N round trips.
+    // Single batched state read instead of N round trips. A batch that
+    // fails is retried one account at a time so a single missing or
+    // corrupt row degrades to `state_status: unavailable` for that row
+    // instead of failing the whole page; any other failure is a storage
+    // error.
     let id_refs: Vec<&str> = metadatas.iter().map(|m| m.account_id.as_str()).collect();
-    let states = state
-        .storage
-        .pull_states_batch(&id_refs)
-        .await
-        .map_err(|e| GuardianError::StorageError(format!("Failed to batch-pull states: {e}")))?;
+    let states = match state.storage.pull_states_batch(&id_refs).await {
+        Ok(states) => states,
+        Err(batch_error) => {
+            tracing::debug!(
+                error = %batch_error,
+                "dashboard account list: batched state read failed; reading accounts individually"
+            );
+            let mut states = std::collections::HashMap::with_capacity(id_refs.len());
+            for id in &id_refs {
+                match state.storage.pull_state(id).await {
+                    Ok(s) => {
+                        states.insert((*id).to_string(), s);
+                    }
+                    Err(e) if crate::storage::is_storage_not_found(&e) => {}
+                    Err(e) if crate::storage::is_record_corruption(&e) => {
+                        tracing::warn!(
+                            account_id = %id,
+                            error = %e,
+                            "dashboard account list: stored state is corrupt; reported as unavailable"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(GuardianError::StorageError(format!(
+                            "Failed to read state for '{id}': {e}"
+                        )));
+                    }
+                }
+            }
+            states
+        }
+    };
 
     let summaries: Vec<DashboardAccountSummary> = metadatas
         .iter()
@@ -278,8 +308,9 @@ impl DashboardAccountDetail {
 /// default, mislabeling accounts on testnet/devnet servers. Returns
 /// `None` for EVM accounts and for any hex that fails to parse as a
 /// Miden `AccountId` (data drift). The HRP set is fixed by the Miden
-/// protocol: `mm` for mainnet, `mtst` for testnet, `mdev` for devnet
+/// protocol: `mdev` for devnet, `mtst` for testnet, `mm` for mainnet
 /// (Local is folded into Devnet — Miden has no separate Local HRP).
+/// Cedar uses `mm`, today the same string as mainnet's.
 fn bech32_for_account(metadata: &AccountMetadata, network_type: NetworkType) -> Option<String> {
     use crate::metadata::MidenNetworkType;
     use miden_protocol::account::AccountId;
@@ -288,6 +319,14 @@ fn bech32_for_account(metadata: &AccountMetadata, network_type: NetworkType) -> 
     }
     let account_id = AccountId::from_hex(&metadata.account_id).ok()?;
     Some(account_id.to_bech32(MidenNetworkType::from(network_type).to_miden_network_id()))
+}
+
+/// Number of distinct authorized signers, as reported by
+/// `DashboardAccountSummary.authorized_signer_count`. Shared with the
+/// `/dashboard/stats` aggregate so both surfaces bucket accounts the
+/// same way.
+pub fn normalized_authorized_signer_count(auth: &Auth) -> usize {
+    normalized_authorized_signer_ids(auth).len()
 }
 
 fn normalized_authorized_signer_ids(auth: &Auth) -> Vec<String> {
@@ -344,6 +383,20 @@ mod tests {
         assert!(
             bech32.starts_with("mtst1"),
             "testnet HRP expected, got '{bech32}'",
+        );
+
+        let bech32_cedar = bech32_for_account(&meta, NetworkType::MidenCedar)
+            .expect("bech32 encodes for valid miden id");
+        assert!(
+            bech32_cedar.starts_with("mm1"),
+            "cedar shares the mainnet HRP, got '{bech32_cedar}'",
+        );
+
+        let bech32_mainnet = bech32_for_account(&meta, NetworkType::MidenMainnet)
+            .expect("bech32 encodes for valid miden id");
+        assert!(
+            bech32_mainnet.starts_with("mm1"),
+            "mainnet HRP expected, got '{bech32_mainnet}'",
         );
 
         let bech32_local =
@@ -444,11 +497,13 @@ mod tests {
         std::fs::create_dir_all(&keystore_dir).expect("keystore dir");
         let ack = AckRegistry::new(keystore_dir).await.expect("ack");
         let state = AppState {
+            miden_sessions: std::sync::Arc::new(crate::session::MidenSessions::default()),
             storage: Arc::new(svc),
             metadata: Arc::new(metadata),
             network_client: Arc::new(MockNetworkClient::new()),
             ack,
             canonicalization: None,
+            release_sweep: None,
             clock: Arc::new(MockClock::default()),
             dashboard: Arc::new(crate::dashboard::DashboardState::default()),
             auditor: Arc::new(crate::audit::LogAuditor::new()),

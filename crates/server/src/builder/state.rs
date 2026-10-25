@@ -7,6 +7,8 @@ use crate::dashboard::DashboardState;
 use crate::evm::EvmAppState;
 use crate::metadata::MetadataStore;
 use crate::network::NetworkClient;
+use crate::release_sweep::ReleaseSweepConfig;
+use crate::session::MidenSessions;
 use crate::storage::StorageBackend;
 use std::sync::Arc;
 
@@ -17,6 +19,9 @@ pub struct AppState {
     pub network_client: Arc<dyn NetworkClient>,
     pub ack: AckRegistry,
     pub canonicalization: Option<CanonicalizationConfig>,
+    /// Chain-driven release sweep settings (issue #434); `None` when
+    /// the sweep task is not running.
+    pub release_sweep: Option<ReleaseSweepConfig>,
     pub clock: Arc<dyn Clock>,
     pub dashboard: Arc<DashboardState>,
     /// Always-on audit writer (feature 006-operator-authz). On
@@ -24,6 +29,8 @@ pub struct AppState {
     /// builds it is `LogAuditor` and a one-shot startup warning is
     /// emitted at construction time (FR-020 / FR-021).
     pub auditor: SharedAuditor,
+    /// Miden account sessions.
+    pub miden_sessions: Arc<MidenSessions>,
     #[cfg(feature = "evm")]
     pub evm: Arc<EvmAppState>,
 }

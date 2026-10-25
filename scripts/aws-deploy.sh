@@ -26,7 +26,7 @@ set -euo pipefail
 #   DEPLOY_STAGE          - Deployment profile (dev or prod, default: dev)
 #   ECR_REPO_NAME         - ECR repository/image name (default: <stack-name>-server)
 #   DOMAIN_NAME           - Root domain (default: openzeppelin.com)
-#   SUBDOMAIN             - Subdomain (default: guardian)
+#   SUBDOMAIN             - Subdomain (default: guardian; the OZ stacks override it with guardian-devnet or guardian-testnet)
 #   ROUTE53_ZONE_ID       - Route 53 hosted zone ID (optional)
 #   CLOUDFLARE_ZONE_ID    - Cloudflare zone ID (optional)
 #   CLOUDFLARE_API_TOKEN  - Cloudflare API token (optional)
@@ -37,6 +37,7 @@ set -euo pipefail
 #   GUARDIAN_NETWORK_TYPE      - Runtime Miden network for the server (default: MidenTestnet)
 #   GUARDIAN_SERVER_FEATURES   - Cargo features for guardian-server Docker build (default: postgres)
 #   GUARDIAN_CORS_ALLOWED_ORIGINS - Comma-separated explicit HTTP origins allowed by credentialed CORS (optional)
+#   GUARDIAN_ALLOWED_ACCOUNT_SCHEMES - Comma-separated signature schemes new accounts may register with: falcon, ecdsa (optional; default every scheme)
 #   GUARDIAN_EVM_CHAIN_CONFIG_FILE - JSON file used to derive EVM chain IDs, RPC URLs, and EntryPoint address (default: config/evm/chains.json)
 #   GUARDIAN_EVM_ALLOWED_CHAIN_IDS - Comma-separated EVM chain IDs allowed by the server; creates a stack Secrets Manager secret (optional)
 #   GUARDIAN_EVM_ALLOWED_CHAIN_IDS_SECRET_ARN - Secrets Manager ARN with comma-separated EVM chain IDs (optional)
@@ -65,6 +66,7 @@ ALIAS_ACM_CERTIFICATE_ARN="${ALIAS_ACM_CERTIFICATE_ARN-}"
 GUARDIAN_NETWORK_TYPE="${GUARDIAN_NETWORK_TYPE:-MidenTestnet}"
 GUARDIAN_SERVER_FEATURES="${GUARDIAN_SERVER_FEATURES:-postgres}"
 GUARDIAN_CORS_ALLOWED_ORIGINS="${GUARDIAN_CORS_ALLOWED_ORIGINS:-${TF_VAR_guardian_cors_allowed_origins:-}}"
+GUARDIAN_ALLOWED_ACCOUNT_SCHEMES="${GUARDIAN_ALLOWED_ACCOUNT_SCHEMES:-${TF_VAR_guardian_allowed_account_schemes:-}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_GUARDIAN_EVM_CHAIN_CONFIG_FILE="${SCRIPT_DIR}/../config/evm/chains.json"
 DEFAULT_GUARDIAN_EVM_ENTRYPOINT_ADDRESS="0x433709009b8330fda32311df1c2afa402ed8d009"
@@ -292,6 +294,9 @@ build_tf_vars() {
   TF_VARS+=("-var" "guardian_operator_public_keys_secret_arn=${GUARDIAN_OPERATOR_PUBLIC_KEYS_SECRET_ARN}")
   if [ -n "$GUARDIAN_CORS_ALLOWED_ORIGINS" ]; then
     TF_VARS+=("-var" "guardian_cors_allowed_origins=${GUARDIAN_CORS_ALLOWED_ORIGINS}")
+  fi
+  if [ -n "$GUARDIAN_ALLOWED_ACCOUNT_SCHEMES" ]; then
+    TF_VARS+=("-var" "guardian_allowed_account_schemes=${GUARDIAN_ALLOWED_ACCOUNT_SCHEMES}")
   fi
   if [ -n "$GUARDIAN_EVM_ALLOWED_CHAIN_IDS" ]; then
     TF_VARS+=("-var" "guardian_evm_allowed_chain_ids=${GUARDIAN_EVM_ALLOWED_CHAIN_IDS}")
@@ -1012,7 +1017,7 @@ case "${COMMAND:-}" in
     echo "Options:"
     echo "  --skip-build  Skip Docker build and push (use existing image)"
     echo "  --domain=     Override root domain (default: openzeppelin.com)"
-    echo "  --subdomain=  Override subdomain (default: guardian)"
+    echo "  --subdomain=  Override subdomain (default: guardian; OZ stacks use guardian-devnet or guardian-testnet)"
     echo "  --route53-zone-id=  Route 53 hosted zone ID (optional)"
     echo "  --cloudflare-zone-id=  Cloudflare zone ID (optional)"
     echo "  --cloudflare-proxied=  Cloudflare proxied setting (true/false)"
@@ -1052,8 +1057,8 @@ case "${COMMAND:-}" in
     echo "  DEPLOY_STAGE=prod STACK_NAME=guardian-prod ./scripts/aws-deploy.sh bootstrap-storage-encryption-key  # prints the name to export"
     echo "  DEPLOY_STAGE=prod STACK_NAME=guardian-prod ./scripts/aws-deploy.sh bootstrap-dashboard-cursor-secret"
     echo "  GUARDIAN_STORAGE_ENCRYPTION_SECRET_NAME=guardian-prod/server/storage-encryption-key DEPLOY_STAGE=prod STACK_NAME=guardian-prod ./scripts/aws-deploy.sh deploy --skip-build"
-    echo "  DEPLOY_STAGE=dev STACK_NAME=guardian SUBDOMAIN=guardian-stg ./scripts/aws-deploy.sh deploy"
-    echo "  DEPLOY_STAGE=prod STACK_NAME=guardian-prod SUBDOMAIN=guardian ./scripts/aws-deploy.sh deploy --skip-build"
+    echo "  DEPLOY_STAGE=dev STACK_NAME=guardian SUBDOMAIN=guardian-devnet ./scripts/aws-deploy.sh deploy"
+    echo "  DEPLOY_STAGE=prod STACK_NAME=guardian-prod SUBDOMAIN=guardian-testnet ./scripts/aws-deploy.sh deploy --skip-build"
     echo "  ./scripts/aws-deploy.sh status"
     echo "  ./scripts/aws-deploy.sh cleanup"
     ;;

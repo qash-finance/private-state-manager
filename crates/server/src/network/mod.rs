@@ -5,6 +5,7 @@ pub use guardian_shared::retry::RpcReadMode;
 use crate::config::positive_u32_from_env;
 use crate::error::GuardianError;
 use crate::metadata::auth::{Auth, Credentials};
+use crate::state_object::StateHead;
 use async_trait::async_trait;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -186,14 +187,97 @@ pub enum StateVerification {
     Mismatch { on_chain: String },
 }
 
+/// What the chain itself says about an account's guardian binding, read
+/// directly from published on-chain storage rather than from a state the
+/// client supplied. Only accounts with public state expose their storage;
+/// for the rest the chain holds a bare commitment and the binding is
+/// `Opaque`. Used by the release sweep (issue #434) to recognize a
+/// guardian switch whose delta never reached this server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnChainGuardianBinding {
+    /// The account publishes its storage. `guardian_commitment` is the
+    /// guardian public key commitment it holds (`None` when the state
+    /// carries no guardian binding). The rest describes the state the
+    /// read observed, so callers can tie the binding to it:
+    /// `on_chain_commitment` and `nonce` are that state's commitment and
+    /// nonce, and `block_num` is the block the node answered at.
+    Visible {
+        on_chain_commitment: String,
+        guardian_commitment: Option<String>,
+        nonce: u64,
+        block_num: u32,
+    },
+    /// The chain does not expose this account's storage (private
+    /// account, or a network without published account state): the
+    /// guardian binding cannot be read from chain.
+    Opaque,
+}
+
+/// Outcome of [`NetworkClient::find_transaction_ending_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionSearch {
+    /// Block holding a committed transaction whose final state
+    /// commitment is the searched one, if the searched range has one.
+    pub found_in_block: Option<u32>,
+    /// The first block this search did not cover: a later search for the
+    /// same commitment resumes here instead of re-reading older blocks.
+    pub resume_from_block: u32,
+}
+
+/// The state [`NetworkClient::apply_delta`] produced: the new state blob,
+/// plus the commitment, nonce, and auth bindings of the account it encodes,
+/// read off the account the method already holds so a caller persisting or
+/// inspecting the state never decodes the blob again (issue #328).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedState {
+    pub state_json: serde_json::Value,
+    pub commitment: String,
+    /// `None` on a network without account nonces (see
+    /// [`crate::state_object::StateObject::nonce`]).
+    pub nonce: Option<u64>,
+    /// Cosigner public key commitments the account's storage carries, the
+    /// values [`NetworkClient::should_update_auth`] reads. Empty when the
+    /// account carries none.
+    pub cosigner_commitments: Vec<String>,
+    /// The guardian public key commitment the account's storage carries,
+    /// the value [`NetworkClient::extract_guardian_commitment`] reads.
+    pub guardian_commitment: Option<String>,
+}
+
+impl AppliedState {
+    /// The account auth to persist after this state commits, or `None`
+    /// when the state carries no cosigner commitments to sync.
+    pub fn updated_auth(&self, current_auth: &Auth) -> Option<Auth> {
+        if self.cosigner_commitments.is_empty() {
+            None
+        } else {
+            Some(current_auth.with_updated_commitments(self.cosigner_commitments.clone()))
+        }
+    }
+}
+
+/// Who may act on an account according to one of its states: the signer
+/// commitments of its multisig signer map, sorted so two bindings compare
+/// as sets, and its guardian public-key commitment, both read from one
+/// decode. An account whose layout carries neither has an empty roster
+/// and no guardian; two states of one account compare equal when the
+/// queued candidates between them changed neither (issue #17).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuthBinding {
+    pub signers: Vec<String>,
+    pub guardian: Option<String>,
+}
+
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
-    /// Get state commitment in hex format from JSON
-    fn get_state_commitment(
+    /// Commitment (hex) and nonce of the account encoded in `state_json`,
+    /// both read from one decode. `nonce` is `None` on a network without
+    /// account nonces.
+    fn get_state_head(
         &self,
         account_id: &str,
         state_json: &serde_json::Value,
-    ) -> Result<String, String>;
+    ) -> Result<StateHead, String>;
 
     /// Compare an expected commitment against the on-chain account commitment.
     /// Returns `Err` only when the comparison could not be made.
@@ -222,7 +306,16 @@ pub trait NetworkClient: Send + Sync {
         &self,
         prev_state_json: &serde_json::Value,
         delta_payload: &serde_json::Value,
-    ) -> Result<(serde_json::Value, String), String>;
+    ) -> Result<AppliedState, String>;
+
+    /// [`Self::verify_delta`] then [`Self::apply_delta`], decoding the
+    /// previous state once for both.
+    fn verify_and_apply_delta(
+        &self,
+        prev_proof: &str,
+        prev_state_json: &serde_json::Value,
+        delta_payload: &serde_json::Value,
+    ) -> Result<AppliedState, String>;
 
     /// Merge multiple deltas
     fn merge_deltas(
@@ -272,6 +365,76 @@ pub trait NetworkClient: Send + Sync {
         Ok(None)
     }
 
+    /// Read the account's guardian binding from published on-chain
+    /// storage (see [`OnChainGuardianBinding`]). Returns `Err` only when
+    /// the read could not be made (RPC failure, malformed response);
+    /// an account whose storage is not published yields `Ok(Opaque)`.
+    /// The default is `Opaque` — "cannot tell" — so backends without
+    /// on-chain guardian storage never trigger a release.
+    ///
+    /// Sweep call sites must pass [`RpcReadMode::SingleAttempt`] for the
+    /// same reason as [`Self::verify_commitment`]: the pass retries
+    /// structurally on its own schedule.
+    async fn fetch_on_chain_guardian_binding(
+        &self,
+        account_id: &str,
+        read_mode: RpcReadMode,
+    ) -> Result<OnChainGuardianBinding, String> {
+        let _ = (account_id, read_mode);
+        Ok(OnChainGuardianBinding::Opaque)
+    }
+
+    /// Search the transactions committed against `account_id` from
+    /// `from_block` through the chain tip for one whose **final** state
+    /// commitment is `final_state_commitment`. Transaction headers are
+    /// public for every account, private ones included, so a hit proves
+    /// the account reached that state even after the chain moved past it.
+    /// Only the final commitment is compared: a new account's first
+    /// transaction records an empty initial commitment, not the state the
+    /// account was registered with. `Err` only when the search could not
+    /// be made. The default searches nothing, so backends without
+    /// transaction history never trigger a release.
+    ///
+    /// Sweep call sites must pass [`RpcReadMode::SingleAttempt`] for the
+    /// same reason as [`Self::verify_commitment`].
+    async fn find_transaction_ending_at(
+        &self,
+        account_id: &str,
+        final_state_commitment: &str,
+        from_block: u32,
+        read_mode: RpcReadMode,
+    ) -> Result<TransactionSearch, String> {
+        let _ = (account_id, final_state_commitment, read_mode);
+        Ok(TransactionSearch {
+            found_in_block: None,
+            resume_from_block: from_block,
+        })
+    }
+
+    /// The nonce of the account state in `state_json`, or `Ok(None)` when
+    /// the network has no such notion. The release sweep compares it with
+    /// the nonce of an on-chain read: a read older than the stored state
+    /// is stale and never evidence of a switch. The canonical-nonce
+    /// pre-check (issue #191) decodes it for a stored state that does not
+    /// carry its nonce yet. The default is `Ok(None)`.
+    fn account_nonce(&self, state_json: &serde_json::Value) -> Result<Option<u64>, String> {
+        let _ = state_json;
+        Ok(None)
+    }
+
+    /// The signer set and guardian key the account state in `state_json`
+    /// binds (see [`AuthBinding`]), or `Ok(None)` when the network has no
+    /// such notion. The candidate queue refuses to chain behind a
+    /// candidate whose post-state binds a different set than the canonical
+    /// state. The default is `Ok(None)`.
+    fn account_auth_binding(
+        &self,
+        state_json: &serde_json::Value,
+    ) -> Result<Option<AuthBinding>, String> {
+        let _ = state_json;
+        Ok(None)
+    }
+
     /// Determine if account auth should be updated given the state
     async fn should_update_auth(
         &self,
@@ -283,15 +446,16 @@ pub trait NetworkClient: Send + Sync {
 /// Network type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum NetworkType {
-    MidenTestnet,
-    MidenDevnet,
     #[default]
     MidenLocal,
+    MidenDevnet,
+    MidenTestnet,
+    MidenCedar,
+    MidenMainnet,
 }
 
 impl NetworkType {
-    const ACCEPTED_VALUES: &str =
-        "MidenLocal (local), MidenTestnet (testnet), MidenDevnet (devnet); case-insensitive";
+    const ACCEPTED_VALUES: &str = "MidenLocal (local), MidenDevnet (devnet), MidenTestnet (testnet), MidenCedar (cedar), MidenMainnet (mainnet); case-insensitive";
 
     pub fn from_env(var_name: &str) -> Result<Self, String> {
         match std::env::var(var_name) {
@@ -315,17 +479,21 @@ impl NetworkType {
     pub fn from_name(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "midenlocal" | "local" => Some(Self::MidenLocal),
-            "midentestnet" | "testnet" => Some(Self::MidenTestnet),
             "midendevnet" | "devnet" => Some(Self::MidenDevnet),
+            "midentestnet" | "testnet" => Some(Self::MidenTestnet),
+            "midencedar" | "cedar" => Some(Self::MidenCedar),
+            "midenmainnet" | "mainnet" => Some(Self::MidenMainnet),
             _ => None,
         }
     }
 
     pub fn rpc_endpoint(&self) -> &str {
         match self {
-            NetworkType::MidenTestnet => "https://rpc.testnet.miden.io",
-            NetworkType::MidenDevnet => "https://rpc.devnet.miden.io",
             NetworkType::MidenLocal => "http://localhost:57291",
+            NetworkType::MidenDevnet => "https://rpc.devnet.miden.io",
+            NetworkType::MidenTestnet => "https://rpc.testnet.miden.io",
+            NetworkType::MidenCedar => "https://rpc.cedar.miden.io",
+            NetworkType::MidenMainnet => "https://rpc.mainnet.miden.io",
         }
     }
 }
@@ -349,9 +517,11 @@ impl RpcSettings {
     /// settings family; a future network type extends it here.
     pub fn from_env(network: NetworkType) -> Result<Self, String> {
         match network {
-            NetworkType::MidenTestnet | NetworkType::MidenDevnet | NetworkType::MidenLocal => {
-                Ok(Self::Miden(MidenRpcSettings::from_env(network)?))
-            }
+            NetworkType::MidenLocal
+            | NetworkType::MidenDevnet
+            | NetworkType::MidenTestnet
+            | NetworkType::MidenCedar
+            | NetworkType::MidenMainnet => Ok(Self::Miden(MidenRpcSettings::from_env(network)?)),
         }
     }
 
@@ -496,7 +666,10 @@ impl MidenRpcSettings {
         self.endpoint_overridden
             && matches!(
                 self.network,
-                NetworkType::MidenTestnet | NetworkType::MidenDevnet
+                NetworkType::MidenDevnet
+                    | NetworkType::MidenTestnet
+                    | NetworkType::MidenCedar
+                    | NetworkType::MidenMainnet
             )
     }
 }
@@ -522,9 +695,11 @@ fn validate_rpc_endpoint(value: &str) -> Result<(), String> {
 impl std::fmt::Display for NetworkType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetworkType::MidenTestnet => write!(f, "MidenTestnet"),
-            NetworkType::MidenDevnet => write!(f, "MidenDevnet"),
             NetworkType::MidenLocal => write!(f, "MidenLocal"),
+            NetworkType::MidenDevnet => write!(f, "MidenDevnet"),
+            NetworkType::MidenTestnet => write!(f, "MidenTestnet"),
+            NetworkType::MidenCedar => write!(f, "MidenCedar"),
+            NetworkType::MidenMainnet => write!(f, "MidenMainnet"),
         }
     }
 }
@@ -805,8 +980,10 @@ mod tests {
 
         assert!(error.contains(var_name));
         assert!(error.contains("MidenLocal"));
-        assert!(error.contains("MidenTestnet"));
         assert!(error.contains("MidenDevnet"));
+        assert!(error.contains("MidenTestnet"));
+        assert!(error.contains("MidenCedar"));
+        assert!(error.contains("MidenMainnet"));
     }
 
     #[test]
@@ -840,6 +1017,7 @@ mod tests {
         assert!(error.contains(var_name));
         assert!(error.contains("tesnet"));
         assert!(error.contains("MidenTestnet"));
+        assert!(error.contains("MidenMainnet"));
         unsafe { std::env::remove_var(var_name) };
     }
 
@@ -866,11 +1044,15 @@ mod tests {
             ("MidenLocal", NetworkType::MidenLocal),
             ("local", NetworkType::MidenLocal),
             ("LOCAL", NetworkType::MidenLocal),
-            ("MidenTestnet", NetworkType::MidenTestnet),
-            ("testnet", NetworkType::MidenTestnet),
             ("MidenDevnet", NetworkType::MidenDevnet),
             ("devnet", NetworkType::MidenDevnet),
             ("DEVNET", NetworkType::MidenDevnet),
+            ("MidenTestnet", NetworkType::MidenTestnet),
+            ("testnet", NetworkType::MidenTestnet),
+            ("MidenCedar", NetworkType::MidenCedar),
+            ("cedar", NetworkType::MidenCedar),
+            ("MidenMainnet", NetworkType::MidenMainnet),
+            ("mainnet", NetworkType::MidenMainnet),
         ];
 
         let var_name = "GUARDIAN_NETWORK_TYPE_TEST_PRESENT";
@@ -938,7 +1120,12 @@ mod tests {
 
     #[test]
     fn rpc_settings_flag_public_network_overrides() {
-        for network in [NetworkType::MidenTestnet, NetworkType::MidenDevnet] {
+        for network in [
+            NetworkType::MidenDevnet,
+            NetworkType::MidenTestnet,
+            NetworkType::MidenCedar,
+            NetworkType::MidenMainnet,
+        ] {
             let settings = MidenRpcSettings::resolve(
                 network,
                 Some(crate::secret::CredentialUrl::new(
@@ -1053,8 +1240,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         for network in [
             NetworkType::MidenLocal,
-            NetworkType::MidenTestnet,
             NetworkType::MidenDevnet,
+            NetworkType::MidenTestnet,
+            NetworkType::MidenCedar,
+            NetworkType::MidenMainnet,
         ] {
             let settings = super::RpcSettings::from_env(network).unwrap();
             let super::RpcSettings::Miden(miden) = settings;

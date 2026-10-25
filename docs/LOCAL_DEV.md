@@ -27,16 +27,17 @@ Three decisions when running Guardian locally:
 - Node 24+ (bundles npm 11, which the `packages/` workspace lockfile requires) if you will run any TS examples or packages.
 - Docker if you will use `docker-compose.*.yml`.
 - A Miden node — required for almost every flow. Either point at a
-  Miden Devnet endpoint or run one locally; configure via
+  public Miden endpoint or run one locally; configure via
   `GUARDIAN_NETWORK_TYPE`. A node on a non-default host or port (for
   example a sidecar container) is reachable via
   `GUARDIAN_MIDEN_RPC_ENDPOINT` without changing the network type; see
   [CONFIGURATION.md](./CONFIGURATION.md) for that and the optional
   `GUARDIAN_MIDEN_RPC_TIMEOUT_MS` / `GUARDIAN_MIDEN_RPC_MAX_ATTEMPTS`
-  read-retry knobs. The node's Miden line must match the workspace
-  baseline (currently the 0.16 pre-release line; devnet already runs
-  the 0.16 node) — a mismatched node is rejected at the RPC boundary
-  (see
+  read-retry knobs. The node's Miden line must match the one this
+  workspace pins; which line that is, and which public networks run it,
+  is tracked in [MIDEN_COMPATIBILITY.md](./MIDEN_COMPATIBILITY.md#support-matrix).
+  When no public network runs it, run a local `miden-node` from that line.
+  A mismatched node is rejected at the RPC boundary (see
   [Troubleshooting](./TROUBLESHOOTING.md#client-and-node-disagree-about-the-network-version)).
 
 ## Environment file
@@ -84,7 +85,7 @@ Useful env:
 | `GUARDIAN_METADATA_PATH` | Local path for accounts, auth, network. Defaults to `/var/guardian/metadata`. |
 | `GUARDIAN_KEYSTORE_PATH` | ACK key files, auto-generated on first run. Defaults to `/var/guardian/keystore`. |
 | `RUST_LOG` (`info`) | `info`, `debug`, or e.g. `server::jobs::canonicalization=debug`. |
-| `GUARDIAN_NETWORK_TYPE` (**required**) | Miden network name: `MidenLocal`, `MidenTestnet`, or `MidenDevnet`. The server refuses to start when it is unset or unrecognized. |
+| `GUARDIAN_NETWORK_TYPE` (**required**) | Miden network name: `MidenLocal`, `MidenDevnet`, `MidenTestnet`, `MidenCedar`, or `MidenMainnet`. The server refuses to start when it is unset or unrecognized. |
 
 At startup the server emits a warning that audit events will **not** be
 persisted — that's expected for filesystem mode
@@ -210,7 +211,8 @@ The deploy script builds with `postgres,evm` when the EVM stack is requested
 
 ```bash
 curl http://localhost:3000/                   # liveness (alias of /status)
-curl http://localhost:3000/pubkey             # ACK key commitment
+curl 'http://localhost:3000/pubkey?scheme=ecdsa'   # ECDSA ACK key commitment + pubkey
+curl 'http://localhost:3000/pubkey?scheme=falcon'  # Falcon ACK key commitment
 grpcurl -plaintext \
   -import-path crates/server/proto -proto guardian.proto \
   -d '{}' localhost:50051 guardian.Guardian/GetPubkey

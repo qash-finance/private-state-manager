@@ -4,6 +4,10 @@ export interface Signer {
   readonly commitment: string;
   readonly publicKey: string;
   readonly scheme: SignatureScheme;
+  /** Selects EIP-712 request authentication; absent keeps the raw signature path. */
+  readonly requestAuthFormat?: 'eip712';
+  /** Tags an ECDSA proposal approval as an EIP-712 transaction-summary signature. */
+  readonly proposalMessageFormat?: 'eip712';
   signAccountIdWithTimestamp(accountId: string, timestamp: number): Promise<string> | string;
   signRequest?(
     accountId: string,
@@ -14,8 +18,9 @@ export interface Signer {
 
   /**
    * Sign the lookup-bound digest for `/state/lookup`. The implementation
-   * MUST sign `LookupAuthMessage::to_word(timestamp_ms, key_commitment)` —
-   * domain-separated from `AuthRequestMessage`. The canonical implementation
+   * Raw signers sign `LookupAuthMessage::to_word(timestamp_ms, key_commitment)`;
+   * EIP-712 signers sign that hash as `GuardianLookup(bytes32 lookupHash)`.
+   * Both are domain-separated from `AuthRequestMessage`. The canonical implementation
    * lives in `@openzeppelin/miden-multisig-client/lookupAuth.ts`; this
    * zero-dependency package does not pull in the Miden SDK to compute it.
    *
@@ -26,6 +31,110 @@ export interface Signer {
     keyCommitmentHex: string,
     timestampMs: number
   ): Promise<string> | string;
+
+  /**
+   * Sign a session grant once, authorizing a delegated signer to sign
+   * per-account requests. Raw signers sign the grant's RPO digest; EIP-712
+   * signers sign readable `GuardianSession` typed data. The canonical
+   * implementation lives in `@openzeppelin/miden-multisig-client`.
+   */
+  signSessionGrant?(grant: SessionGrantFields): Promise<string> | string;
+
+  /**
+   * Sign the account-less revoke-all message for `POST /session/revoke-all`,
+   * which ends every session of this signer on the Guardian. Raw signers sign
+   * its RPO digest; EIP-712 signers sign `GuardianSessionRevokeAll` typed data.
+   */
+  signSessionRevokeAll?(
+    signerCommitment: string,
+    timestampMs: number
+  ): Promise<string> | string;
+}
+
+/**
+ * Fields of a session grant, as the wallet signs and displays them. The scope
+ * is fixed in v1 (every account the signer cosigns on this Guardian) and is
+ * not a field.
+ */
+export interface SessionGrantFields {
+  /** Hex commitment of the wallet key that signs the grant. */
+  signerCommitment: string;
+  /** Hex SEC1-compressed P-256 delegated-signer public key (33 bytes). */
+  sessionPublicKey: string;
+  /**
+   * The website asking for the session, e.g. `https://app.example`; empty
+   * outside a browser. The wallet displays it so the user sees who asks;
+   * Guardian does not check it against requests.
+   */
+  origin: string;
+  /** Unix seconds. */
+  issuedAt: number;
+  /** Unix seconds. */
+  expiresAt: number;
+  /** This Guardian's ACK key commitment for the wallet's scheme (`GET /pubkey`). */
+  guardianCommitment: string;
+  /** `environment` from `GET /status`. */
+  network: string;
+}
+
+/**
+ * Why a client stopped using a session:
+ * - `logout`: the app ended it with `revokeSession` or `revokeAllSessions`
+ *   (the multisig SDK also logs out a session it replaces); do not start a
+ *   new one in response;
+ * - `expired`: it reached its expiry;
+ * - `revoked`: Guardian answered `session_revoked` (logout or revoke-all
+ *   elsewhere);
+ * - `rejected`: Guardian no longer accepts it (`authentication_failed`, e.g.
+ *   after a restart forgot it or the Guardian key was rotated).
+ */
+export type SessionEndReason = 'logout' | 'expired' | 'revoked' | 'rejected';
+
+/**
+ * Signs session-eligible requests on behalf of a wallet after a session grant
+ * was registered. Requests carry `x-auth-format: session`.
+ */
+export interface SessionRequestSigner {
+  /** Hex SEC1-compressed P-256 session public key, sent as `x-pubkey`. */
+  readonly publicKey: string;
+  /**
+   * Commitment of the wallet that granted the session. The client only uses
+   * the session while that wallet is its signer.
+   */
+  readonly signerCommitment: string;
+  /** Unix seconds. */
+  readonly expiresAt: number;
+  signRequest(
+    accountId: string,
+    timestamp: number,
+    requestPayload: RequestAuthPayload
+  ): Promise<string> | string;
+  /** Sign the account-less `SessionLogoutMessage` for `POST /session/logout`. */
+  signLogout(timestampMs: number): Promise<string> | string;
+  /** Called once when the client stops using the session. */
+  onEnded?(reason: SessionEndReason): void;
+}
+
+export interface CreateSessionRequest {
+  scheme: SignatureScheme;
+  /** `eip712` for EIP-712 wallet signatures; omitted for raw signatures. */
+  authFormat?: 'eip712';
+  /** Wallet public key; required for ECDSA. */
+  publicKey?: string;
+  signature: string;
+  grant: SessionGrantFields;
+}
+
+export interface CreateSessionResponse {
+  signerCommitment: string;
+  /** RFC 3339 UTC. */
+  expiresAt: string;
+}
+
+/** Session parameters a Guardian advertises on `GET /status`. */
+export interface SessionsStatus {
+  /** Grants may expire at most this many seconds after registration. */
+  maxTtlSeconds: number;
 }
 
 export interface FalconSignature {
@@ -37,6 +146,7 @@ export interface EcdsaSignature {
   scheme: 'ecdsa';
   signature: string;
   publicKey?: string;
+  messageFormat?: 'eip712';
 }
 
 export type ProposalSignature = FalconSignature | EcdsaSignature;
@@ -65,11 +175,17 @@ export type DeltaStatus =
   | { status: 'pending'; timestamp: string; proposerId: string; cosignerSigs: CosignerSignature[] }
   | { status: 'candidate'; timestamp: string }
   | { status: 'canonical'; timestamp: string }
-  /** Candidate the Guardian gave up verifying (retry exhaustion or a
-   * confirmed-diverged observation) but kept for background
-   * reconciliation (issue #345); promoted to `canonical` if the chain
-   * ever shows it landed, dropped after a server-side TTL otherwise. */
-  | { status: 'retained'; timestamp: string; reason?: 'retry_exhausted' | 'diverged' }
+  /** Candidate the Guardian gave up verifying (retry exhaustion, a
+   * confirmed-diverged observation, or an orphaned position in the
+   * account's candidate queue after its predecessor was parked) but
+   * kept for background reconciliation (issue #345 / #17); promoted to
+   * `canonical` if the chain ever shows it landed, dropped after a
+   * server-side TTL otherwise. */
+  | {
+      status: 'retained';
+      timestamp: string;
+      reason?: 'retry_exhausted' | 'diverged' | 'orphaned';
+    }
   | { status: 'discarded'; timestamp: string; reason?: string };
 
 export type ProposalType =
@@ -106,11 +222,13 @@ export interface ProposalMetadata {
   /** P2ID note visibility, "public" or "private" (issue #322). Absent => public. */
   noteType?: string;
   /**
-   * Base64-serialized Miden `ChainAnchor` pinning the reference block the
-   * proposal's transaction summary was built at. Since protocol 0.16 the
-   * signed summary binds the reference block commitment, so cosigners and the
-   * executor need this anchor to reproduce the summary the proposer signed.
+   * The block the proposal's transaction summary binds. Not signed: the
+   * multisig SDKs read the block from the summary and refuse a proposal whose
+   * value disagrees, so a wrong value can deny a proposal but never get a
+   * wrong one accepted.
    */
+  boundBlockNum?: number;
+  /** Legacy: the base64 Miden `ChainAnchor` 0.18 clients wrote instead of `boundBlockNum`. */
   chainAnchor?: string;
   /** P2IDE reclaim block height (issue #366). Presence of either height means a P2IDE note. */
   reclaimHeight?: number;
@@ -153,6 +271,20 @@ export interface StateObject {
   authScheme?: string;
 }
 
+/**
+ * Head of the latest canonical state (`GET /state/nonce`): the account
+ * nonce carried by the state GUARDIAN holds as canonical and that state's
+ * commitment, without the state blob. A client can skip `getState` when
+ * `nonce` is below its local account nonce, or equal to it with the same
+ * `commitment`; an equal nonce at a different commitment means the local
+ * account diverged from GUARDIAN, so it fetches the state.
+ */
+export interface CanonicalNonce {
+  accountId: string;
+  nonce: number;
+  commitment: string;
+}
+
 export interface ConfigureRequest {
   accountId: string;
   auth: AuthConfig;
@@ -178,6 +310,8 @@ export interface StatusResponse {
   environment: string;
   startedAt: string;
   uptimeSeconds: number;
+  /** Present on every Guardian that accepts session grants; absent on older servers. */
+  sessions?: SessionsStatus;
 }
 
 export interface DeltaProposalRequest {

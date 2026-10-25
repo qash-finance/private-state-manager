@@ -12,6 +12,7 @@
 use crate::build_info;
 use crate::canonicalization::CanonicalizationConfig;
 use crate::network::NetworkType;
+use crate::release_sweep::ReleaseSweepConfig;
 use crate::storage::StorageType;
 use std::net::SocketAddr;
 
@@ -24,7 +25,9 @@ pub(crate) struct StartupInfo {
     ecdsa_backend: &'static str,
     falcon_commitment: String,
     ecdsa_commitment: String,
+    account_schemes: String,
     canonicalization: Option<CanonicalizationConfig>,
+    release_sweep: Option<ReleaseSweepConfig>,
     operator_count: usize,
     cursor_secret_configured: bool,
     http_port: Option<u16>,
@@ -42,7 +45,9 @@ impl StartupInfo {
         ecdsa_backend: &'static str,
         falcon_commitment: String,
         ecdsa_commitment: String,
+        account_schemes: String,
         canonicalization: Option<CanonicalizationConfig>,
+        release_sweep: Option<ReleaseSweepConfig>,
         operator_count: usize,
         cursor_secret_configured: bool,
         http_port: Option<u16>,
@@ -57,7 +62,9 @@ impl StartupInfo {
             ecdsa_backend,
             falcon_commitment,
             ecdsa_commitment,
+            account_schemes,
             canonicalization,
+            release_sweep,
             operator_count,
             cursor_secret_configured,
             http_port,
@@ -104,6 +111,7 @@ impl StartupInfo {
             falcon_commitment = %self.falcon_commitment,
             ecdsa_backend = self.ecdsa_backend,
             ecdsa_commitment = %self.ecdsa_commitment,
+            account_schemes = %self.account_schemes,
             "ack signers"
         );
         tracing::info!(
@@ -123,10 +131,27 @@ impl StartupInfo {
                 fast_promotion_window_seconds = config.fast_promotion_window_seconds,
                 max_retries = config.max_retries,
                 submission_grace_period_seconds = config.submission_grace_period_seconds,
+                max_concurrent_accounts = config.max_concurrent_accounts,
+                max_pending_candidates_per_account = config.max_pending_candidates_per_account,
+                retained_ttl_seconds = config.retained_ttl_seconds,
+                reconcile_interval_seconds = config.reconcile_interval_seconds,
                 "canonicalization"
             ),
             None => {
                 tracing::info!("optimistic mode (deltas accepted without on-chain verification)")
+            }
+        }
+        match &self.release_sweep {
+            Some(config) if config.enabled => tracing::info!(
+                rotation_seconds = config.rotation_seconds,
+                max_rate_per_second = config.max_rate_per_second,
+                page_size = config.page_size,
+                recheck_seconds = config.recheck_seconds,
+                confirmations = config.confirmations,
+                "release sweep"
+            ),
+            _ => {
+                tracing::info!("release sweep disabled (switch detection relies on the push path)")
             }
         }
         tracing::info!(
@@ -182,6 +207,7 @@ mod tests {
             "aws-kms",
             "0xfalcon".to_string(),
             "0xecdsa".to_string(),
+            "falcon,ecdsa".to_string(),
             Some(CanonicalizationConfig {
                 check_interval_seconds: 10,
                 fast_promotion_enabled: true,
@@ -196,7 +222,9 @@ mod tests {
                 retained_ttl_seconds: 86_400,
                 reconcile_interval_seconds: 60,
                 reconcile_page_size: 100,
+                max_pending_candidates_per_account: 4,
             }),
+            Some(ReleaseSweepConfig::default()),
             3,
             true,
             Some(3000),
@@ -231,6 +259,8 @@ mod tests {
             "in-memory",
             "0xfalcon".to_string(),
             "0xecdsa".to_string(),
+            "falcon,ecdsa".to_string(),
+            None,
             None,
             0,
             false,
@@ -264,6 +294,8 @@ mod tests {
             "in-memory",
             "0xfalcon".to_string(),
             "0xecdsa".to_string(),
+            "falcon,ecdsa".to_string(),
+            None,
             None,
             0,
             false,

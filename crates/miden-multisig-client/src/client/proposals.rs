@@ -53,7 +53,8 @@ use crate::execution::{
 use crate::keystore::proposal_public_key_hex;
 use crate::proposal::{Proposal, TransactionType, is_builtin_proposal_type};
 use crate::transaction::{
-    ProposalBuilder, deserialize_transaction_request, execute_for_summary, word_to_hex,
+    ProposalBuilder, ProposalOptions, deserialize_transaction_request, execute_for_summary_at_tip,
+    proposal_auth_args, word_to_hex,
 };
 
 impl MultisigClient {
@@ -72,8 +73,8 @@ impl MultisigClient {
             .proposal
             .ok_or_else(|| MultisigError::ProposalNotFound(proposal_id.to_string()))?;
         Self::ensure_proposal_account_id(&raw_proposal.account_id, account_id)?;
-        let proposal = Proposal::from(&raw_proposal)?;
-        self.verify_proposal_summary_binding(&proposal).await?;
+        let mut proposal = Proposal::from(&raw_proposal)?;
+        self.verify_proposal_summary_binding(&mut proposal).await?;
         Ok(proposal)
     }
 
@@ -82,6 +83,14 @@ impl MultisigClient {
     /// Proposals whose nonce is not above the committed account nonce are
     /// skipped: they have already been executed or superseded, but GUARDIAN may
     /// still report them pending until canonicalization prunes them.
+    ///
+    /// Every listed proposal's metadata is checked against its signed summary
+    /// and the outcome is recorded in [`Proposal::verification`]. One that
+    /// fails is still listed, so a single stale or corrupt proposal cannot
+    /// hide the others (issue #462). `Failed { retryable: true }`
+    /// means a transient node error, worth listing again; `retryable: false`
+    /// means the proposal cannot be reproduced and must be re-proposed.
+    /// Signing and executing re-verify and refuse a failed proposal.
     ///
     /// # Errors
     ///
@@ -110,12 +119,32 @@ impl MultisigClient {
             if proposal.nonce <= current_nonce {
                 continue;
             }
-
-            self.verify_proposal_summary_binding(&proposal).await?;
             proposals.push(proposal);
         }
 
+        self.sync_chain_before_verifying(&proposals).await;
+        for proposal in &mut proposals {
+            // The outcome lands on the proposal either way; a failure is
+            // reported there rather than failing the listing.
+            let _ = self.verify_listed_proposal_summary_binding(proposal).await;
+        }
+
         Ok(proposals)
+    }
+
+    /// Brings the Miden client to the chain tip once before a listing's
+    /// proposals are re-executed: an execution loads foreign accounts, the
+    /// fee faucet among them, at the store's sync height, which a node prunes
+    /// about 50 blocks later. Best effort, so a node outage shows up on each
+    /// proposal as a retryable verification failure instead of failing the
+    /// listing.
+    async fn sync_chain_before_verifying(&mut self, proposals: &[Proposal]) {
+        if proposals.is_empty() {
+            return;
+        }
+        if let Err(error) = crate::transaction::sync_chain(&mut self.miden_client).await {
+            tracing::warn!(%error, "could not sync the Miden client before verifying proposals");
+        }
     }
 
     /// [`MultisigClient::list_proposals`] variant for the recovery flow:
@@ -146,7 +175,7 @@ impl MultisigClient {
                 MultisigError::GuardianServer(format!("failed to get proposals: {}", e))
             })?;
 
-        let mut proposals = Vec::with_capacity(response.proposals.len());
+        let mut parsed = Vec::with_capacity(response.proposals.len());
         let mut skipped = Vec::new();
         for (position, delta) in response.proposals.iter().enumerate() {
             let identifier = format!("proposal at nonce {} (#{})", delta.nonce, position);
@@ -165,8 +194,16 @@ impl MultisigClient {
             if proposal.nonce <= current_nonce {
                 continue;
             }
+            parsed.push(proposal);
+        }
 
-            if let Err(e) = self.verify_proposal_summary_binding(&proposal).await {
+        self.sync_chain_before_verifying(&parsed).await;
+        let mut proposals = Vec::with_capacity(parsed.len());
+        for mut proposal in parsed {
+            if let Err(e) = self
+                .verify_listed_proposal_summary_binding(&mut proposal)
+                .await
+            {
                 skipped.push((
                     format!("proposal {}", proposal.id),
                     format!("summary binding failed verification: {}", e),
@@ -190,6 +227,9 @@ impl MultisigClient {
         }
 
         let account_id = account.id();
+        // Verification re-executes the proposal at the store's sync height, so
+        // bring it to the tip first (see `sync_chain_before_verifying`).
+        crate::transaction::sync_chain(&mut self.miden_client).await?;
         let proposal = self.get_proposal(&account_id, proposal_id).await?;
 
         // Check if already signed
@@ -222,7 +262,11 @@ impl MultisigClient {
             .as_ref()
             .ok_or_else(|| MultisigError::ProposalNotFound(proposal_id.to_string()))?;
         Self::ensure_proposal_account_id(&updated_raw.account_id, &account_id)?;
-        let updated = Proposal::from(updated_raw)?;
+        // GUARDIAN's response is a fresh payload: parse it and re-verify it, so
+        // the returned proposal carries a real verification outcome (and is
+        // actionable once the threshold is met) rather than `Unchecked`.
+        let mut updated = Proposal::from(updated_raw)?;
+        self.verify_proposal_summary_binding(&mut updated).await?;
         Ok(updated)
     }
 
@@ -287,6 +331,9 @@ impl MultisigClient {
             ));
         }
 
+        self.assert_approval_not_expired(&proposal.id, &proposal.tx_summary)
+            .await?;
+
         let tx_summary_commitment = proposal.tx_summary.to_commitment();
 
         let mut signature_inputs: Vec<SignatureInput> = proposal
@@ -297,6 +344,7 @@ impl MultisigClient {
                 signature_hex: signature.signature_hex,
                 scheme: signature.scheme,
                 public_key_hex: signature.public_key_hex,
+                message_format: signature.message_format,
             })
             .collect();
 
@@ -313,6 +361,7 @@ impl MultisigClient {
             signature_inputs,
             &required_commitments,
             tx_summary_commitment,
+            Some(&proposal.tx_summary),
         )?;
 
         if proposal.transaction_type.requires_guardian_ack() {
@@ -361,9 +410,6 @@ impl MultisigClient {
             }
         }
 
-        // Build the final transaction request with all signatures
-        let salt = proposal.metadata.salt()?;
-
         // For signer-update transactions, we must propagate parse errors for signer commitments
         // rather than silently converting to None. This ensures malformed hex is diagnosed properly.
         let signer_commitments = if matches!(
@@ -377,18 +423,13 @@ impl MultisigClient {
             proposal.metadata.signer_commitments().ok()
         };
 
-        // Execute and finalize at the proposal's anchored reference block, so
-        // the summary the cosigners signed reproduces exactly. The anchor was
-        // already checked against the summary's block commitment when
-        // `get_proposal` verified the summary binding. It also carries the fee
-        // faucet used to derive native fee conversion info during execution.
-        let chain_anchor = proposal.metadata.chain_anchor()?;
+        let auth_args = proposal_auth_args(&self.miden_client, &proposal.tx_summary).await?;
 
         let final_tx_request = build_final_transaction_request(
             &self.miden_client,
             &proposal.transaction_type,
             account.inner(),
-            salt,
+            &auth_args,
             signature_advice,
             proposal.metadata.new_threshold,
             signer_commitments.as_deref(),
@@ -396,13 +437,8 @@ impl MultisigClient {
         )
         .await?;
 
-        self.finalize_transaction(
-            account_id,
-            final_tx_request,
-            &proposal.transaction_type,
-            chain_anchor,
-        )
-        .await
+        self.finalize_transaction(account_id, final_tx_request, &proposal.transaction_type)
+            .await
     }
 
     /// Creates a proposal from a producer-built transaction the SDK does not
@@ -437,32 +473,28 @@ impl MultisigClient {
             )));
         }
 
-        self.sync().await?;
         let account = self.require_account()?.clone();
         let account_id = account.id();
 
         let tx_request = deserialize_transaction_request(transaction_request_bytes)?;
-        let (tx_summary, chain_anchor) =
-            execute_for_summary(&mut self.miden_client, account_id, tx_request).await?;
+        let tx_summary =
+            execute_for_summary_at_tip(&mut self.miden_client, account_id, tx_request).await?;
         let tx_commitment = tx_summary.to_commitment();
 
         let required_signatures = account.threshold()? as usize;
-        let chain_anchor_b64 = crate::transaction::chain_anchor_to_base64(&chain_anchor);
 
         let metadata = crate::proposal::ProposalMetadata {
             tx_summary_json: Some(tx_summary.to_json()),
             proposal_type: Some(proposal_type.to_string()),
             required_signatures: Some(required_signatures),
             signers: vec![self.key_manager.commitment_hex()],
-            chain_anchor_b64: Some(chain_anchor_b64.clone()),
             ..Default::default()
         };
 
         let payload = crate::payload::ProposalPayload::new(&tx_summary)
             .with_signature(self.key_manager.as_ref(), tx_commitment)
             .with_custom_metadata(proposal_type.to_string())
-            .with_required_signatures(required_signatures)
-            .with_chain_anchor(chain_anchor_b64);
+            .with_required_signatures(required_signatures);
 
         let nonce = account.nonce() + 1;
         let mut guardian_client = self.create_authenticated_guardian_client().await?;
@@ -529,17 +561,14 @@ impl MultisigClient {
 
         let tx_summary_commitment = proposal.tx_summary.to_commitment();
 
-        // Re-execute at the proposal's anchored reference block: the signed
-        // summary binds that block's commitment, so probing at the local sync
-        // height would never reproduce it. The anchor itself was verified
-        // against the summary when `get_proposal` checked the binding.
-        let chain_anchor = proposal.metadata.chain_anchor()?;
+        // Re-derive the summary at the tip: it binds the block the producer's
+        // auth args name, which the request declares, so it reproduces at any
+        // sync height at or past that block.
         let probe_request = deserialize_transaction_request(transaction_request_bytes)?;
-        let derived_summary = crate::transaction::execute_for_summary_at(
+        let derived_summary = crate::transaction::execute_for_summary_at_tip(
             &mut self.miden_client,
             account_id,
             probe_request,
-            chain_anchor,
         )
         .await?;
         let derived_commitment = derived_summary.to_commitment();
@@ -552,6 +581,9 @@ impl MultisigClient {
             )));
         }
 
+        self.assert_approval_not_expired(&proposal.id, &proposal.tx_summary)
+            .await?;
+
         let mut signature_inputs: Vec<SignatureInput> = proposal
             .signatures
             .into_iter()
@@ -560,6 +592,7 @@ impl MultisigClient {
                 signature_hex: signature.signature_hex,
                 scheme: signature.scheme,
                 public_key_hex: signature.public_key_hex,
+                message_format: signature.message_format,
             })
             .collect();
         signature_inputs.sort_by(|a, b| a.signer_commitment.cmp(&b.signer_commitment));
@@ -571,6 +604,7 @@ impl MultisigClient {
             signature_inputs,
             &required_commitments,
             tx_summary_commitment,
+            Some(&derived_summary),
         )?;
 
         if proposal.transaction_type.requires_guardian_ack() {
@@ -592,8 +626,8 @@ impl MultisigClient {
     /// API). The caller injects the advice from `prepare_custom_execution` into
     /// its own transaction request (`request.advice_map_mut().extend(advice)`)
     /// and passes it here with the proposal id to finalize. The transaction is
-    /// executed at the proposal's anchored reference block, since the collected
-    /// signatures only authorize the summary produced at that block.
+    /// executed at the chain tip, so the request has to declare the block its
+    /// auth args bind (attach them with [`crate::TransactionRequestBuilderExt`]).
     pub async fn submit_transaction(
         &mut self,
         proposal_id: &str,
@@ -604,10 +638,10 @@ impl MultisigClient {
         // state would reject an otherwise-valid request.
         self.sync().await?;
         let account_id = self.require_account()?.id();
-        let proposal = self.get_proposal(&account_id, proposal_id).await?;
-        let chain_anchor = proposal.metadata.chain_anchor()?;
-        self.submit_transaction_at(account_id, request, chain_anchor)
-            .await?;
+        // Fetched for its binding check: a proposal GUARDIAN serves that does
+        // not verify is not submitted.
+        self.get_proposal(&account_id, proposal_id).await?;
+        self.submit_transaction_at_tip(account_id, request).await?;
         let _ = self.miden_client.sync_state().await;
         Ok(())
     }
@@ -636,6 +670,17 @@ impl MultisigClient {
         &mut self,
         transaction_type: TransactionType,
     ) -> Result<Proposal> {
+        self.propose_transaction_with_options(transaction_type, ProposalOptions::default())
+            .await
+    }
+
+    /// Proposes a transaction with per-proposal settings, such as an approval
+    /// expiration. See [`ProposalOptions`].
+    pub async fn propose_transaction_with_options(
+        &mut self,
+        transaction_type: TransactionType,
+        options: ProposalOptions,
+    ) -> Result<Proposal> {
         // Sync with the network before executing transaction
         self.sync().await?;
 
@@ -643,9 +688,12 @@ impl MultisigClient {
         warn_on_override_dilution(&account, &transaction_type);
         let mut guardian_client = self.create_authenticated_guardian_client().await?;
 
+        let node_rpc = self.node_rpc_client();
         ProposalBuilder::new(transaction_type)
+            .with_options(options)
             .build(
                 &mut self.miden_client,
+                &node_rpc,
                 &mut guardian_client,
                 &account,
                 self.key_manager.as_ref(),
@@ -830,6 +878,7 @@ fn warn_on_override_dilution(
 mod tests {
     use guardian_client::DeltaObject;
     use guardian_shared::ToJson;
+    use miden_protocol::account::AccountCodePatch;
     use miden_protocol::account::AccountId;
     use miden_protocol::account::AccountStoragePatch;
     use miden_protocol::account::delta::{AccountDelta, AccountVaultDelta};
@@ -848,7 +897,7 @@ mod tests {
             account_id,
             AccountStoragePatch::default(),
             AccountVaultDelta::default(),
-            None,
+            AccountCodePatch::default(),
             Felt::ZERO,
         )
         .expect("valid delta");
@@ -857,10 +906,10 @@ mod tests {
             account_delta,
             InputNotes::new(Vec::new()).expect("empty input notes"),
             RawOutputNotes::new(Vec::new()).expect("empty output notes"),
+            miden_protocol::block::BlockNumber::from(0),
             Word::default(),
             0,
             TransactionSummaryUserParams::new([
-                ZERO,
                 ZERO,
                 ZERO,
                 Felt::new_unchecked(seed),

@@ -2,6 +2,7 @@
 
 use miden_client::rpc::{GrpcError, RpcError};
 use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
 use miden_protocol::note::NoteId;
 use thiserror::Error;
 
@@ -30,6 +31,44 @@ pub enum MultisigError {
     /// Miden client error.
     #[error("miden client error: {0}")]
     MidenClient(String),
+
+    /// A proposal's `bound_block_num` names a block other than the one its
+    /// signed summary binds. TypeScript custom producers rebuild at that
+    /// number, so both SDKs refuse a wrong one by name.
+    #[error(
+        "proposal {proposal_id} declares bound_block_num {declared}, but its signed \
+         transaction summary binds block {bound}"
+    )]
+    BoundBlockMismatch {
+        proposal_id: String,
+        declared: u32,
+        bound: BlockNumber,
+    },
+
+    /// A multisig request binds a block in its auth args without declaring it
+    /// through `TransactionRequestBuilder::block_numbers`. A proposal executes
+    /// at the chain tip, where the auth procedure can read the bound block only
+    /// from the transaction's partial blockchain, so the request would fail in
+    /// the VM once the chain moves past that block.
+    #[error(
+        "the transaction request binds block {bound_block_num} in its multisig auth args but \
+         does not declare it, so it cannot execute at a later chain tip; attach the auth args \
+         with TransactionRequestBuilderExt::multisig_auth_args or add \
+         .block_numbers([{bound_block_num}])"
+    )]
+    BoundBlockNotDeclared { bound_block_num: BlockNumber },
+
+    /// The Miden client synced, and its node still has not produced the block
+    /// a proposal binds, so the proposal cannot execute at this client's tip
+    /// yet. Worth retrying once the node catches up.
+    #[error(
+        "the Miden client synced to block {synced}, below block {bound_block_num} the proposal \
+         binds; its node has not reached that block yet"
+    )]
+    ChainBehindBoundBlock {
+        synced: BlockNumber,
+        bound_block_num: BlockNumber,
+    },
 
     /// Miden client error retaining the concrete source and its RPC status.
     #[error("miden client error: {message}")]
@@ -164,6 +203,13 @@ pub enum MultisigError {
     /// store does not contain the referenced note. Not reachable on v2.
     #[error("consume_notes legacy verification: note not found in local store: {note_id}")]
     LegacyConsumeNotesNoteMissing { note_id: NoteId },
+
+    /// consume_notes: a note the proposal consumes could not be authenticated
+    /// (its inclusion proof fetched from the node and imported into the local
+    /// store). The signed summary commits to authenticated consumption, so
+    /// an unauthenticated rebuild would never match it (issue #409).
+    #[error("consume_notes: note {note_id} could not be authenticated: {reason}")]
+    ConsumeNoteNotAuthenticated { note_id: NoteId, reason: String },
 }
 
 impl MultisigError {
@@ -178,6 +224,9 @@ impl MultisigError {
             }
             Self::ConsumeNotesMetadataOversize { .. } => Some("consume_notes_metadata_oversize"),
             Self::LegacyConsumeNotesNoteMissing { .. } => Some("consume_notes_legacy_note_missing"),
+            Self::ConsumeNoteNotAuthenticated { .. } => {
+                Some("consume_notes_note_not_authenticated")
+            }
             Self::UnsupportedTransactionType(_) => Some("unsupported_transaction_type"),
             _ => None,
         }

@@ -2,15 +2,9 @@
 //!
 //! Resolves a Miden public-key commitment to the set of account IDs whose
 //! authorization set contains that commitment. Authentication is by
-//! proof-of-possession: the caller submits a signature over a
-//! `LookupAuthMessage` digest; the service derives the public key from the
-//! signature itself (Falcon embeds it; ECDSA recovers it), verifies the
-//! signature, and requires the derived commitment to equal the queried
-//! commitment.
-//!
-//! The `x-pubkey` header is part of the wire format for consistency with
-//! per-account requests but is not consulted on this path — identity is
-//! sourced from the signature.
+//! proof-of-possession over a `LookupAuthMessage` digest. Raw lookup derives
+//! the key from the signature; EIP-712 lookup verifies against `x-pubkey`.
+//! Both require the verified key's commitment to equal the queried commitment.
 //!
 //! The service is intentionally account-less. It does NOT call
 //! `services::resolve_account` because that path requires an `account_id`
@@ -19,10 +13,13 @@
 //! `last_auth_timestamp` to compare against.
 
 use crate::error::{GuardianError, Result};
-use crate::metadata::auth::lookup::{commitment_of, derive_pubkey_from_lookup_signature};
-use crate::metadata::auth::{Credentials, MAX_TIMESTAMP_SKEW_MS};
+use crate::metadata::auth::lookup::{
+    commitment_of, derive_pubkey_from_lookup_signature, verify_eip712_lookup_signature,
+};
+use crate::metadata::auth::{Credentials, MAX_TIMESTAMP_SKEW_MS, RequestAuthFormat};
 use crate::state::AppState;
 use guardian_shared::hex::FromHex;
+use guardian_shared::lookup_auth_message::LookupAuthMessage;
 use miden_protocol::Word;
 
 /// Length of a Miden public-key commitment in hex characters (32 bytes ×
@@ -32,10 +29,8 @@ const COMMITMENT_HEX_CHARS: usize = 64;
 #[derive(Debug, Clone)]
 pub struct LookupAccountParams {
     pub key_commitment: String,
-    /// Standard request credentials. The `pubkey` field is not consulted on
-    /// the lookup path — the public key is derived from the signature itself
-    /// (Falcon embeds it; ECDSA recovers it). The field is part of the wire
-    /// format only for API consistency with per-account requests.
+    /// Standard request credentials. Raw lookup derives the key from the
+    /// signature; EIP-712 lookup verifies against the supplied public key.
     pub credentials: Credentials,
 }
 
@@ -83,21 +78,34 @@ pub async fn lookup_account(
         )));
     }
 
-    let (_pubkey_hex, signature_hex, _) = params.credentials.as_signature().ok_or_else(|| {
+    let (pubkey_hex, signature_hex, _) = params.credentials.as_signature().ok_or_else(|| {
         GuardianError::AuthenticationFailed("missing signature credentials".into())
     })?;
 
-    // Derive the pubkey from the signature itself (Falcon embeds it; ECDSA
-    // recovers it). LookupAuthMessage is domain-separated from
-    // AuthRequestMessage by construction (see lookup_auth_message.rs).
-    let parsed_pubkey =
-        derive_pubkey_from_lookup_signature(signature_hex, request_timestamp, key_commitment_word)
-            .map_err(GuardianError::AuthenticationFailed)?;
+    // Raw lookup derives the key from the signature; typed lookup verifies
+    // against the supplied key. Both sign the account-less lookup hash.
+    let parsed_pubkey = match params.credentials.auth_format() {
+        RequestAuthFormat::Raw => derive_pubkey_from_lookup_signature(
+            signature_hex,
+            request_timestamp,
+            key_commitment_word,
+        ),
+        RequestAuthFormat::Eip712 => verify_eip712_lookup_signature(
+            signature_hex,
+            pubkey_hex,
+            request_timestamp,
+            key_commitment_word,
+        ),
+        RequestAuthFormat::Session => {
+            let message = LookupAuthMessage::new(request_timestamp, key_commitment_word).to_word();
+            return Err(
+                super::reject_session_credentials(state, &params.credentials, message).await,
+            );
+        }
+    }
+    .map_err(GuardianError::AuthenticationFailed)?;
 
-    // Bind the recovered key to the queried commitment: this is the
-    // proof-of-possession check. Knowing only the queried commitment is not
-    // enough to forge a signature whose embedded/recovered pubkey hashes to
-    // that same commitment.
+    // Bind the verified key to the queried commitment.
     let derived_commitment = commitment_of(&parsed_pubkey);
     if derived_commitment != normalized_commitment {
         tracing::warn!(
@@ -120,10 +128,37 @@ pub async fn lookup_account(
                 "Failed to look up accounts by cosigner commitment: {e}"
             ))
         })?;
+    let accounts = configured_accounts(state, accounts).await?;
     tracing::Span::current().record("match_count", accounts.len());
     tracing::debug!("Lookup completed");
 
     Ok(LookupAccountResult { accounts })
+}
+
+/// Drops accounts whose metadata exists without a stored state: a first
+/// configuration that claimed the account and failed before writing its
+/// state. Listing one would hand the caller an account whose state reads
+/// 404, which fails recovery of every account behind the key.
+async fn configured_accounts(state: &AppState, accounts: Vec<String>) -> Result<Vec<String>> {
+    let mut configured = Vec::with_capacity(accounts.len());
+    for account_id in accounts {
+        match state.storage.pull_state_commitment(&account_id).await {
+            Ok(_) => configured.push(account_id),
+            Err(e) if crate::storage::is_storage_not_found(&e) => {
+                tracing::debug!(
+                    account_id = %account_id,
+                    "Lookup skipped an account whose first configuration has not finished"
+                );
+            }
+            Err(e) => {
+                tracing::error!(account_id = %account_id, error = %e, "Failed to read the stored state during lookup");
+                return Err(GuardianError::StorageError(format!(
+                    "Failed to read the stored state of {account_id}: {e}"
+                )));
+            }
+        }
+    }
+    Ok(configured)
 }
 
 /// Normalize a `0x`-prefixed (or unprefixed) hex commitment to the canonical

@@ -14,7 +14,16 @@ pub mod lookup;
 mod miden_ecdsa;
 mod miden_falcon_rpo;
 
-pub use credentials::{AuthHeader, Credentials, ExtractCredentials, MAX_TIMESTAMP_SKEW_MS};
+pub use credentials::{
+    AuthHeader, Credentials, ExtractCredentials, MAX_TIMESTAMP_SKEW_MS, MAX_TIMESTAMP_SKEW_SECS,
+    RequestAuthFormat,
+};
+
+/// Session-signed requests are resolved by `services::resolve_account`, and
+/// wallet-only routes reject them earlier with `WalletSignatureRequired`.
+/// This guard keeps `Auth::verify` from ever accepting a delegated signer.
+pub(crate) const SESSION_NOT_ACCEPTED: &str =
+    "Session credentials are not accepted here; sign this request with the wallet key";
 
 /// Authentication and authorization handler
 /// Defines which signature scheme to use and handles verification
@@ -166,13 +175,21 @@ impl Auth {
     /// * `account_id` - The account ID
     /// * `credentials` - The credentials to verify (includes timestamp)
     pub fn verify(&self, account_id: &str, credentials: &Credentials) -> Result<String, String> {
+        if credentials.auth_format() == RequestAuthFormat::Session {
+            return Err(SESSION_NOT_ACCEPTED.to_string());
+        }
         match self {
             Auth::MidenFalconRpo {
                 cosigner_commitments,
             } => {
+                if credentials.auth_format() != RequestAuthFormat::Raw {
+                    return Err(
+                        "EIP-712 request authentication requires an ECDSA account".to_string()
+                    );
+                }
                 let (_pubkey, signature, timestamp) =
                     credentials.as_signature().ok_or_else(|| {
-                        tracing::error!(
+                        tracing::warn!(
                             account_id = %account_id,
                             "MidenFalconRpo requires signature credentials but got different type"
                         );
@@ -192,21 +209,32 @@ impl Auth {
             } => {
                 let (pubkey, signature, timestamp) =
                     credentials.as_signature().ok_or_else(|| {
-                        tracing::error!(
+                        tracing::warn!(
                             account_id = %account_id,
                             "MidenEcdsa requires signature credentials but got different type"
                         );
                         "MidenEcdsa requires signature credentials".to_string()
                     })?;
 
-                miden_ecdsa::verify_request_signature(
-                    account_id,
-                    timestamp,
-                    cosigner_commitments,
-                    signature,
-                    pubkey,
-                    credentials.request_payload(),
-                )
+                match credentials.auth_format() {
+                    RequestAuthFormat::Raw => miden_ecdsa::verify_request_signature(
+                        account_id,
+                        timestamp,
+                        cosigner_commitments,
+                        signature,
+                        pubkey,
+                        credentials.request_payload(),
+                    ),
+                    RequestAuthFormat::Eip712 => miden_ecdsa::verify_eip712_request_signature(
+                        account_id,
+                        timestamp,
+                        cosigner_commitments,
+                        signature,
+                        pubkey,
+                        credentials.request_payload(),
+                    ),
+                    RequestAuthFormat::Session => Err(SESSION_NOT_ACCEPTED.to_string()),
+                }
             }
             Auth::EvmEcdsa { .. } => {
                 let _ = credentials;
@@ -235,9 +263,40 @@ impl TryFrom<crate::api::grpc::guardian::AuthConfig> for Auth {
                     .collect::<Result<Vec<_>, _>>()?,
             }),
             None => {
-                tracing::error!("Auth type not specified in AuthConfig");
+                tracing::warn!("Auth type not specified in AuthConfig");
                 Err("Auth type not specified".to_string())
             }
+        }
+    }
+}
+
+/// Verify the wallet signature on a session grant (`POST /session`) and return
+/// the verified signer commitment. Falcon grants are raw-only; ECDSA grants are
+/// raw or readable EIP-712 and need the public key.
+pub fn verify_session_grant(
+    scheme: SignatureScheme,
+    format: RequestAuthFormat,
+    grant: &guardian_shared::session_grant::SessionGrant,
+    signature: &str,
+    public_key: Option<&str>,
+) -> Result<String, String> {
+    match (scheme, format) {
+        (SignatureScheme::Falcon, RequestAuthFormat::Raw) => {
+            miden_falcon_rpo::verify_session_grant(grant, signature)
+        }
+        (SignatureScheme::Ecdsa, RequestAuthFormat::Raw | RequestAuthFormat::Eip712) => {
+            miden_ecdsa::verify_session_grant(
+                grant,
+                signature,
+                public_key,
+                format == RequestAuthFormat::Eip712,
+            )
+        }
+        (SignatureScheme::Falcon, RequestAuthFormat::Eip712) => {
+            Err("EIP-712 session grants require an ECDSA wallet".to_string())
+        }
+        (_, RequestAuthFormat::Session) => {
+            Err("A session grant must be signed by the wallet key".to_string())
         }
     }
 }
@@ -267,4 +326,20 @@ pub async fn update_credentials(
         .map_err(|e| GuardianError::StorageError(format!("Failed to update metadata: {e}")))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn falcon_rejects_eip712_request_auth() {
+        let auth = Auth::MidenFalconRpo {
+            cosigner_commitments: vec![],
+        };
+        let credentials = Credentials::signature(String::new(), String::new(), 0)
+            .with_auth_format(RequestAuthFormat::Eip712);
+
+        assert!(auth.verify("", &credentials).is_err());
+    }
 }

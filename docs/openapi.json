@@ -7,7 +7,7 @@
       "name": "AGPL-3.0",
       "identifier": "AGPL-3.0"
     },
-    "version": "0.17.0"
+    "version": "0.18.3"
   },
   "paths": {
     "/": {
@@ -256,6 +256,20 @@
         ],
         "summary": "Configure (register) an account with its authorization set and\ninitial state. Requires the signed `x-pubkey` / `x-signature` /\n`x-timestamp` auth headers.",
         "operationId": "configure",
+        "parameters": [
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -289,6 +303,16 @@
           },
           "401": {
             "description": "Authentication failed or replay rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "New account uses a signature scheme excluded by GUARDIAN_ALLOWED_ACCOUNT_SCHEMES (`signature_scheme_not_allowed`; meta.scheme and meta.allowed_schemes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1489,6 +1513,170 @@
         ]
       }
     },
+    "/dashboard/stats": {
+      "get": {
+        "tags": [
+          "dashboard"
+        ],
+        "summary": "`GET /dashboard/stats` — account and Miden vault aggregates in one\nrequest (issue #371). Served from a background-maintained snapshot:\nno per-account reads at request time; `as_of` reports its age.",
+        "operationId": "get_dashboard_stats_handler",
+        "parameters": [
+          {
+            "name": "updated_since",
+            "in": "query",
+            "description": "Optional RFC3339 timestamp. Restricts the **asset** aggregate to\naccounts whose metadata `updated_at >= updated_since`; account\ncounts are always unfiltered. Omitted or empty aggregates every\naccount.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account counts, asset totals, and coverage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardStatsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "updated_since is not an RFC3339 timestamp (`invalid_timestamp`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No operator session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing dashboard:read permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Aggregate not yet computed since startup (`data_unavailable`, retryable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "operator_session": []
+          }
+        ]
+      }
+    },
+    "/dashboard/stats/refresh": {
+      "post": {
+        "tags": [
+          "dashboard"
+        ],
+        "summary": "`POST /dashboard/stats/refresh` — request an out-of-cycle refresh of\nthe `/dashboard/stats` aggregate (issue #371). Requires\n`stats:refresh`. Returns `202` with the request's status; the walk\nitself runs on the lease holder, so poll `GET /dashboard/stats` for a\nnewer `as_of`.",
+        "operationId": "request_dashboard_stats_refresh_handler",
+        "responses": {
+          "202": {
+            "description": "Refresh queued, or already running (no duplicate work started)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardStatsRefreshResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No operator session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing stats:refresh permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Within the cooldown of the last accepted request (`rate_limit_exceeded`, `Retry-After` set)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "operator_session": []
+          }
+        ]
+      }
+    },
     "/delta": {
       "get": {
         "tags": [
@@ -1513,6 +1701,18 @@
               "type": "integer",
               "format": "int64",
               "minimum": 0
+            }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -1582,6 +1782,20 @@
         ],
         "summary": "Push a signed state delta for a single-key account. The request\nbody is the JSON-encoded [`DeltaObject`] to commit.",
         "operationId": "push_delta",
+        "parameters": [
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1671,6 +1885,20 @@
         "summary": "Request abandonment of a pending canonicalization candidate whose\ntransaction will never land on-chain (issue #319).",
         "description": "The request records an abandon *intent* and returns `202 Accepted`;\nthe delta stays a candidate — the account stays locked — until the\ncanonicalization worker confirms over the abandon quarantine that the\ntransaction did not land, then discards the delta as\n`client_abandoned` and releases the account (typically well under a\nminute, versus the full submission grace + retry window).\n\nRefused with `GUARDIAN_CANDIDATE_LANDED` (409) when the transaction\nalready landed. Retries are idempotent and preserve the original\nrequest timestamp. Poll `GET /delta` for the resolution: still\n`candidate` → waiting; `canonical` → landed after all; `discarded`\nwith reason `client_abandoned` → abandoned; `retained` → the worker\nalready released the account, but the outcome is still uncertain\n(reconciliation may promote it until the retention TTL expires).",
         "operationId": "abandon_candidate",
+        "parameters": [
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1785,6 +2013,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1873,6 +2113,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1931,6 +2183,20 @@
         ],
         "summary": "Add a cosigner signature to an existing multisig proposal. When the\nsignature threshold is reached the proposal is promoted to a delta.",
         "operationId": "sign_delta_proposal",
+        "parameters": [
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2027,6 +2293,20 @@
         ],
         "summary": "Create a new multisig delta proposal for cosigners to sign.",
         "operationId": "push_delta_proposal",
+        "parameters": [
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2131,6 +2411,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2218,6 +2510,18 @@
               "type": "integer",
               "format": "int64",
               "minimum": 0
+            }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -3101,6 +3405,7 @@
           {
             "name": "scheme",
             "in": "query",
+            "description": "`falcon` or `ecdsa`. Omitted or unrecognized values return the Falcon key, whichever\nschemes the server admits for new accounts.",
             "required": false,
             "schema": {
               "type": "string"
@@ -3141,6 +3446,266 @@
         }
       }
     },
+    "/session": {
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Register a wallet-authorized P-256 delegated signer.",
+        "description": "The wallet signs a session grant once; afterwards the delegated signer\nsigns per-account requests with `x-auth-format: session`. Wallet-only\nroutes (`POST /delta`, `/delta/candidate/abandon`, `/configure`,\n`/state/lookup`, `/session/revoke-all`) reject session credentials with\n`wallet_signature_required`. Re-submitting the grant of a live session\nsucceeds.",
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Session registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Grant does not match this Guardian, its lifetime is invalid, its origin is too long, or it is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid signature, stale grant, or session key registered with another grant or revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Signer is not a cosigner of any account (`authorization_failed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/session/logout": {
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Revoke the session whose key signs this request.",
+        "description": "`x-pubkey` is the session public key, `x-signature` the session-key\nsignature over `SessionLogoutMessage(x-pubkey, x-timestamp)`.",
+        "operationId": "revoke_session",
+        "responses": {
+          "200": {
+            "description": "Session revoked (idempotent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeSessionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Malformed or invalid session key or signature, or stale timestamp",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "x-pubkey": [],
+            "x-signature": [],
+            "x-timestamp": []
+          }
+        ]
+      }
+    },
+    "/session/revoke-all": {
+      "post": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Revoke every session of the wallet key signing this request.",
+        "description": "Wallet-only: `x-signature` is the wallet's signature over\n`SessionRevokeAllMessage(signer_commitment, x-timestamp)`, raw or as\nEIP-712 typed data (`x-auth-format: eip712`). Idempotent.",
+        "operationId": "revoke_all_sessions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeAllSessionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Sessions revoked (idempotent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeAllSessionsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed signer commitment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid signature, stale timestamp, or signature by another key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Signed by a delegated signer (`wallet_signature_required`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "x-pubkey": [],
+            "x-signature": [],
+            "x-timestamp": []
+          }
+        ]
+      }
+    },
     "/state": {
       "get": {
         "tags": [
@@ -3155,6 +3720,18 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA request format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -3234,6 +3811,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-auth-format",
+            "in": "header",
+            "description": "Optional ECDSA lookup format: eip712; omitted for raw signatures",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -3289,6 +3878,104 @@
           },
           "500": {
             "description": "Storage error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "x-pubkey": [],
+            "x-signature": [],
+            "x-timestamp": []
+          }
+        ]
+      }
+    },
+    "/state/nonce": {
+      "get": {
+        "tags": [
+          "client"
+        ],
+        "summary": "Nonce and commitment of the latest canonical state (issue #191), read\nfrom the values stored with the state rather than from the state blob.\nA client can skip `GET /state` when `nonce` is below its local account\nnonce, or equal to it with `commitment` matching the local commitment.\nAn equal nonce at a different commitment means the account diverged, so\nthe client fetches the state.",
+        "operationId": "get_canonical_nonce",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nonce and commitment of the canonical state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanonicalNonceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication failed or replay rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Account or state not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The stored state carries no nonce and cannot be decoded",
             "content": {
               "application/json": {
                 "schema": {
@@ -3412,6 +4099,16 @@
           "retryable"
         ],
         "properties": {
+          "allowed_schemes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Signature schemes this Guardian accepts for new accounts. Present\nonly for `signature_scheme_not_allowed`."
+          },
           "missing_permissions": {
             "type": [
               "array",
@@ -3455,6 +4152,13 @@
           "retryable": {
             "type": "boolean",
             "description": "Whether retrying the same request could plausibly succeed."
+          },
+          "scheme": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Rejected signature scheme. Present only for\n`signature_scheme_not_allowed`."
           }
         }
       },
@@ -3621,6 +4325,30 @@
         "properties": {
           "success": {
             "type": "boolean"
+          }
+        }
+      },
+      "CanonicalNonceResponse": {
+        "type": "object",
+        "description": "Head of the canonical state: the nonce the account carries in that\nstate and the state's commitment.",
+        "required": [
+          "account_id",
+          "nonce",
+          "commitment"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "commitment": {
+            "type": "string",
+            "description": "Commitment of the latest canonical state."
+          },
+          "nonce": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Account nonce of the latest canonical state.",
+            "minimum": 0
           }
         }
       },
@@ -3792,6 +4520,57 @@
           }
         }
       },
+      "CreateSessionRequest": {
+        "type": "object",
+        "required": [
+          "scheme",
+          "signature",
+          "grant"
+        ],
+        "properties": {
+          "auth_format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`raw` (default) or `eip712` (ECDSA only; readable `GuardianSession`\ntyped data)."
+          },
+          "grant": {
+            "$ref": "#/components/schemas/SessionGrantRequest"
+          },
+          "public_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Hex wallet public key; required for ECDSA, ignored for Falcon."
+          },
+          "scheme": {
+            "$ref": "#/components/schemas/SignatureScheme",
+            "description": "Wallet signature scheme: `falcon` or `ecdsa`."
+          },
+          "signature": {
+            "type": "string",
+            "description": "Hex wallet signature over the grant."
+          }
+        }
+      },
+      "CreateSessionResponse": {
+        "type": "object",
+        "required": [
+          "signer_commitment",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "description": "RFC 3339 UTC."
+          },
+          "signer_commitment": {
+            "type": "string"
+          }
+        }
+      },
       "DashboardAccountDetail": {
         "type": "object",
         "required": [
@@ -3913,6 +4692,59 @@
           "unavailable"
         ]
       },
+      "DashboardAccountStats": {
+        "type": "object",
+        "description": "Unfiltered account counts (FR-3). `updated_since` does not apply.",
+        "required": [
+          "total",
+          "by_lifecycle",
+          "by_auth_method",
+          "by_auth_method_and_signer_count",
+          "updated_within_7d",
+          "updated_within_30d"
+        ],
+        "properties": {
+          "by_auth_method": {
+            "type": "object",
+            "description": "Counts by stable auth-method label. A map because the key is\nthe closed `Auth::method_label()` vocabulary and it is the very\nsame aggregate `/dashboard/info.accounts_by_auth_method` serves\n(FR-9). Never omitted above an inventory threshold.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "by_auth_method_and_signer_count": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DashboardAuthMethodSignerCount"
+            },
+            "description": "Sorted by `(auth_method, authorized_signer_count)`. An array\nrather than a nested map because the signer count is an\nunbounded integer, which JSON object keys cannot type."
+          },
+          "by_lifecycle": {
+            "$ref": "#/components/schemas/DashboardLifecycleCounts"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "updated_within_30d": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Same, for the last 30 days.",
+            "minimum": 0
+          },
+          "updated_within_7d": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Accounts whose metadata `updated_at` is within the last 7 days,\nanchored to `as_of`.",
+            "minimum": 0
+          }
+        }
+      },
       "DashboardAccountSummary": {
         "type": "object",
         "required": [
@@ -3980,6 +4812,93 @@
           }
         }
       },
+      "DashboardAssetStats": {
+        "type": "object",
+        "description": "Asset totals over eligible Miden accounts plus the coverage that\nqualifies them (FR-1 / FR-4). `covered + sum(skipped) == eligible`.",
+        "required": [
+          "eligible",
+          "covered",
+          "skipped",
+          "complete",
+          "fungible",
+          "non_fungible"
+        ],
+        "properties": {
+          "complete": {
+            "type": "boolean",
+            "description": "`true` only when every eligible account is covered. A skipped\naccount never appears as a zero balance."
+          },
+          "covered": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Eligible accounts whose vault was decoded into the totals.",
+            "minimum": 0
+          },
+          "eligible": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Miden accounts passing the `updated_since` filter (EVM accounts\nare never eligible — they have no Miden vault).",
+            "minimum": 0
+          },
+          "fungible": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DashboardFungibleTotal"
+            },
+            "description": "Sorted by `faucet_id`."
+          },
+          "non_fungible": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DashboardNonFungibleTotal"
+            },
+            "description": "Sorted by `faucet_id`."
+          },
+          "skipped": {
+            "type": "object",
+            "description": "Eligible accounts not covered, by stable reason. Keys are the\nclosed [`SkipReason`] vocabulary; a new reason is additive and\n`covered + Σskipped == eligible` always holds.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Stable reason an eligible account's vault was not aggregated.\nSerialized via [`SkipReason::as_str`]; new reasons must add a new\nlabel, never repurpose an existing one.",
+              "enum": [
+                "state_unavailable",
+                "state_undecodable"
+              ]
+            }
+          }
+        }
+      },
+      "DashboardAuthMethodSignerCount": {
+        "type": "object",
+        "description": "Accounts sharing one `(auth_method, authorized_signer_count)` shape.\nLets a consumer reproduce its account-shape heuristics without\nGuardian asserting which client a shape belongs to.",
+        "required": [
+          "auth_method",
+          "authorized_signer_count",
+          "count"
+        ],
+        "properties": {
+          "auth_method": {
+            "type": "string",
+            "description": "Stable `Auth::method_label()` (`miden_falcon`, `miden_ecdsa`, `evm`)."
+          },
+          "authorized_signer_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Distinct authorized signers, as on `DashboardAccountSummary`.",
+            "minimum": 0
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "DashboardBackendInfo": {
         "type": "object",
         "description": "Backend configuration snapshot. Stable for the lifetime of the\nprocess; lets operators distinguish a filesystem dev box from a\npostgres-backed prod replica without inspecting environment.",
@@ -3996,6 +4915,17 @@
               {
                 "$ref": "#/components/schemas/DashboardCanonicalizationConfig",
                 "description": "`None` when running in optimistic-commit mode; `Some(_)` when\nthe canonicalization worker is active."
+              }
+            ]
+          },
+          "release_sweep": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DashboardReleaseSweepConfig",
+                "description": "Release sweep settings; `None` when the sweep is disabled."
               }
             ]
           },
@@ -4049,13 +4979,21 @@
           "submission_grace_period_seconds",
           "retained_ttl_seconds",
           "reconcile_interval_seconds",
-          "reconcile_page_size"
+          "reconcile_page_size",
+          "max_pending_candidates_per_account"
         ],
         "properties": {
           "check_interval_seconds": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "max_pending_candidates_per_account": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Candidate deltas one account may hold in flight at once, as a\nstrictly ordered chain (issue #17). `1`, the default, is the\nhistorical one-in-flight-candidate behavior; deeper queues are an\noperator opt-in.",
+            "maximum": 16,
+            "minimum": 1
           },
           "max_retries": {
             "type": "integer",
@@ -4122,7 +5060,7 @@
               "boolean",
               "null"
             ],
-            "description": "Whether the `retained` row still chains from the stored account\nstate — `false` means the row is structurally obsolete (the base\nmoved out from under it) and can only age out. Present only on\n`retained` rows, and absent when the state read fails."
+            "description": "Whether the `retained` row builds directly on the stored account\nstate. `false` means it does not: reconciliation can still promote\nit when other retained rows chain from the stored state to its base\n(an `orphaned` successor whose predecessor is promoted first), and\notherwise it can only age out. Present only on `retained` rows, and\nabsent when the state read fails."
           },
           "category": {
             "oneOf": [
@@ -4207,7 +5145,7 @@
               "string",
               "null"
             ],
-            "description": "Why the row left the active candidate path: `retry_exhausted` or\n`diverged` on `retained` rows, `client_abandoned` on `discarded`\nrows; absent elsewhere."
+            "description": "Why the row left the active candidate path: `retry_exhausted`,\n`diverged`, or `orphaned` on `retained` rows, `client_abandoned`\non `discarded` rows; absent elsewhere."
           },
           "status_timestamp": {
             "type": "string"
@@ -4360,6 +5298,23 @@
           }
         }
       },
+      "DashboardFungibleTotal": {
+        "type": "object",
+        "description": "Base-unit fungible total for one faucet across covered accounts.",
+        "required": [
+          "faucet_id",
+          "total_amount"
+        ],
+        "properties": {
+          "faucet_id": {
+            "type": "string"
+          },
+          "total_amount": {
+            "type": "string",
+            "description": "Base-10 decimal string; may exceed `u64` and JavaScript's safe\ninteger range. No decimals normalization or pricing is applied."
+          }
+        }
+      },
       "DashboardGlobalDeltaEntry": {
         "type": "object",
         "description": "One entry in the global delta feed wire shape per `data-model.md`.\nCarries every field of a per-account [`DashboardDeltaEntry`] plus\n`account_id` so the dashboard can group / link without a second\nrequest.",
@@ -4446,7 +5401,7 @@
               "string",
               "null"
             ],
-            "description": "Why the row left the active candidate path: `retry_exhausted` or\n`diverged` on `retained` rows, `client_abandoned` on `discarded`\nrows; absent elsewhere."
+            "description": "Why the row left the active candidate path: `retry_exhausted`,\n`diverged`, or `orphaned` on `retained` rows, `client_abandoned`\non `discarded` rows; absent elsewhere."
           },
           "status_timestamp": {
             "type": "string"
@@ -4528,7 +5483,7 @@
         "properties": {
           "accounts_by_auth_method": {
             "type": "object",
-            "description": "Counts of accounts grouped by stable `Auth::method_label()`.\nKeys never collide with internal enum names. Absent when the\naggregate is marked degraded (see `degraded_aggregates`).",
+            "description": "Counts of accounts grouped by stable `Auth::method_label()`.\nKeys never collide with internal enum names. Served from the\nsame snapshot as `GET /dashboard/stats` (`accounts.by_auth_method`),\nso the two endpoints agree; empty and listed in\n`degraded_aggregates` only until that snapshot first publishes\nafter startup.",
             "additionalProperties": {
               "type": "integer",
               "format": "int64",
@@ -4537,6 +5492,13 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "aggregates_as_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 time the published snapshot that backs every\ncross-account aggregate below was computed; `null` until the\nfirst publication after startup (all of them are then listed in\n`degraded_aggregates`). Same value as `/dashboard/stats.as_of`."
           },
           "backend": {
             "$ref": "#/components/schemas/DashboardBackendInfo"
@@ -4567,7 +5529,7 @@
               "string",
               "null"
             ],
-            "description": "Greater of the most recent delta status timestamp and the most\nrecent proposal originating timestamp across all accounts;\n`None` (serialized as `null`) when the inventory has produced\nno activity yet, OR when this aggregate is degraded."
+            "description": "Greater of the most recent delta status timestamp and the most\nrecent proposal originating timestamp across all accounts as of\n`aggregates_as_of`; `None` (serialized as `null`) when the\ninventory has produced no activity yet, OR when this aggregate\nis degraded."
           },
           "service_status": {
             "$ref": "#/components/schemas/DashboardServiceStatus"
@@ -4575,7 +5537,52 @@
           "total_account_count": {
             "type": "integer",
             "format": "int64",
+            "description": "Total registered accounts. Once the `/dashboard/stats` snapshot\nis available this is `accounts.total` from that snapshot, so it\nalways equals the sum of `accounts_by_auth_method` and matches\n`/dashboard/stats`; before the first publication it is a live\ncount.",
             "minimum": 0
+          }
+        }
+      },
+      "DashboardLifecycleCounts": {
+        "type": "object",
+        "description": "Mutually exclusive lifecycle counts: `released` when `released_at`\nis set, otherwise `paused` when `paused_at` is set, otherwise\n`active`. Sums to `total`.",
+        "required": [
+          "active",
+          "paused",
+          "released"
+        ],
+        "properties": {
+          "active": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "paused": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "released": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "DashboardNonFungibleTotal": {
+        "type": "object",
+        "description": "Non-fungible asset count for one faucet across covered accounts.",
+        "required": [
+          "faucet_id",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "faucet_id": {
+            "type": "string"
           }
         }
       },
@@ -4636,12 +5643,137 @@
           }
         }
       },
+      "DashboardReleaseSweepConfig": {
+        "type": "object",
+        "description": "Chain-driven release sweep settings (issue #434): the background\ntask that releases accounts whose on-chain guardian key is no longer\nthis server's even when the switch delta never reached the push\npath.",
+        "required": [
+          "rotation_seconds",
+          "max_rate_per_second",
+          "recheck_seconds",
+          "confirmations"
+        ],
+        "properties": {
+          "confirmations": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Observations of a foreign guardian key in published storage, each\nat a strictly later block, required before releasing on that\nevidence.",
+            "minimum": 0
+          },
+          "max_rate_per_second": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Upper bound on account visits per second, rotation and\nconfirmation re-checks together.",
+            "minimum": 0
+          },
+          "recheck_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Delay between confirmation re-checks of an account whose published\nstorage showed a foreign guardian key.",
+            "minimum": 0
+          },
+          "rotation_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Target time for one full walk of the fleet; every unreleased\nMiden account is visited once per rotation.",
+            "minimum": 0
+          }
+        }
+      },
       "DashboardServiceStatus": {
         "type": "string",
         "enum": [
           "healthy",
           "degraded"
         ]
+      },
+      "DashboardStatsRefreshResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "cooldown_seconds"
+        ],
+        "properties": {
+          "cooldown_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Minimum seconds between accepted operator requests.",
+            "minimum": 0
+          },
+          "current_as_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`as_of` of the snapshot currently served, or `null` before the\nfirst publication. Poll `GET /dashboard/stats` for a newer value."
+          },
+          "requested_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 time the pending request was recorded (`queued`)."
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 time the running walk started (`in_progress`)."
+          },
+          "status": {
+            "$ref": "#/components/schemas/DashboardStatsRefreshStatus"
+          }
+        }
+      },
+      "DashboardStatsRefreshStatus": {
+        "type": "string",
+        "description": "Outcome of an operator-triggered refresh request (`202 Accepted`).",
+        "enum": [
+          "queued",
+          "in_progress"
+        ]
+      },
+      "DashboardStatsResponse": {
+        "type": "object",
+        "required": [
+          "as_of",
+          "refresh_interval_seconds",
+          "version",
+          "accounts",
+          "assets"
+        ],
+        "properties": {
+          "accounts": {
+            "$ref": "#/components/schemas/DashboardAccountStats"
+          },
+          "as_of": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC3339 time the published aggregate's walk began. Consumers\nderive the result's age from this; it is the only truthful age\nsignal, since a slow or failed walk keeps the previous\npublication."
+          },
+          "assets": {
+            "$ref": "#/components/schemas/DashboardAssetStats"
+          },
+          "refresh_interval_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Configured cadence at which the lease holder starts a new walk\n(`GUARDIAN_DASHBOARD_STATS_REFRESH_INTERVAL_SECS`). Not a bound\non the age of `as_of`: a slow or failed walk keeps the previous\npublication.",
+            "minimum": 0
+          },
+          "updated_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The applied filter, normalized to RFC3339, or `null` when the\nasset aggregate spans every account."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Publication counter of the snapshot this response was served\nfrom; identical across replicas for the same publication."
+          }
+        }
       },
       "DashboardVaultFungibleEntry": {
         "type": "object",
@@ -5082,6 +6214,14 @@
           "client_abandoned"
         ]
       },
+      "EcdsaMessageFormat": {
+        "type": "string",
+        "description": "Message format used by an ECDSA approval.",
+        "enum": [
+          "raw",
+          "eip712"
+        ]
+      },
       "EvmProposal": {
         "type": "object",
         "required": [
@@ -5335,7 +6475,9 @@
         "enum": [
           "local",
           "devnet",
-          "testnet"
+          "testnet",
+          "cedar",
+          "mainnet"
         ]
       },
       "NetworkConfig": {
@@ -5755,7 +6897,7 @@
                     "string",
                     "null"
                   ],
-                  "description": "Why the row left the active candidate path: `retry_exhausted` or\n`diverged` on `retained` rows, `client_abandoned` on `discarded`\nrows; absent elsewhere."
+                  "description": "Why the row left the active candidate path: `retry_exhausted`,\n`diverged`, or `orphaned` on `retained` rows, `client_abandoned`\non `discarded` rows; absent elsewhere."
                 },
                 "status_timestamp": {
                   "type": "string"
@@ -6033,7 +7175,7 @@
       },
       "ProposalMetadata": {
         "type": "object",
-        "description": "Operator-stated intent lifted from a matching proposal.\n`chain_anchor` remains only in the proposal payload to avoid duplicating it\nin delta metadata and dashboard listings.",
+        "description": "Operator-stated intent lifted from a matching proposal.\nThe fields that bind a proposal to a block (`bound_block_num`, and the\nlegacy `chain_anchor`) remain only in the proposal payload, to avoid\nduplicating them in delta metadata and dashboard listings.",
         "required": [
           "proposal_type"
         ],
@@ -6189,6 +7331,9 @@
               "scheme"
             ],
             "properties": {
+              "message_format": {
+                "$ref": "#/components/schemas/EcdsaMessageFormat"
+              },
               "public_key": {
                 "type": [
                   "string",
@@ -6209,7 +7354,7 @@
             }
           }
         ],
-        "description": "Signature type for delta proposals"
+        "description": "Signature type for delta proposals."
       },
       "ProposalsResponse": {
         "type": "object",
@@ -6305,8 +7450,93 @@
         "description": "Why a candidate was moved to `Retained` instead of deleted\n(issue #345). The label is diagnostic — every retained delta is\nreconciled and TTL-expired identically — but it records which\nworker verdict parked the row, and a `diverged` row that later\nreconciles is direct evidence the divergence verdict was spurious\n(e.g. a lagging RPC node, or the pre-#326 empty-digest misread\nthat hit new accounts' first transactions).",
         "enum": [
           "retry_exhausted",
-          "diverged"
+          "diverged",
+          "orphaned"
         ]
+      },
+      "RevokeAllSessionsRequest": {
+        "type": "object",
+        "required": [
+          "signer_commitment"
+        ],
+        "properties": {
+          "signer_commitment": {
+            "type": "string",
+            "description": "Hex commitment of the wallet key whose sessions end; it must be the\nkey that signs this request."
+          }
+        }
+      },
+      "RevokeAllSessionsResponse": {
+        "type": "object",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many active sessions were revoked; zero when none existed.",
+            "minimum": 0
+          }
+        }
+      },
+      "RevokeSessionResponse": {
+        "type": "object",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "boolean",
+            "description": "Whether an active session existed; logout is idempotent."
+          }
+        }
+      },
+      "SessionGrantRequest": {
+        "type": "object",
+        "description": "Fields of a session grant, in the order the wallet displays them. The\nscope is not sent: every v1 grant states the same fixed text, which the\nserver supplies.",
+        "required": [
+          "signer_commitment",
+          "session_public_key",
+          "issued_at",
+          "expires_at",
+          "guardian_commitment",
+          "network"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds; more than the skew window and at most\n`sessions.max_ttl_seconds` after server time.",
+            "minimum": 0
+          },
+          "guardian_commitment": {
+            "type": "string",
+            "description": "Hex commitment of this Guardian's ACK key for `scheme` (`GET /pubkey`)."
+          },
+          "issued_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds; within the request timestamp skew window of server time.",
+            "minimum": 0
+          },
+          "network": {
+            "type": "string",
+            "description": "Must equal `environment` from `GET /status`."
+          },
+          "origin": {
+            "type": "string",
+            "description": "The website that asked for the grant, e.g. `https://multisig.example`,\nshown to the user by the wallet; empty for clients outside a browser.\nAt most 256 bytes. Guardian does not check it against requests."
+          },
+          "session_public_key": {
+            "type": "string",
+            "description": "Hex SEC1-compressed P-256 delegated-signer public key (33 bytes)."
+          },
+          "signer_commitment": {
+            "type": "string",
+            "description": "Hex commitment of the wallet public key that signs the grant."
+          }
+        }
       },
       "SessionInfoResponse": {
         "type": "object",
@@ -6323,6 +7553,21 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "SessionsStatus": {
+        "type": "object",
+        "description": "Session parameters a client needs before it builds a grant.",
+        "required": [
+          "max_ttl_seconds"
+        ],
+        "properties": {
+          "max_ttl_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Grants may expire at most this many seconds after registration.",
+            "minimum": 0
           }
         }
       },
@@ -6344,6 +7589,14 @@
             "$ref": "#/components/schemas/ProposalSignature"
           }
         }
+      },
+      "SignatureScheme": {
+        "type": "string",
+        "description": "Supported signature schemes",
+        "enum": [
+          "falcon",
+          "ecdsa"
+        ]
       },
       "StateObject": {
         "type": "object",
@@ -6386,7 +7639,8 @@
           "git_commit",
           "environment",
           "started_at",
-          "uptime_seconds"
+          "uptime_seconds",
+          "sessions"
         ],
         "properties": {
           "environment": {
@@ -6396,6 +7650,10 @@
           "git_commit": {
             "type": "string",
             "description": "Short git SHA at build time (`\"unknown\"` when unavailable)."
+          },
+          "sessions": {
+            "$ref": "#/components/schemas/SessionsStatus",
+            "description": "Session authentication for Miden accounts (issue #219). Present on\nevery Guardian that accepts session grants; SDKs treat its absence as\n\"no sessions\"."
           },
           "started_at": {
             "type": "string",

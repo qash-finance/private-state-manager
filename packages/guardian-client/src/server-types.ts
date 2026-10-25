@@ -7,6 +7,7 @@ export interface ServerEcdsaSignature {
   scheme: 'ecdsa';
   signature: string;
   public_key?: string;
+  message_format?: 'eip712';
 }
 
 export type ServerProposalSignature = ServerFalconSignature | ServerEcdsaSignature;
@@ -21,7 +22,7 @@ export type ServerDeltaStatus =
   | { status: 'pending'; timestamp: string; proposer_id: string; cosigner_sigs: ServerCosignerSignature[] }
   | { status: 'candidate'; timestamp: string }
   | { status: 'canonical'; timestamp: string }
-  | { status: 'retained'; timestamp: string; reason?: 'retry_exhausted' | 'diverged' }
+  | { status: 'retained'; timestamp: string; reason?: 'retry_exhausted' | 'diverged' | 'orphaned' }
   | { status: 'discarded'; timestamp: string; reason?: string };
 
 export type ServerProposalType =
@@ -57,7 +58,9 @@ export interface ServerProposalMetadata {
   amount?: string;
   /** P2ID note visibility, "public" or "private" (issue #322). Absent => public. */
   note_type?: string;
-  /** Base64-serialized Miden `ChainAnchor` pinning the proposal's reference block. */
+  /** The block the proposal's transaction summary binds (unsigned). */
+  bound_block_num?: number;
+  /** Legacy base64 Miden `ChainAnchor` written by 0.18 clients. */
   chain_anchor?: string;
   /** P2IDE reclaim block height (issue #366). Presence of either height means a P2IDE note. */
   reclaim_height?: number;
@@ -108,6 +111,12 @@ export interface ServerStateObject {
   created_at: string;
   updated_at: string;
   auth_scheme?: string;
+}
+
+export interface ServerCanonicalNonceResponse {
+  account_id: string;
+  nonce: number;
+  commitment: string;
 }
 
 export type ServerAuthConfig =
@@ -176,6 +185,42 @@ export interface ServerStatusResponse {
   environment: string;
   started_at: string;
   uptime_seconds: number;
+  sessions?: {
+    max_ttl_seconds: number;
+  };
+}
+
+export interface ServerCreateSessionRequest {
+  scheme: string;
+  auth_format?: string;
+  public_key?: string;
+  signature: string;
+  grant: {
+    signer_commitment: string;
+    session_public_key: string;
+    origin: string;
+    issued_at: number;
+    expires_at: number;
+    guardian_commitment: string;
+    network: string;
+  };
+}
+
+export interface ServerCreateSessionResponse {
+  signer_commitment: string;
+  expires_at: string;
+}
+
+export interface ServerRevokeSessionResponse {
+  revoked: boolean;
+}
+
+export interface ServerRevokeAllSessionsRequest {
+  signer_commitment: string;
+}
+
+export interface ServerRevokeAllSessionsResponse {
+  revoked: number;
 }
 
 export interface ServerLookupAccount {

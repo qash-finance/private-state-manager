@@ -9,12 +9,19 @@
 //! - `notes` - Note filtering and listing
 //! - `recovery` - Recovery primitives (transport backlog drain)
 //! - `io` - Export/import functionality
+//! - `session` - Guardian sessions (delegated signer)
 //! - `proposal_note_import` - Recovery primitive: proposal-embedded note import
 //! - `public_note_backfill` - Recovery primitive: historical public-note backfill by tag
 //! - `helpers` - Internal GUARDIAN client helpers
 
 mod account;
+#[cfg(test)]
+mod anchor_binding_tests;
+#[cfg(test)]
+mod canonical_nonce_sync_tests;
 mod delta_history;
+#[cfg(test)]
+mod endpoint_scheme_tests;
 mod helpers;
 mod io;
 mod note_recovery;
@@ -24,6 +31,9 @@ mod proposal_note_import;
 mod proposals;
 mod public_note_backfill;
 mod recovery;
+mod session;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod switch_recovery_tests;
 #[cfg(test)]
@@ -40,13 +50,17 @@ pub use proposals::{AbandonRequestState, AbandonStatus};
 pub use public_note_backfill::{BlockRange, PublicBackfillOptions, PublicBackfillReport};
 pub use recovery::{TransportRecoveryReport, TransportRecoveryStatus};
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use guardian_client::GetStateResponse;
+use guardian_client::{GetStateResponse, SessionSlot};
 use miden_client::rpc::Endpoint;
+use miden_client::store::Store;
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
+use miden_standards::account::auth::MultisigAuthArgs;
 
 use crate::MidenSdkClient;
 use crate::account::MultisigAccount;
@@ -109,6 +123,9 @@ pub struct StateVerificationResult {
 /// ```
 pub struct MultisigClient {
     pub(crate) miden_client: MidenSdkClient,
+    /// The store `miden_client` was built on, for the client-owned settings
+    /// the public settings API does not reach (the note-transport cursors).
+    pub(crate) miden_store: Arc<dyn Store>,
     pub(crate) key_manager: Arc<dyn KeyManager>,
     /// Guardian server endpoint.
     pub(crate) guardian_endpoint: String,
@@ -127,6 +144,8 @@ pub struct MultisigClient {
     pub(crate) prover_config: ProverConfig,
     /// Node RPC timeout and read-retry configuration (for recovery).
     pub(crate) rpc_config: RpcConfig,
+    /// The Guardian session every per-operation client shares.
+    pub(crate) guardian_session: SessionSlot,
 }
 
 impl MultisigClient {
@@ -139,6 +158,7 @@ impl MultisigClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         miden_client: MidenSdkClient,
+        miden_store: Arc<dyn Store>,
         key_manager: Arc<dyn KeyManager>,
         guardian_endpoint: String,
         account_dir: PathBuf,
@@ -151,6 +171,7 @@ impl MultisigClient {
             crate::builder::configured_node_rpc_client(&miden_endpoint, &rpc_config);
         Self {
             miden_client,
+            miden_store,
             key_manager,
             guardian_endpoint,
             account: None,
@@ -160,6 +181,40 @@ impl MultisigClient {
             node_rpc_client,
             prover_config,
             rpc_config,
+            guardian_session: SessionSlot::default(),
+        }
+    }
+
+    /// The multisig auth args a request this client's account executes has to
+    /// carry. Producers of custom proposals (issue #266) build them here, then
+    /// attach them with [`crate::TransactionRequestBuilderExt`]. `bound_block_num`
+    /// left out binds the store's sync height, which a fresh proposal wants:
+    /// [`sync`](Self::sync) first, then build, then
+    /// [`propose_custom_transaction`](Self::propose_custom_transaction), which
+    /// derives the summary at the chain tip. A rebuild passes the block the
+    /// proposal's summary binds. The fee conversion info names the fee faucet
+    /// of the protocol configuration the last sync delivered.
+    pub async fn multisig_auth_args(
+        &self,
+        salt: Word,
+        bound_block_num: Option<BlockNumber>,
+        approval_expiration_delta: Option<NonZeroU32>,
+    ) -> Result<MultisigAuthArgs> {
+        match bound_block_num {
+            Some(bound_block_num) => crate::transaction::multisig_auth_args(
+                crate::transaction::synced_fee_faucet_id(&self.miden_client).await?,
+                bound_block_num,
+                salt,
+                approval_expiration_delta,
+            ),
+            None => {
+                crate::transaction::proposer_auth_args(
+                    &self.miden_client,
+                    salt,
+                    approval_expiration_delta,
+                )
+                .await
+            }
         }
     }
 

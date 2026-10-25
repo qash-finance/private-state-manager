@@ -21,9 +21,13 @@ const client = new GuardianHttpClient('http://localhost:3000');
 ### Get Server Public Key (Unauthenticated)
 
 ```typescript
-const pubkey = await client.getPubkey();
-console.log('GUARDIAN pubkey:', pubkey);
+const { commitment, pubkey } = await client.getPubkey('ecdsa');
+console.log('GUARDIAN ECDSA commitment:', commitment, 'pubkey:', pubkey);
 ```
+
+The scheme defaults to `falcon` when omitted, whichever schemes the server
+admits for new accounts, so pass the scheme you need. `pubkey` is set only for
+`ecdsa`.
 
 ### Set Signer for Authenticated Requests
 
@@ -47,6 +51,45 @@ const signer: Signer = {
 client.setSigner(signer);
 ```
 
+### Sessions
+
+When the Guardian advertises `sessions` on `getStatus()`, a wallet can sign one
+session grant and let a delegated signer (a P-256 key) sign the
+session-eligible requests. `@openzeppelin/miden-multisig-client` builds and
+signs the grant (`startGuardianSession`); this client only routes requests:
+
+```typescript
+client.setSession(session); // a SessionRequestSigner
+await client.getState(accountId); // signed by the delegated signer
+
+await client.revokeSession(); // session-key-signed logout; back to the wallet
+await client.revokeAllSessions(); // wallet-signed: ends every session of the signer
+```
+
+The delegated signer signs reads (`getState`, `getCanonicalNonce`, `getDelta`,
+`getDeltaSince`, `getDeltaHistory`), proposal reads and proposal create/sign
+(`getDeltaProposals`, `getDeltaProposal`, `pushDeltaProposal`,
+`signDeltaProposal`). Every other route uses the wallet signer, including
+`configure`, `pushDelta`, `abandonCandidate`, account lookup and
+`revokeAllSessions`; the server rejects session credentials there with
+`wallet_signature_required`.
+
+A session is used only while the wallet that granted it
+(`session.signerCommitment`) is the client's signer. It is dropped 30 seconds
+before it expires (`expired`), or as soon as Guardian answers
+`session_expired`, `session_revoked` or `authentication_failed` to a request
+it signed (`expired`, `revoked`, `rejected`); requests then fall back to the
+wallet and `session.onEnded(reason)` is called once, so the app can start a
+new session. `authorization_failed` (the wallet does not cosign that account)
+keeps the session. Logout and revoke-all drop the session only after Guardian
+confirms, with the reason `logout`: the app ended it itself.
+
+Revoke-all ends sessions already registered with Guardian. A page that got a
+grant signed can still register it for up to about 10 minutes afterwards, and
+a revoking device whose clock runs behind can miss sessions started just
+before it. When a session key may be compromised, run `revokeAllSessions`
+again 10 minutes later.
+
 ### Configure an Account
 
 ```typescript
@@ -69,11 +112,35 @@ console.log('Commitment:', state.commitment);
 console.log('State data:', state.state_json.data);
 ```
 
+### Get Canonical Nonce
+
+Nonce and commitment of the latest canonical state, without the state blob
+(`GET /state/nonce`). The full `getState` fetch can be skipped when Guardian's
+nonce is below the local account's nonce, or equal to it with the same
+commitment. An equal nonce at a different commitment means the local account
+has diverged from Guardian, so fetch the state in that case too. The multisig
+SDK's `syncState()` runs this pre-check for you.
+
+```typescript
+const head = await client.getCanonicalNonce(accountId);
+const inSync =
+  head.nonce < localNonce ||
+  (head.nonce === localNonce && head.commitment === localCommitment);
+if (!inSync) {
+  const state = await client.getState(accountId);
+}
+```
+
 ### Abandon a Stuck Candidate
 
 If an approved transaction died client-side after guardian approval, its
-candidate keeps the account locked (`409 conflict_pending_delta` on new
-proposals). Record an abandon intent and poll for the resolution:
+candidate keeps the account locked: new proposals and deltas answer
+`409 conflict_pending_delta` while the account's candidate queue (one
+candidate by default) is full, when they build on the state that candidate
+already claimed, or when their nonce does not extend the queue (a proposal's
+must be the newest queued candidate's plus one), and any candidate queued
+behind it can never land. Record an
+abandon intent and poll for the resolution:
 
 ```typescript
 const accepted = await client.abandonCandidate(accountId, nonce);
@@ -107,9 +174,10 @@ directly. The Guardian server exposes `GET /state/lookup` so the wallet
 can ask "which account(s) authorize this commitment?" and proceed with
 the existing recovery flow.
 
-The signer used here MUST implement `signLookupMessage`, which signs the
+The signer used here MUST implement `signLookupMessage`. Raw signers sign the
 domain-separated `LookupAuthMessage::to_word(timestampMs, keyCommitment)`
-digest. The canonical implementation lives in
+digest; EIP-712 signers sign that hash as `GuardianLookup(bytes32 lookupHash)`
+and set `requestAuthFormat` to `eip712`. The canonical hash implementation lives in
 `@openzeppelin/miden-multisig-client` (which has access to the Miden SDK's
 RPO256); this package keeps the digest computation out of its zero-dependency
 surface.
@@ -226,6 +294,24 @@ try {
   if (error instanceof GuardianHttpError) {
     console.error(`HTTP ${error.status}: ${error.statusText}`);
     console.error('Body:', error.body);
+  }
+}
+```
+
+Branch on `error.code`, the server's stable machine-readable code, never on
+the message text. `error.meta` carries structured side-data for some codes.
+For example, a Guardian configured with `GUARDIAN_ALLOWED_ACCOUNT_SCHEMES`
+rejects a new account whose signature scheme it does not accept:
+
+```typescript
+try {
+  await client.configure(request);
+} catch (error) {
+  if (error instanceof GuardianHttpError && error.code === 'signature_scheme_not_allowed') {
+    // HTTP 403, not retryable. Create the account with an accepted scheme.
+    console.error(
+      `scheme ${error.meta?.scheme} rejected; this Guardian accepts ${error.meta?.allowedSchemes?.join(', ')}`
+    );
   }
 }
 ```

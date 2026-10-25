@@ -1,18 +1,26 @@
 use crate::proto::guardian_server::{Guardian, GuardianServer};
 use crate::proto::{
     AbandonDeltaCandidateRequest, AbandonDeltaCandidateResponse, AccountState, ConfigureRequest,
-    ConfigureResponse, DeltaObject as ProtoDeltaObject, GetAccountByKeyCommitmentRequest,
-    GetAccountByKeyCommitmentResponse, GetDeltaHistoryRequest, GetDeltaHistoryResponse,
-    GetDeltaProposalRequest, GetDeltaProposalResponse, GetDeltaProposalsRequest,
-    GetDeltaProposalsResponse, GetDeltaRequest, GetDeltaResponse, GetDeltaSinceRequest,
-    GetDeltaSinceResponse, GetPubkeyRequest, GetStateRequest, GetStateResponse,
-    PushDeltaProposalRequest, PushDeltaProposalResponse, PushDeltaRequest, PushDeltaResponse,
-    SignDeltaProposalRequest, SignDeltaProposalResponse,
+    ConfigureResponse, CreateSessionRequest, CreateSessionResponse,
+    DeltaObject as ProtoDeltaObject, GetAccountByKeyCommitmentRequest,
+    GetAccountByKeyCommitmentResponse, GetCanonicalNonceRequest, GetCanonicalNonceResponse,
+    GetDeltaHistoryRequest, GetDeltaHistoryResponse, GetDeltaProposalRequest,
+    GetDeltaProposalResponse, GetDeltaProposalsRequest, GetDeltaProposalsResponse, GetDeltaRequest,
+    GetDeltaResponse, GetDeltaSinceRequest, GetDeltaSinceResponse, GetPubkeyRequest,
+    GetStateRequest, GetStateResponse, PushDeltaProposalRequest, PushDeltaProposalResponse,
+    PushDeltaRequest, PushDeltaResponse, RevokeAllSessionsRequest, RevokeAllSessionsResponse,
+    RevokeSessionRequest, RevokeSessionResponse, SignDeltaProposalRequest,
+    SignDeltaProposalResponse,
 };
+use guardian_shared::FromJson;
+use miden_protocol::account::Account;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+
+/// `(request, x-pubkey, x-signature, x-timestamp)` of a RevokeAllSessions call.
+pub type RevokeAllSessionsCall = (RevokeAllSessionsRequest, String, String, i64);
 
 /// Post-start control surface for a [`MockGuardianService`]: the service is
 /// moved into `start_mock_server`, so tests clone a handle first to observe
@@ -29,8 +37,11 @@ pub struct MockGuardianHandle {
     calls: Arc<StdMutex<Vec<String>>>,
     /// Every `push_delta_proposal` request body, in arrival order.
     push_delta_proposal_requests: Arc<StdMutex<Vec<PushDeltaProposalRequest>>>,
+    /// The `scheme` field of every `get_pubkey` request, in arrival order.
+    get_pubkey_schemes: Arc<StdMutex<Vec<Option<String>>>>,
     persistent_get_pubkey: Arc<StdMutex<Option<String>>>,
     persistent_get_state: Arc<StdMutex<Option<GetStateResponse>>>,
+    persistent_get_canonical_nonce: Arc<StdMutex<Option<GetCanonicalNonceResponse>>>,
     persistent_get_delta_proposal: Arc<StdMutex<Option<GetDeltaProposalResponse>>>,
     persistent_get_delta_proposals: Arc<StdMutex<Option<GetDeltaProposalsResponse>>>,
 }
@@ -46,6 +57,14 @@ impl MockGuardianHandle {
         self.push_delta_proposal_requests.lock().unwrap().clone()
     }
 
+    /// The signature scheme each `get_pubkey` call asked for, in arrival
+    /// order. GUARDIAN serves one acknowledgement identity per scheme, so a
+    /// caller that omits it (`None`) or names the wrong one is served an
+    /// identity that is not the account's.
+    pub fn get_pubkey_schemes(&self) -> Vec<Option<String>> {
+        self.get_pubkey_schemes.lock().unwrap().clone()
+    }
+
     /// Serve `pubkey` from `get_pubkey` whenever no one-shot response is queued.
     pub fn set_persistent_get_pubkey(&self, pubkey: impl Into<String>) {
         *self.persistent_get_pubkey.lock().unwrap() = Some(pubkey.into());
@@ -54,6 +73,13 @@ impl MockGuardianHandle {
     /// Serve `response` from `get_state` whenever the one-shot queue is empty.
     pub fn set_persistent_get_state(&self, response: GetStateResponse) {
         *self.persistent_get_state.lock().unwrap() = Some(response);
+    }
+
+    /// Serve `response` from `get_canonical_nonce` whenever the one-shot
+    /// queue is empty. When nothing is armed here, the endpoint derives its
+    /// answer from the armed persistent `get_state` (see [`canonical_nonce_of`]).
+    pub fn set_persistent_get_canonical_nonce(&self, response: GetCanonicalNonceResponse) {
+        *self.persistent_get_canonical_nonce.lock().unwrap() = Some(response);
     }
 
     /// Serve `response` from `get_delta_proposal` whenever no one-shot response is queued.
@@ -83,13 +109,50 @@ pub struct MockGuardianService {
     get_delta_history_requests: Arc<StdMutex<Vec<(GetDeltaHistoryRequest, i64, String)>>>,
     get_state_responses: Arc<StdMutex<Vec<Result<GetStateResponse, Status>>>>,
     get_state_auth_headers: Arc<StdMutex<Vec<(i64, String)>>>,
+    get_canonical_nonce_responses: Arc<StdMutex<Vec<Result<GetCanonicalNonceResponse, Status>>>>,
     get_account_by_key_commitment_response:
         Arc<StdMutex<Option<Result<GetAccountByKeyCommitmentResponse, Status>>>>,
     abandon_delta_candidate_response:
         Arc<StdMutex<Option<Result<AbandonDeltaCandidateResponse, Status>>>>,
+    create_session_requests: Arc<StdMutex<Vec<CreateSessionRequest>>>,
+    /// (x-pubkey, x-signature, x-timestamp) of each RevokeSession call.
+    revoke_session_auth: Arc<StdMutex<Vec<(String, String, i64)>>>,
+    /// Each RevokeAllSessions call.
+    revoke_all_sessions_calls: Arc<StdMutex<Vec<RevokeAllSessionsCall>>>,
+    /// x-auth-format of each PushDelta and AbandonDeltaCandidate call.
+    wallet_route_auth_formats: Arc<StdMutex<Vec<(String, String)>>>,
+    /// x-auth-format and x-pubkey of each GetState call.
+    get_state_auth_formats: Arc<StdMutex<Vec<(String, String)>>>,
+    /// x-auth-format of each Configure call.
+    configure_auth_formats: Arc<StdMutex<Vec<String>>>,
 }
 
 impl MockGuardianService {
+    pub fn create_session_requests_handle(&self) -> Arc<StdMutex<Vec<CreateSessionRequest>>> {
+        self.create_session_requests.clone()
+    }
+
+    pub fn revoke_session_auth_handle(&self) -> Arc<StdMutex<Vec<(String, String, i64)>>> {
+        self.revoke_session_auth.clone()
+    }
+
+    pub fn revoke_all_sessions_calls_handle(&self) -> Arc<StdMutex<Vec<RevokeAllSessionsCall>>> {
+        self.revoke_all_sessions_calls.clone()
+    }
+
+    /// `(rpc, x-auth-format)` of each PushDelta and AbandonDeltaCandidate call.
+    pub fn wallet_route_auth_formats_handle(&self) -> Arc<StdMutex<Vec<(String, String)>>> {
+        self.wallet_route_auth_formats.clone()
+    }
+
+    pub fn get_state_auth_formats_handle(&self) -> Arc<StdMutex<Vec<(String, String)>>> {
+        self.get_state_auth_formats.clone()
+    }
+
+    pub fn configure_auth_formats_handle(&self) -> Arc<StdMutex<Vec<String>>> {
+        self.configure_auth_formats.clone()
+    }
+
     pub fn with_get_pubkey(self, response: Result<String, Status>) -> Self {
         *self.get_pubkey_response.lock().unwrap() = Some(response);
         self
@@ -160,6 +223,20 @@ impl MockGuardianService {
         self
     }
 
+    /// Queue a `get_canonical_nonce` response. Responses are served FIFO;
+    /// once the queue is empty the persistent slot is served, and failing
+    /// that the head is derived from the persistent `get_state` state.
+    pub fn with_get_canonical_nonce(
+        self,
+        response: Result<GetCanonicalNonceResponse, Status>,
+    ) -> Self {
+        self.get_canonical_nonce_responses
+            .lock()
+            .unwrap()
+            .push(response);
+        self
+    }
+
     /// Handle onto the `(x-timestamp, x-signature)` pairs recorded from every
     /// `get_state` request, in arrival order. Clone before moving the service
     /// into `start_mock_server` to observe per-attempt auth metadata.
@@ -216,9 +293,14 @@ fn persistent_or<T: Clone>(slot: &StdMutex<Option<T>>, default: impl FnOnce() ->
 impl Guardian for MockGuardianService {
     async fn get_pubkey(
         &self,
-        _request: Request<GetPubkeyRequest>,
+        request: Request<GetPubkeyRequest>,
     ) -> Result<Response<crate::proto::GetPubkeyResponse>, Status> {
         self.record_call("get_pubkey");
+        self.handle
+            .get_pubkey_schemes
+            .lock()
+            .unwrap()
+            .push(request.into_inner().scheme);
         let response = self
             .get_pubkey_response
             .lock()
@@ -240,8 +322,18 @@ impl Guardian for MockGuardianService {
 
     async fn configure(
         &self,
-        _request: Request<ConfigureRequest>,
+        request: Request<ConfigureRequest>,
     ) -> Result<Response<ConfigureResponse>, Status> {
+        let auth_format = request
+            .metadata()
+            .get("x-auth-format")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        self.configure_auth_formats
+            .lock()
+            .unwrap()
+            .push(auth_format);
         self.record_call("configure");
         let response = self
             .configure_response
@@ -359,6 +451,10 @@ impl Guardian for MockGuardianService {
         &self,
         request: Request<AbandonDeltaCandidateRequest>,
     ) -> Result<Response<AbandonDeltaCandidateResponse>, Status> {
+        self.wallet_route_auth_formats.lock().unwrap().push((
+            "abandon_delta_candidate".to_string(),
+            metadata_str(&request, "x-auth-format"),
+        ));
         let data = request.into_inner();
         let response = self
             .abandon_delta_candidate_response
@@ -382,9 +478,13 @@ impl Guardian for MockGuardianService {
 
     async fn push_delta(
         &self,
-        _request: Request<PushDeltaRequest>,
+        request: Request<PushDeltaRequest>,
     ) -> Result<Response<PushDeltaResponse>, Status> {
         self.record_call("push_delta");
+        self.wallet_route_auth_formats.lock().unwrap().push((
+            "push_delta".to_string(),
+            metadata_str(&request, "x-auth-format"),
+        ));
         let response = self
             .push_delta_response
             .lock()
@@ -481,6 +581,32 @@ impl Guardian for MockGuardianService {
         response.map(Response::new)
     }
 
+    async fn get_canonical_nonce(
+        &self,
+        _request: Request<GetCanonicalNonceRequest>,
+    ) -> Result<Response<GetCanonicalNonceResponse>, Status> {
+        self.record_call("get_canonical_nonce");
+        let mut responses = self.get_canonical_nonce_responses.lock().unwrap();
+        let response = if responses.is_empty() {
+            Ok(persistent_or(
+                &self.handle.persistent_get_canonical_nonce,
+                || {
+                    canonical_nonce_of(persistent_or(&self.handle.persistent_get_state, || {
+                        GetStateResponse {
+                            success: true,
+                            message: String::new(),
+                            state: Some(create_mock_account_state()),
+                        }
+                    }))
+                },
+            ))
+        } else {
+            responses.remove(0)
+        };
+
+        response.map(Response::new)
+    }
+
     async fn get_state(
         &self,
         request: Request<GetStateRequest>,
@@ -501,6 +627,10 @@ impl Guardian for MockGuardianService {
             .lock()
             .unwrap()
             .push((timestamp, signature));
+        self.get_state_auth_formats.lock().unwrap().push((
+            metadata_str(&request, "x-auth-format"),
+            metadata_str(&request, "x-pubkey"),
+        ));
 
         self.record_call("get_state");
         let mut responses = self.get_state_responses.lock().unwrap();
@@ -532,6 +662,61 @@ impl Guardian for MockGuardianService {
 
         response.map(Response::new)
     }
+
+    async fn create_session(
+        &self,
+        request: Request<CreateSessionRequest>,
+    ) -> Result<Response<CreateSessionResponse>, Status> {
+        let request = request.into_inner();
+        let signer_commitment = request
+            .grant
+            .as_ref()
+            .map(|grant| grant.signer_commitment.clone())
+            .unwrap_or_default();
+        self.create_session_requests.lock().unwrap().push(request);
+        Ok(Response::new(CreateSessionResponse {
+            signer_commitment,
+            expires_at: String::new(),
+        }))
+    }
+
+    async fn revoke_session(
+        &self,
+        request: Request<RevokeSessionRequest>,
+    ) -> Result<Response<RevokeSessionResponse>, Status> {
+        self.revoke_session_auth.lock().unwrap().push((
+            metadata_str(&request, "x-pubkey"),
+            metadata_str(&request, "x-signature"),
+            metadata_str(&request, "x-timestamp")
+                .parse()
+                .unwrap_or_default(),
+        ));
+        Ok(Response::new(RevokeSessionResponse { revoked: true }))
+    }
+
+    async fn revoke_all_sessions(
+        &self,
+        request: Request<RevokeAllSessionsRequest>,
+    ) -> Result<Response<RevokeAllSessionsResponse>, Status> {
+        self.revoke_all_sessions_calls.lock().unwrap().push((
+            request.get_ref().clone(),
+            metadata_str(&request, "x-pubkey"),
+            metadata_str(&request, "x-signature"),
+            metadata_str(&request, "x-timestamp")
+                .parse()
+                .unwrap_or_default(),
+        ));
+        Ok(Response::new(RevokeAllSessionsResponse { revoked: 2 }))
+    }
+}
+
+fn metadata_str<T>(request: &Request<T>, name: &str) -> String {
+    request
+        .metadata()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub async fn start_mock_server(
@@ -569,6 +754,27 @@ pub fn create_mock_delta() -> ProtoDeltaObject {
         status: None,
         ack_pubkey: None,
         ack_scheme: None,
+    }
+}
+
+/// The canonical-nonce head a real GUARDIAN would report for `state`: the
+/// nonce of the account serialized in `state_json` (0 when the blob is not
+/// a Miden account, as with [`create_mock_account_state`]) and the state's
+/// commitment.
+pub fn canonical_nonce_of(state: GetStateResponse) -> GetCanonicalNonceResponse {
+    let state = state.state.unwrap_or_else(create_mock_account_state);
+    let nonce = serde_json::from_str::<serde_json::Value>(&state.state_json)
+        .ok()
+        .and_then(|value| Account::from_json(&value).ok())
+        .map(|account| account.nonce().as_canonical_u64())
+        .unwrap_or(0);
+    GetCanonicalNonceResponse {
+        success: true,
+        message: String::new(),
+        account_id: state.account_id,
+        nonce,
+        commitment: state.commitment,
+        error_code: String::new(),
     }
 }
 

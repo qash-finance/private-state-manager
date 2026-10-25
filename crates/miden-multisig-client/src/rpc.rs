@@ -8,7 +8,7 @@ use guardian_shared::retry::{
     connect_failure_is_permanent, is_transient_error_with, run_retries,
 };
 use miden_client::note_transport::{
-    NoteInfo, NoteStream, NoteTransportClient, NoteTransportCursor, NoteTransportError,
+    NoteInfo, NoteTransportClient, NoteTransportCursor, NoteTransportError, TransportNote,
 };
 use miden_client::rpc::domain::account::{AccountProof, GetAccountRequest};
 use miden_client::rpc::domain::account_vault::AccountVaultInfo;
@@ -24,11 +24,12 @@ use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::address::NetworkId;
 use miden_protocol::batch::{ProposedBatch, ProvenBatch};
-use miden_protocol::block::{BlockHeader, BlockNumber, ProvenBlock};
+use miden_protocol::block::{BlockHeader, BlockNumber, SignedBlock};
 use miden_protocol::crypto::merkle::mmr::MmrProof;
-use miden_protocol::note::NoteHeader;
+use miden_protocol::note::NoteInclusionProof;
 use miden_protocol::note::{NoteId, NoteScript, NoteTag};
 use miden_protocol::transaction::ProvenTransaction;
+use miden_protocol::vm::ExecutionProof;
 
 use crate::error::{MultisigError, Result, rpc_kind};
 
@@ -158,9 +159,21 @@ pub(crate) fn is_transient_rpc_error(error: &RpcError) -> bool {
     is_transient_error_with(error, rpc_link_evidence, &RPC_TRANSPORT_SIGNALS)
 }
 
+/// Whether a client-level error is worth retrying as-is: the same
+/// RPC-transport evidence as [`is_transient_rpc_error`], read off the
+/// error's source chain and its flattened message, so a wrapped node
+/// hiccup (unavailable, timeout) counts and a definitive answer (invalid
+/// argument such as a pruned block, a failed assertion) does not.
+pub(crate) fn is_transient_multisig_error(error: &MultisigError) -> bool {
+    is_transient_error_with(error, rpc_link_evidence, &RPC_TRANSPORT_SIGNALS)
+}
+
 /// `Connection` wraps endpoint parsing, TLS configuration, and actual
 /// connect failures indiscriminately; only the last class is worth another
-/// attempt, so the wrapped chain decides.
+/// attempt, so the wrapped chain decides. The match stays exhaustive, so it
+/// still names `PaginationDidNotTerminate`, deprecated since miden-client
+/// 0.17.1.
+#[allow(deprecated)]
 fn note_transport_link_evidence(cause: &(dyn Error + 'static)) -> StructuredEvidence {
     match cause.downcast_ref::<NoteTransportError>() {
         Some(NoteTransportError::Connection(inner)) => {
@@ -173,6 +186,9 @@ fn note_transport_link_evidence(cause: &(dyn Error + 'static)) -> StructuredEvid
         Some(
             NoteTransportError::Disabled
             | NoteTransportError::Deserialization(_)
+            | NoteTransportError::NoteDetailsMismatch { .. }
+            | NoteTransportError::InvalidFetchedNote(_)
+            | NoteTransportError::UnrequestedTag(_)
             | NoteTransportError::PaginationDidNotTerminate(_),
         ) => StructuredEvidence::Permanent,
         Some(NoteTransportError::Network(_)) | None => StructuredEvidence::Indeterminate,
@@ -251,7 +267,7 @@ impl NodeRpcClient for RetryingNodeRpcClient {
     /// outcome is unknown could execute it twice.
     async fn submit_proven_transaction(
         &self,
-        proven_transaction: ProvenTransaction,
+        proven_transaction: &ProvenTransaction,
         sealed_transaction_inputs: SealedTransactionInputs,
     ) -> std::result::Result<BlockNumber, RpcError> {
         self.inner
@@ -263,12 +279,40 @@ impl NodeRpcClient for RetryingNodeRpcClient {
     /// outcome is unknown could execute it twice.
     async fn submit_proven_batch(
         &self,
-        proven_batch: ProvenBatch,
-        proposed_batch: ProposedBatch,
+        proven_batch: &ProvenBatch,
+        proposed_batch: &ProposedBatch,
         transaction_inputs: Vec<SealedTransactionInputs>,
     ) -> std::result::Result<BlockNumber, RpcError> {
         self.inner
             .submit_proven_batch(proven_batch, proposed_batch, transaction_inputs)
+            .await
+    }
+
+    /// Never retried: registration funds or allowlists the account, and a
+    /// re-sent registration whose outcome is unknown is not a harmless read.
+    async fn register_account(
+        &self,
+        invitation_code: &str,
+        account_id: AccountId,
+    ) -> std::result::Result<(), RpcError> {
+        self.inner
+            .register_account(invitation_code, account_id)
+            .await
+    }
+
+    async fn is_account_allowed(
+        &self,
+        account_id: AccountId,
+    ) -> std::result::Result<bool, RpcError> {
+        self.execute(|| self.inner.is_account_allowed(account_id))
+            .await
+    }
+
+    async fn is_invitation_code_valid(
+        &self,
+        invitation_code: &str,
+    ) -> std::result::Result<bool, RpcError> {
+        self.execute(|| self.inner.is_invitation_code_valid(invitation_code))
             .await
     }
 
@@ -288,7 +332,7 @@ impl NodeRpcClient for RetryingNodeRpcClient {
         &self,
         block_num: BlockNumber,
         include_proof: bool,
-    ) -> std::result::Result<ProvenBlock, RpcError> {
+    ) -> std::result::Result<(SignedBlock, Option<ExecutionProof>), RpcError> {
         self.execute(|| self.inner.get_block_by_number(block_num, include_proof))
             .await
     }
@@ -480,12 +524,12 @@ impl NoteTransportClient for RetryingNoteTransportClient {
     /// Never retried in-call: the client's relay outbox already re-sends
     /// undelivered notes on later syncs, and an in-call resend could deliver
     /// the same note twice.
-    async fn send_note(
+    async fn send_note_with_proof(
         &self,
-        header: NoteHeader,
-        details: Vec<u8>,
+        note: TransportNote,
+        inclusion_proof: NoteInclusionProof,
     ) -> std::result::Result<(), NoteTransportError> {
-        self.inner.send_note(header, details).await
+        self.inner.send_note_with_proof(note, inclusion_proof).await
     }
 
     async fn fetch_notes(
@@ -494,15 +538,6 @@ impl NoteTransportClient for RetryingNoteTransportClient {
         cursor: NoteTransportCursor,
     ) -> std::result::Result<(Vec<NoteInfo>, NoteTransportCursor), NoteTransportError> {
         self.retry_fetch(|| self.inner.fetch_notes(tag, cursor))
-            .await
-    }
-
-    async fn stream_notes(
-        &self,
-        tag: NoteTag,
-        cursor: NoteTransportCursor,
-    ) -> std::result::Result<Box<dyn NoteStream>, NoteTransportError> {
-        self.retry_fetch(|| self.inner.stream_notes(tag, cursor))
             .await
     }
 }
@@ -719,17 +754,30 @@ mod tests {
         }
         async fn submit_proven_transaction(
             &self,
-            _: ProvenTransaction,
+            _: &ProvenTransaction,
             _: SealedTransactionInputs,
         ) -> std::result::Result<BlockNumber, RpcError> {
             unimplemented!()
         }
         async fn submit_proven_batch(
             &self,
-            _: ProvenBatch,
-            _: ProposedBatch,
+            _: &ProvenBatch,
+            _: &ProposedBatch,
             _: Vec<SealedTransactionInputs>,
         ) -> std::result::Result<BlockNumber, RpcError> {
+            unimplemented!()
+        }
+        async fn register_account(
+            &self,
+            _: &str,
+            _: AccountId,
+        ) -> std::result::Result<(), RpcError> {
+            unimplemented!()
+        }
+        async fn is_account_allowed(&self, _: AccountId) -> std::result::Result<bool, RpcError> {
+            unimplemented!()
+        }
+        async fn is_invitation_code_valid(&self, _: &str) -> std::result::Result<bool, RpcError> {
             unimplemented!()
         }
         async fn get_block_header_by_number(
@@ -743,7 +791,7 @@ mod tests {
             &self,
             _: BlockNumber,
             _: bool,
-        ) -> std::result::Result<ProvenBlock, RpcError> {
+        ) -> std::result::Result<(SignedBlock, Option<ExecutionProof>), RpcError> {
             unimplemented!()
         }
         async fn get_notes_by_id(
@@ -977,10 +1025,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NoteTransportClient for ScriptedNoteTransportInner {
-        async fn send_note(
+        async fn send_note_with_proof(
             &self,
-            _: NoteHeader,
-            _: Vec<u8>,
+            _: TransportNote,
+            _: NoteInclusionProof,
         ) -> std::result::Result<(), NoteTransportError> {
             self.send_calls.fetch_add(1, Ordering::SeqCst);
             Err((self.error)())
@@ -1000,32 +1048,24 @@ mod tests {
             }
             Ok((Vec::new(), cursor))
         }
-
-        async fn stream_notes(
-            &self,
-            _: NoteTag,
-            _: NoteTransportCursor,
-        ) -> std::result::Result<Box<dyn NoteStream>, NoteTransportError> {
-            unimplemented!()
-        }
     }
 
-    fn test_note_header() -> NoteHeader {
-        let sender = AccountId::from_hex("0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b").unwrap();
-        let metadata = miden_protocol::note::NoteMetadata::new(
-            miden_protocol::note::PartialNoteMetadata::new(
-                sender,
-                miden_protocol::note::NoteType::Private,
-            ),
-            &miden_protocol::note::NoteAttachments::default(),
+    fn test_transport_note() -> TransportNote {
+        let note = crate::client::test_support::p2id_note_for(
+            &crate::client::test_support::test_wallet(1),
+            1,
+            miden_protocol::note::NoteType::Private,
         );
-        NoteHeader::new(
-            miden_protocol::note::NoteDetailsCommitment::from_raw_commitments(
-                Word::default(),
-                Word::default(),
-            ),
-            metadata,
+        TransportNote::from(note)
+    }
+
+    fn test_inclusion_proof() -> NoteInclusionProof {
+        NoteInclusionProof::new(
+            BlockNumber::from(1u32),
+            0,
+            miden_protocol::crypto::merkle::SparseMerklePath::default(),
         )
+        .unwrap()
     }
 
     fn note_fetch_timeout() -> NoteTransportError {
@@ -1050,9 +1090,6 @@ mod tests {
         assert!(!is_transient_note_transport_error(
             &NoteTransportError::Network("note not recognized by relay".to_string())
         ));
-        assert!(!is_transient_note_transport_error(
-            &NoteTransportError::PaginationDidNotTerminate(64)
-        ));
     }
 
     #[tokio::test]
@@ -1071,7 +1108,7 @@ mod tests {
         );
 
         client
-            .fetch_notes(&[], NoteTransportCursor::from(0))
+            .fetch_notes(&[], NoteTransportCursor::init())
             .await
             .unwrap();
 
@@ -1095,7 +1132,7 @@ mod tests {
         );
 
         let error = client
-            .send_note(test_note_header(), Vec::new())
+            .send_note_with_proof(test_transport_note(), test_inclusion_proof())
             .await
             .unwrap_err();
 
@@ -1141,7 +1178,7 @@ mod tests {
             &RpcConfig::new().with_retry_policy(RpcRetryPolicy::new(2)),
         );
         wrapped
-            .fetch_notes(&[], NoteTransportCursor::from(0))
+            .fetch_notes(&[], NoteTransportCursor::init())
             .await
             .unwrap();
         assert_eq!(retried_inner.fetch_calls.load(Ordering::SeqCst), 2);
@@ -1157,7 +1194,7 @@ mod tests {
             &RpcConfig::new().with_retry_policy(RpcRetryPolicy::new(1)),
         );
         passthrough
-            .fetch_notes(&[], NoteTransportCursor::from(0))
+            .fetch_notes(&[], NoteTransportCursor::init())
             .await
             .unwrap_err();
         assert_eq!(passthrough_inner.fetch_calls.load(Ordering::SeqCst), 1);
@@ -1173,7 +1210,7 @@ mod tests {
             &RpcConfig::new().with_retry_policy(RpcRetryPolicy::new(5)),
         );
         wrapped_send
-            .send_note(test_note_header(), Vec::new())
+            .send_note_with_proof(test_transport_note(), test_inclusion_proof())
             .await
             .unwrap_err();
         assert_eq!(send_inner.send_calls.load(Ordering::SeqCst), 1);

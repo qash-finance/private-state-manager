@@ -2,8 +2,8 @@ use crate::delta_object::{DeltaObject, ProposalSignature};
 use crate::metadata::NetworkConfig;
 use crate::metadata::auth::{Auth, Credentials, ExtractCredentials};
 use crate::services::{
-    self, ConfigureAccountParams, GetDeltaHistoryParams, GetDeltaParams, GetDeltaProposalParams,
-    GetStateParams, LookupAccountParams, PushDeltaParams,
+    self, ConfigureAccountParams, GetCanonicalNonceParams, GetDeltaHistoryParams, GetDeltaParams,
+    GetDeltaProposalParams, GetStateParams, LookupAccountParams, PushDeltaParams,
 };
 use crate::state::AppState;
 use guardian_shared::SignatureScheme;
@@ -233,6 +233,32 @@ impl Guardian for GuardianService {
         }
     }
 
+    async fn get_canonical_nonce(
+        &self,
+        request: Request<GetCanonicalNonceRequest>,
+    ) -> Result<Response<GetCanonicalNonceResponse>, Status> {
+        let auth = authenticated_request(&request)?;
+
+        let req = request.into_inner();
+
+        let params = GetCanonicalNonceParams {
+            account_id: req.account_id,
+            credentials: auth,
+        };
+
+        match services::get_canonical_nonce(&self.app_state, params).await {
+            Ok(response) => Ok(Response::new(GetCanonicalNonceResponse {
+                success: true,
+                message: "Canonical nonce retrieved successfully".to_string(),
+                account_id: response.account_id,
+                nonce: response.nonce,
+                commitment: response.commitment,
+                error_code: String::new(),
+            })),
+            Err(e) => Err(Status::from(e)),
+        }
+    }
+
     async fn get_pubkey(
         &self,
         request: Request<GetPubkeyRequest>,
@@ -421,6 +447,83 @@ impl Guardian for GuardianService {
                 .collect(),
         }))
     }
+
+    /// Register a wallet-authorized session key. Mirror of HTTP
+    /// `POST /session`.
+    async fn create_session(
+        &self,
+        request: Request<CreateSessionRequest>,
+    ) -> Result<Response<CreateSessionResponse>, Status> {
+        let req = request.into_inner();
+        let grant = req
+            .grant
+            .ok_or_else(|| Status::invalid_argument("Missing session grant"))?;
+        let scheme = SignatureScheme::from(&req.scheme).map_err(Status::invalid_argument)?;
+        let auth_format =
+            crate::metadata::auth::RequestAuthFormat::parse(req.auth_format.as_deref())
+                .map_err(Status::invalid_argument)?;
+        let result = services::create_session(
+            &self.app_state,
+            services::CreateSessionParams {
+                scheme,
+                auth_format,
+                public_key: req.public_key,
+                signature: req.signature,
+                signer_commitment: grant.signer_commitment,
+                session_public_key: grant.session_public_key,
+                origin: grant.origin,
+                issued_at: grant.issued_at,
+                expires_at: grant.expires_at,
+                guardian_commitment: grant.guardian_commitment,
+                network: grant.network,
+            },
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(CreateSessionResponse {
+            signer_commitment: result.signer_commitment,
+            expires_at: result.expires_at.to_rfc3339(),
+        }))
+    }
+
+    /// Revoke the session whose key signs this call. Mirror of HTTP
+    /// `POST /session/logout`.
+    async fn revoke_session(
+        &self,
+        request: Request<RevokeSessionRequest>,
+    ) -> Result<Response<RevokeSessionResponse>, Status> {
+        let credentials = request.metadata().extract_credentials()?;
+        let result = services::revoke_session(
+            &self.app_state,
+            services::RevokeSessionParams { credentials },
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(RevokeSessionResponse {
+            revoked: result.revoked,
+        }))
+    }
+
+    /// Revoke every session of the wallet key signing this call. Mirror of
+    /// HTTP `POST /session/revoke-all`.
+    async fn revoke_all_sessions(
+        &self,
+        request: Request<RevokeAllSessionsRequest>,
+    ) -> Result<Response<RevokeAllSessionsResponse>, Status> {
+        let credentials = request.metadata().extract_credentials()?;
+        let result = services::revoke_all_sessions(
+            &self.app_state,
+            services::RevokeAllSessionsParams {
+                signer_commitment: request.into_inner().signer_commitment,
+                credentials,
+            },
+        )
+        .await
+        .map_err(Status::from)?;
+        Ok(Response::new(RevokeAllSessionsResponse {
+            revoked: result.revoked,
+        }))
+    }
 }
 
 fn authenticated_request<T: Message>(request: &Request<T>) -> Result<Credentials, Status> {
@@ -543,6 +646,7 @@ fn delta_to_proto(delta: &DeltaObject) -> guardian::DeltaObject {
                     "retry_exhausted".to_string()
                 }
                 Some(crate::delta_object::RetainReason::Diverged) => "diverged".to_string(),
+                Some(crate::delta_object::RetainReason::Orphaned) => "orphaned".to_string(),
                 None => String::new(),
             },
         }),
@@ -595,14 +699,20 @@ fn proposal_signature_to_proto(signature: &ProposalSignature) -> guardian::Propo
             scheme: "falcon".to_string(),
             signature: signature.clone(),
             public_key: None,
+            message_format: String::new(),
         },
         ProposalSignature::Ecdsa {
             signature,
             public_key,
+            message_format,
         } => guardian::ProposalSignature {
             scheme: "ecdsa".to_string(),
             signature: signature.clone(),
             public_key: public_key.clone(),
+            message_format: match message_format {
+                guardian_shared::EcdsaMessageFormat::Raw => String::new(),
+                guardian_shared::EcdsaMessageFormat::Eip712 => "eip712".to_string(),
+            },
         },
     }
 }
@@ -612,12 +722,21 @@ fn proto_signature_to_internal(
     signature: guardian::ProposalSignature,
 ) -> Result<ProposalSignature, Status> {
     match signature.scheme.as_str() {
-        "falcon" => Ok(ProposalSignature::Falcon {
+        "falcon" if signature.message_format.is_empty() => Ok(ProposalSignature::Falcon {
             signature: signature.signature,
         }),
         "ecdsa" => Ok(ProposalSignature::Ecdsa {
             signature: signature.signature,
             public_key: signature.public_key,
+            message_format: match signature.message_format.as_str() {
+                "" | "raw" => guardian_shared::EcdsaMessageFormat::Raw,
+                "eip712" => guardian_shared::EcdsaMessageFormat::Eip712,
+                other => {
+                    return Err(Status::invalid_argument(format!(
+                        "Unknown ECDSA message format: {other}"
+                    )));
+                }
+            },
         }),
         other => Err(Status::invalid_argument(format!(
             "Unknown signature scheme: {other}"
@@ -685,6 +804,7 @@ mod tests {
         StateObject {
             account_id,
             commitment,
+            nonce: None,
             state_json,
             created_at: "2024-11-14T12:00:00Z".to_string(),
             updated_at: "2024-11-14T12:00:00Z".to_string(),
@@ -1234,6 +1354,7 @@ mod tests {
                 scheme: "falcon".to_string(),
                 signature: dummy_sig,
                 public_key: None,
+                message_format: String::new(),
             }),
         };
 

@@ -1,7 +1,10 @@
 import type {
+  CanonicalNonce,
   CosignerSignature,
   ConfigureRequest,
   ConfigureResponse,
+  CreateSessionRequest,
+  CreateSessionResponse,
   DeltaObject,
   DeltaProposalRequest,
   DeltaStatus,
@@ -16,9 +19,12 @@ import type {
   StateObject,
 } from './types.js';
 import type {
+  ServerCanonicalNonceResponse,
   ServerCosignerSignature,
   ServerConfigureRequest,
   ServerConfigureResponse,
+  ServerCreateSessionRequest,
+  ServerCreateSessionResponse,
   ServerDeltaObject,
   ServerDeltaProposalRequest,
   ServerDeltaStatus,
@@ -64,6 +70,7 @@ export function fromServerSignature(signature: ServerProposalSignature): Proposa
       scheme: 'ecdsa',
       signature: signature.signature,
       publicKey: signature.public_key,
+      ...(signature.message_format ? { messageFormat: signature.message_format } : {}),
     };
   }
   return signature;
@@ -116,6 +123,7 @@ export function fromServerProposalMetadata(server: ServerProposalMetadata): Prop
     amount: server.amount,
     noteType: server.note_type,
     chainAnchor: server.chain_anchor,
+    boundBlockNum: server.bound_block_num,
     reclaimHeight: server.reclaim_height,
     timelockHeight: server.timelock_height,
   };
@@ -155,6 +163,17 @@ export function fromServerStateObject(server: ServerStateObject): StateObject {
   };
 }
 
+export function fromServerCanonicalNonce(server: ServerCanonicalNonceResponse): CanonicalNonce {
+  if (!Number.isSafeInteger(server.nonce) || server.nonce < 0) {
+    throw new Error(`Invalid canonical nonce from server: ${String(server.nonce)}`);
+  }
+  return {
+    accountId: server.account_id,
+    nonce: server.nonce,
+    commitment: server.commitment,
+  };
+}
+
 export function fromServerConfigureResponse(server: ServerConfigureResponse): ConfigureResponse {
   return {
     success: server.success,
@@ -179,6 +198,7 @@ export function toServerSignature(sig: ProposalSignature): ServerProposalSignatu
       scheme: 'ecdsa',
       signature: sig.signature,
       public_key: sig.publicKey,
+      ...(sig.messageFormat ? { message_format: sig.messageFormat } : {}),
     };
   }
   return sig;
@@ -231,6 +251,7 @@ export function toServerProposalMetadata(meta: ProposalMetadata): ServerProposal
     amount: meta.amount,
     note_type: meta.noteType,
     chain_anchor: meta.chainAnchor,
+    bound_block_num: meta.boundBlockNum,
     reclaim_height: meta.reclaimHeight,
     timelock_height: meta.timelockHeight,
   };
@@ -242,6 +263,30 @@ export function toServerConfigureRequest(req: ConfigureRequest): ServerConfigure
     auth: req.auth,
     initial_state: { data: req.initialState.data, account_id: req.initialState.accountId },
   };
+}
+
+export function toServerCreateSessionRequest(req: CreateSessionRequest): ServerCreateSessionRequest {
+  return {
+    scheme: req.scheme,
+    ...(req.authFormat ? { auth_format: req.authFormat } : {}),
+    ...(req.publicKey ? { public_key: req.publicKey } : {}),
+    signature: req.signature,
+    grant: {
+      signer_commitment: req.grant.signerCommitment,
+      session_public_key: req.grant.sessionPublicKey,
+      origin: req.grant.origin,
+      issued_at: req.grant.issuedAt,
+      expires_at: req.grant.expiresAt,
+      guardian_commitment: req.grant.guardianCommitment,
+      network: req.grant.network,
+    },
+  };
+}
+
+export function fromServerCreateSessionResponse(
+  server: ServerCreateSessionResponse
+): CreateSessionResponse {
+  return { signerCommitment: server.signer_commitment, expiresAt: server.expires_at };
 }
 
 export function toServerDeltaProposalRequest(req: DeltaProposalRequest): ServerDeltaProposalRequest {

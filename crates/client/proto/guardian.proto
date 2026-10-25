@@ -47,6 +47,30 @@ service Guardian {
   // Per-account canonical transaction history (issue #413), paginated
   // newest-first by nonce with decoded input/output note summaries.
   rpc GetDeltaHistory(GetDeltaHistoryRequest) returns (GetDeltaHistoryResponse);
+
+  // Nonce and commitment of the latest canonical state (issue #191), served
+  // from the values stored with the state, without the state blob. A client
+  // can skip the full GetState fetch when the nonce is below its local
+  // nonce, or equal to it with the commitment matching its local commitment.
+  // An equal nonce at a different commitment is divergence: fetch the state.
+  rpc GetCanonicalNonce(GetCanonicalNonceRequest) returns (GetCanonicalNonceResponse);
+
+  // Register a wallet-authorized P-256 session key (issue #219). The wallet
+  // signs a session grant once; afterwards the session key signs per-account
+  // requests with `x-auth-format: session` metadata. Mirror of HTTP
+  // POST /session.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // Revoke the session whose key signs this call: `x-pubkey` is the session
+  // public key and `x-signature` signs SessionLogoutMessage(x-pubkey,
+  // x-timestamp). Mirror of HTTP POST /session/logout.
+  rpc RevokeSession(RevokeSessionRequest) returns (RevokeSessionResponse);
+
+  // Revoke every session of the wallet key signing this call: `x-signature`
+  // is the wallet's signature over SessionRevokeAllMessage(signer_commitment,
+  // x-timestamp), raw or as EIP-712 typed data (`x-auth-format: eip712`).
+  // Wallet-only. Mirror of HTTP POST /session/revoke-all.
+  rpc RevokeAllSessions(RevokeAllSessionsRequest) returns (RevokeAllSessionsResponse);
 }
 
 // Auth configuration - one of the auth types
@@ -146,8 +170,8 @@ message DeltaStatus {
   // Why a discarded delta was discarded ("client_abandoned"); empty for
   // other statuses and for discards without a recorded reason.
   string discard_reason = 5;
-  // Why a retained delta was retained ("retry_exhausted" / "diverged");
-  // empty for other statuses.
+  // Why a retained delta was retained ("retry_exhausted" / "diverged" /
+  // "orphaned"); empty for other statuses.
   string retain_reason = 7;
 }
 
@@ -170,6 +194,7 @@ message ProposalSignature {
   string scheme = 1;
   string signature = 2;
   optional string public_key = 3;
+  string message_format = 4; // Empty means raw for existing clients.
 }
 
 // Delta object
@@ -195,6 +220,23 @@ message AccountState {
   string commitment = 3;
   string created_at = 4;
   string updated_at = 5;
+}
+
+// Canonical nonce request (issue #191)
+message GetCanonicalNonceRequest {
+  string account_id = 1;
+}
+
+// Nonce of the account state GUARDIAN currently holds as canonical, with
+// the commitment of that state so a client at the same nonce can also
+// detect divergence without fetching the state blob.
+message GetCanonicalNonceResponse {
+  bool success = 1;
+  string message = 2;
+  string account_id = 3;
+  uint64 nonce = 4;
+  string commitment = 5;
+  string error_code = 6;
 }
 
 // Get pubkey request
@@ -365,4 +407,52 @@ message GetDeltaHistoryResponse {
   repeated HistoryEntry entries = 3;
   // Opaque resume token; absent when no further pages exist.
   optional string next_cursor = 4;
+}
+
+// Session grant fields. The readable expiry and the scope are not sent:
+// Guardian derives both, so a wallet that displayed other values signed a
+// different digest.
+message SessionGrantFields {
+  string signer_commitment = 1;
+  // Hex SEC1-compressed P-256 delegated-signer public key (33 bytes).
+  string session_public_key = 2;
+  // Unix seconds.
+  uint64 issued_at = 3;
+  // Unix seconds.
+  uint64 expires_at = 4;
+  // This Guardian's ACK key commitment for `scheme` (GetPubkey).
+  string guardian_commitment = 5;
+  string network = 6;
+  // The website that asked for the grant, shown to the user by the wallet;
+  // empty outside a browser. Guardian does not check it against requests.
+  string origin = 7;
+}
+
+message CreateSessionRequest {
+  string scheme = 1; // "falcon" or "ecdsa"
+  optional string auth_format = 2; // "raw" (default) or "eip712"
+  optional string public_key = 3; // required for ECDSA
+  string signature = 4;
+  SessionGrantFields grant = 5;
+}
+
+message CreateSessionResponse {
+  string signer_commitment = 1;
+  string expires_at = 2; // RFC 3339 UTC
+}
+
+message RevokeSessionRequest {}
+
+message RevokeSessionResponse {
+  bool revoked = 1;
+}
+
+message RevokeAllSessionsRequest {
+  // Hex commitment of the wallet key whose sessions end; must be the signing key.
+  string signer_commitment = 1;
+}
+
+message RevokeAllSessionsResponse {
+  // How many active sessions were revoked.
+  uint64 revoked = 1;
 }

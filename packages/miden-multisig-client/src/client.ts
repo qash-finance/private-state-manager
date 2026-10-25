@@ -11,8 +11,18 @@ import type { StateObject } from '@openzeppelin/guardian-client';
 import { Multisig } from './multisig.js';
 import { createMultisigAccount } from './account/index.js';
 import { AccountInspector, assertCompleteDetectedConfig } from './inspector.js';
-import { getRawMidenClient, requireConfigValue, requireMidenRpcEndpoint } from './raw-client.js';
+import { requireConfigValue, requireMidenRpcEndpoint } from './config.js';
 import type { MultisigConfig, Signer } from './types.js';
+import { isSafeToAdoptGuardianState, readOnChainCommitment } from './state/adopt.js';
+import { normalizeHexWord } from './utils/encoding.js';
+import type { GuardianSession, SessionKeyStore } from './session/key.js';
+import {
+  type StartSessionOptions,
+  endGuardianSession,
+  resumeGuardianSession,
+  revokeAllGuardianSessions,
+  startGuardianSession,
+} from './session/manager.js';
 import {
   resolveProverConfig,
   type ProverConfig,
@@ -46,9 +56,11 @@ export interface MultisigClientConfig {
   /** GUARDIAN server endpoint. Required — there is no default. */
   guardianEndpoint: string;
   /**
-   * Miden node RPC endpoint used for proposal execution and state
-   * commitment verification. Required — must point at the same network as
-   * the injected `MidenClient`; there is no default.
+   * Miden node RPC endpoint the SDK reads directly: on-chain commitments for
+   * state verification, and note inclusion proofs for consume-notes proposals
+   * and note recovery. Everything else, execution included, goes through the
+   * injected `MidenClient`. Required — must point at the same network as the
+   * injected `MidenClient`; there is no default.
    */
   midenRpcEndpoint: string;
   /** Multisig-owned remote prover override and proof retry policy. */
@@ -70,13 +82,18 @@ export interface RecoveredAccount {
 /**
  * Client for creating and loading multisig accounts.
  *
+ * In a browser, create the injected `MidenClient` with `useWorker: false` until
+ * https://github.com/0xMiden/web-sdk/issues/441 is fixed: a worker-mode client
+ * applies transactions in a Web Worker that never sees the account state this
+ * SDK writes.
+ *
  * @example
  * ```typescript
  * import { MultisigClient, FalconSigner } from '@openzeppelin/miden-multisig-client';
  * import { MidenClient, AuthSecretKey } from '@miden-sdk/miden-sdk';
  *
  * // Initialize
- * const midenClient = await MidenClient.createDevnet();
+ * const midenClient = await MidenClient.createDevnet({ useWorker: false });
  * const secretKey = AuthSecretKey.rpoFalconWithRNG(seed);
  * const signer = new FalconSigner(secretKey);
  *
@@ -90,8 +107,8 @@ export interface RecoveredAccount {
  *   },
  * });
  *
- * // Get GUARDIAN pubkey for config
- * const guardianCommitment = await client.guardianClient.getPubkey();
+ * // Get GUARDIAN's ACK commitment for the account's signature scheme
+ * const { commitment: guardianCommitment } = await client.guardianClient.getPubkey(signer.scheme);
  *
  * // Create multisig
  * const config = { threshold: 2, signerCommitments: [...], guardianCommitment };
@@ -104,6 +121,7 @@ export class MultisigClient {
   private readonly proverConfig: ResolvedProverConfig;
   private readonly rpcConfig: ResolvedRpcConfig;
   private _guardianClient: GuardianHttpClient;
+  private guardianSession: GuardianSession | null = null;
 
   constructor(midenClient: MidenClient, config: MultisigClientConfig) {
     this.midenClient = midenClient;
@@ -124,6 +142,7 @@ export class MultisigClient {
     this._guardianClient = new GuardianHttpClient(
       requireConfigValue('guardianEndpoint', endpoint),
     );
+    this.guardianSession = null;
   }
 
   /**
@@ -134,6 +153,91 @@ export class MultisigClient {
   }
 
   /**
+   * Start a Guardian session: `signer` signs one grant, then a non-extractable
+   * browser key (the delegated signer) signs this client's session-eligible
+   * Guardian requests (state and delta reads, proposal list/get/create/sign)
+   * until the session ends. Account configuration, lookup, delta pushes,
+   * candidate abandons and transaction approvals keep using `signer`. Pass
+   * `options.store` to survive page reloads via `resumeSession`, and
+   * `options.onEnded` to learn when requests fall back to the wallet.
+   *
+   * A session this client already holds is logged out once the new one is
+   * registered. A Guardian endpoint change (`setGuardianEndpoint`) drops the
+   * session.
+   */
+  async startSession(signer: Signer, options: StartSessionOptions = {}): Promise<GuardianSession> {
+    const previous = this.guardianSession;
+    const session = await startGuardianSession(this._guardianClient, signer, {
+      ...options,
+      onEnded: this.trackSessionEnd(options.onEnded),
+    });
+    this.guardianSession = session;
+    if (previous) {
+      await endGuardianSession(this._guardianClient, previous, options.store).catch(() => false);
+    }
+    return session;
+  }
+
+  /**
+   * Reuse a session key stored by `startSession` without a wallet prompt.
+   * Returns `null` when there is none or it is about to expire.
+   */
+  async resumeSession(
+    signer: Signer,
+    store: SessionKeyStore,
+    options: Pick<StartSessionOptions, 'onEnded'> = {},
+  ): Promise<GuardianSession | null> {
+    const session = await resumeGuardianSession(this._guardianClient, signer, store, {
+      onEnded: this.trackSessionEnd(options.onEnded),
+    });
+    if (session) {
+      this.guardianSession = session;
+    }
+    return session;
+  }
+
+  /**
+   * Revoke the current session, fall back to wallet signatures, and forget its
+   * stored key. Returns whether Guardian still had the session active. On
+   * error the session stays in use.
+   */
+  async endSession(store?: SessionKeyStore): Promise<boolean> {
+    const session = this.guardianSession;
+    if (!session) {
+      return false;
+    }
+    const revoked = await endGuardianSession(this._guardianClient, session, store);
+    if (this.guardianSession === session) {
+      this.guardianSession = null;
+    }
+    return revoked;
+  }
+
+  /**
+   * Revoke every session of `signer` on the Guardian with a wallet signature,
+   * including sessions started in other tabs or devices; stop using the
+   * current one and forget its stored key. Use it when a session key may be
+   * compromised, and run it again 10 minutes later: it ends only sessions
+   * already registered, and a page can register a grant it got signed for up
+   * to about 10 minutes. Returns how many sessions Guardian revoked.
+   */
+  async revokeAllSessions(signer: Signer, store?: SessionKeyStore): Promise<number> {
+    return revokeAllGuardianSessions(this._guardianClient, signer, store);
+  }
+
+  /** Forgets the session this client holds once Guardian stops using it. */
+  private trackSessionEnd(
+    onEnded: StartSessionOptions['onEnded'],
+  ): NonNullable<StartSessionOptions['onEnded']> {
+    return (reason, session) => {
+      if (this.guardianSession === session) {
+        this.guardianSession = null;
+      }
+      onEnded?.(reason, session);
+    };
+  }
+
+  /**
    * Recover the set of accounts a given signer authorizes by querying
    * Guardian's `/state/lookup` endpoint and fetching state for each match.
    * Returns `(accountId, state)` pairs; an empty array means no account on
@@ -141,7 +245,7 @@ export class MultisigClient {
    * which would fail authentication first).
    *
    * @throws if `signer` does not implement `signLookupMessage`. The bundled
-   *   `FalconSigner` and `EcdsaSigner` both do.
+   *   `FalconSigner`, `EcdsaSigner`, and `LedgerSigner` do.
    */
   async recoverByKey(signer: Signer): Promise<RecoveredAccount[]> {
     this._guardianClient.setSigner(signer);
@@ -168,11 +272,7 @@ export class MultisigClient {
   async create(config: MultisigConfig, signer: Signer): Promise<Multisig> {
     this._guardianClient.setSigner(signer);
 
-    const { account } = await createMultisigAccount(
-      this.midenClient,
-      config,
-      this.midenRpcEndpoint,
-    );
+    const { account } = await createMultisigAccount(this.midenClient, config);
     const accountId = account.id().toString();
     await bindSignerAccountKey(signer, this.midenClient, accountId);
 
@@ -211,7 +311,9 @@ export class MultisigClient {
     for (let i = 0; i < binaryString.length; i++) {
       accountBytes[i] = binaryString.charCodeAt(i);
     }
-    const account = Account.deserialize(accountBytes);
+    const incomingAccount = Account.deserialize(accountBytes);
+
+    const account = await this.adoptGuardianAccount(accountId, incomingAccount);
 
     const detected = AccountInspector.fromAccount(account);
     // Fail closed on a partial read: the detected signer set becomes the
@@ -226,10 +328,6 @@ export class MultisigClient {
       ),
     };
 
-    const existingAccount = await this.midenClient.accounts.get(AccountId.fromHex(accountId));
-    if (!existingAccount) {
-      await this.midenClient.accounts.insert({ account, overwrite: true });
-    }
     await bindSignerAccountKey(signer, this.midenClient, accountId);
 
     return new Multisig(
@@ -243,5 +341,93 @@ export class MultisigClient {
       this.proverConfig,
       this.rpcConfig,
     );
+  }
+
+  /**
+   * Reconcile the account GUARDIAN returned with the local store, and answer
+   * with the one that is actually current.
+   *
+   * Writing GUARDIAN's account only when the store held nothing meant a caller
+   * that already had the account kept its own copy while the returned
+   * `Multisig` carried a config derived from GUARDIAN's. One object, two
+   * sources, silently disagreeing: after a membership change the config said
+   * one thing and every account read said another, with no error.
+   *
+   * Overwriting unconditionally is not the fix either. Between pushing a delta
+   * and GUARDIAN canonicalizing it, local is legitimately ahead, and clobbering
+   * it would build the next transaction on a stale nonce. So this applies the
+   * same rule `syncState` does, and returns whichever account wins so the
+   * caller describes the state it will actually read.
+   */
+  private async adoptGuardianAccount(
+    accountId: string,
+    incomingAccount: Account,
+  ): Promise<Account> {
+    const localAccount = await this.midenClient.accounts.get(AccountId.fromHex(accountId));
+    if (!localAccount) {
+      // Still checked against chain, and through the same rule the other path
+      // uses. An empty store is the ordinary shape for loading an account this
+      // client has never held, so inserting without the check would make it the
+      // one path where GUARDIAN's word is taken on its own. Checking only that
+      // *some* commitment exists is not the check: it admits state that
+      // disagrees with chain, which is the thing being guarded against.
+      // Only for an account that has transacted. One that has not is not
+      // deployed, so there is no on-chain commitment to agree or disagree with,
+      // and reading the node for one would make loading a fresh account depend
+      // on the node as well as on GUARDIAN.
+      const transacted = incomingAccount.nonce().asInt() > BigInt(0);
+      const onChain = transacted
+        ? await readOnChainCommitment(
+            this.midenRpcEndpoint,
+            AccountId.fromHex(accountId),
+            this.rpcConfig,
+          )
+        : null;
+      // The one rule the shared predicate cannot apply here. It keys its
+      // null-commitment guard on the *local* nonce, because `syncState`
+      // legitimately meets a higher incoming nonce with no local history. With
+      // no local record at all, the incoming nonce is the only evidence there
+      // is: an account GUARDIAN reports as having transacted is deployed, so a
+      // node reporting nothing for it is an RPC or gateway failure rather than
+      // an undeployed account. `readOnChainCommitment` reports a missing
+      // account by matching `not found`, which a 404 also says.
+      if (transacted && !onChain) {
+        throw new Error(
+          `Refusing to adopt GUARDIAN state for ${accountId}: it has transacted (nonce ${incomingAccount.nonce().asInt().toString()}) but the node reported no on-chain commitment, so it could not be checked against chain`
+        );
+      }
+      // Handed the commitment already read, rather than letting the predicate
+      // read it again: two reads can disagree, and the guard above would then
+      // have passed on a different answer than the comparison rejects.
+      await isSafeToAdoptGuardianState({
+        accountId,
+        incomingAccount,
+        readCommitment: () => Promise.resolve(onChain),
+      });
+      await this.midenClient.accounts.insert({ account: incomingAccount, overwrite: true });
+      return incomingAccount;
+    }
+
+    const localCommitment = normalizeHexWord(localAccount.to_commitment().toHex());
+    const incomingCommitment = normalizeHexWord(incomingAccount.to_commitment().toHex());
+    // Equal commitments are the same state, and the safety rule reads an equal
+    // nonce as divergence, so it must not be asked about a pair that agrees.
+    if (localCommitment === incomingCommitment) {
+      return localAccount;
+    }
+
+    const adopt = await isSafeToAdoptGuardianState({
+      accountId,
+      incomingAccount,
+      localAccount,
+      readCommitment: () =>
+        readOnChainCommitment(this.midenRpcEndpoint, AccountId.fromHex(accountId), this.rpcConfig),
+    });
+    if (!adopt) {
+      return localAccount;
+    }
+
+    await this.midenClient.accounts.insert({ account: incomingAccount, overwrite: true });
+    return incomingAccount;
   }
 }

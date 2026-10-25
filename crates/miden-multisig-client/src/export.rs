@@ -9,8 +9,8 @@ use std::collections::HashSet;
 use std::num::NonZeroU32;
 
 use guardian_shared::FromJson;
-use guardian_shared::SignatureScheme;
 use guardian_shared::hex::FromHex;
+use guardian_shared::{EcdsaMessageFormat, SignatureScheme};
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::dsa::ecdsa_k256_keccak::{
     PublicKey as EcdsaPublicKey, Signature as EcdsaSignature,
@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{MultisigError, Result};
 use crate::keystore::{ensure_hex_prefix, word_from_hex};
 use crate::proposal::{
-    Proposal, ProposalMetadata, ProposalSignatureEntry, ProposalStatus, SerializedNote,
+    Proposal, ProposalMetadata, ProposalSignatureEntry, ProposalStatus, ProposalVerification,
+    SerializedNote,
 };
 use crate::utils::hex_body_eq;
 
@@ -61,6 +62,8 @@ pub struct ExportedSignature {
     pub scheme: SignatureScheme,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "EcdsaMessageFormat::is_raw")]
+    pub message_format: EcdsaMessageFormat,
 }
 
 /// Metadata needed for proposal reconstruction.
@@ -124,12 +127,9 @@ pub struct ExportedMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_procedure: Option<String>,
 
-    /// Base64-serialized Miden `ChainAnchor` pinning the reference block the
-    /// tx_summary was built at. Mirrors
-    /// `ProposalMetadataPayload::chain_anchor`; required to verify or execute
-    /// the imported proposal.
+    /// Mirrors `ProposalMetadataPayload::bound_block_num`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_anchor: Option<String>,
+    pub bound_block_num: Option<u32>,
 }
 
 impl ExportedProposal {
@@ -164,7 +164,7 @@ impl ExportedProposal {
                 .iter()
                 .map(|signature| signature.signer_commitment.clone())
                 .collect(),
-            chain_anchor_b64: self.metadata.chain_anchor.clone(),
+            bound_block_num: self.metadata.bound_block_num,
         }
     }
 
@@ -186,6 +186,11 @@ impl ExportedProposal {
             let signature_hex = ensure_hex_prefix(&signature.signature);
             match signature.scheme {
                 SignatureScheme::Falcon => {
+                    if signature.message_format != EcdsaMessageFormat::Raw {
+                        return Err(MultisigError::Signature(
+                            "EIP-712 requires an ECDSA signer".to_string(),
+                        ));
+                    }
                     Poseidon2FalconSignature::from_hex(&signature_hex).map_err(|e| {
                         MultisigError::Signature(format!("invalid exported signature: {}", e))
                     })?;
@@ -319,7 +324,7 @@ impl ExportedProposal {
             new_guardian_pubkey_hex: proposal.metadata.new_guardian_pubkey_hex.clone(),
             new_guardian_endpoint: proposal.metadata.new_guardian_endpoint.clone(),
             target_procedure: proposal.metadata.target_procedure.clone(),
-            chain_anchor: proposal.metadata.chain_anchor_b64.clone(),
+            bound_block_num: proposal.metadata.bound_block_num,
         };
 
         Ok(Self {
@@ -378,9 +383,11 @@ impl ExportedProposal {
                     signature_hex: signature.signature.clone(),
                     scheme: signature.scheme,
                     public_key_hex: signature.public_key_hex.clone(),
+                    message_format: signature.message_format,
                 })
                 .collect(),
             metadata,
+            verification: ProposalVerification::Unchecked,
         })
     }
 
@@ -482,6 +489,7 @@ impl ExportedProposal {
 mod tests {
     use guardian_shared::ToJson;
     use miden_client::Serializable;
+    use miden_protocol::account::AccountCodePatch;
     use miden_protocol::account::AccountId;
     use miden_protocol::account::AccountStoragePatch;
     use miden_protocol::account::delta::{AccountDelta, AccountVaultDelta};
@@ -501,6 +509,7 @@ mod tests {
             signature: "0xdef456".to_string(),
             scheme: SignatureScheme::Falcon,
             public_key_hex: None,
+            message_format: EcdsaMessageFormat::Raw,
         };
 
         let json = serde_json::to_string(&sig).expect("should serialize");
@@ -508,6 +517,8 @@ mod tests {
 
         assert_eq!(sig.signer_commitment, parsed.signer_commitment);
         assert_eq!(sig.signature, parsed.signature);
+        assert_eq!(parsed.message_format, EcdsaMessageFormat::Raw);
+        assert!(!json.contains("message_format"));
     }
 
     #[test]
@@ -529,7 +540,7 @@ mod tests {
             new_guardian_pubkey_hex: None,
             new_guardian_endpoint: None,
             target_procedure: None,
-            chain_anchor: None,
+            bound_block_num: None,
         };
 
         let json = serde_json::to_string(&meta).expect("should serialize");
@@ -590,6 +601,7 @@ mod tests {
             signature: "0xsig1".to_string(),
             scheme: SignatureScheme::Falcon,
             public_key_hex: None,
+            message_format: EcdsaMessageFormat::Raw,
         });
         assert!(!proposal.is_ready());
 
@@ -598,6 +610,7 @@ mod tests {
             signature: "0xsig2".to_string(),
             scheme: SignatureScheme::Falcon,
             public_key_hex: None,
+            message_format: EcdsaMessageFormat::Raw,
         });
         assert!(proposal.is_ready());
     }
@@ -642,6 +655,7 @@ mod tests {
             signature: "0xsig1".to_string(),
             scheme: SignatureScheme::Falcon,
             public_key_hex: None,
+            message_format: EcdsaMessageFormat::Raw,
         });
 
         assert_eq!(proposal.signature_counts(), (1, 3));
@@ -662,12 +676,14 @@ mod tests {
                     signature: "0xsig1".to_string(),
                     scheme: SignatureScheme::Falcon,
                     public_key_hex: None,
+                    message_format: EcdsaMessageFormat::Raw,
                 },
                 ExportedSignature {
                     signer_commitment: "0xsigner2".to_string(),
                     signature: "0xsig2".to_string(),
                     scheme: SignatureScheme::Falcon,
                     public_key_hex: None,
+                    message_format: EcdsaMessageFormat::Raw,
                 },
             ],
             signatures_required: 3,
@@ -695,12 +711,14 @@ mod tests {
                     signature: "0xsig1".to_string(),
                     scheme: SignatureScheme::Falcon,
                     public_key_hex: None,
+                    message_format: EcdsaMessageFormat::Raw,
                 },
                 ExportedSignature {
                     signer_commitment: "0xsigner2".to_string(),
                     signature: "0xsig2".to_string(),
                     scheme: SignatureScheme::Falcon,
                     public_key_hex: None,
+                    message_format: EcdsaMessageFormat::Raw,
                 },
             ],
             signatures_required: 3,
@@ -738,7 +756,7 @@ mod tests {
             account_id,
             AccountStoragePatch::default(),
             AccountVaultDelta::default(),
-            None,
+            AccountCodePatch::default(),
             Felt::ZERO,
         )
         .expect("valid delta");
@@ -747,10 +765,10 @@ mod tests {
             account_delta,
             InputNotes::new(Vec::new()).expect("empty input notes"),
             RawOutputNotes::new(Vec::new()).expect("empty output notes"),
+            miden_protocol::block::BlockNumber::from(0),
             Word::default(),
             0,
             TransactionSummaryUserParams::new([
-                ZERO,
                 ZERO,
                 ZERO,
                 Felt::new_unchecked(7),
@@ -776,6 +794,7 @@ mod tests {
             signature: format!("0x{}", hex::encode(signature.to_bytes())),
             scheme: SignatureScheme::Falcon,
             public_key_hex: None,
+            message_format: EcdsaMessageFormat::Raw,
         }
     }
 

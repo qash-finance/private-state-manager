@@ -1,5 +1,6 @@
 use crate::delta_object::{DeltaObject, DeltaStatus};
 use crate::error::GuardianError;
+use crate::network::AppliedState;
 use crate::services::ResolvedAccount;
 use crate::state::AppState;
 use crate::state_object::StateObject;
@@ -32,8 +33,7 @@ impl DeltaCommitStrategy {
         &self,
         ctx: CommitContext<'_>,
         delta: &mut DeltaObject,
-        new_state_json: serde_json::Value,
-        new_commitment: &str,
+        applied: AppliedState,
     ) -> Result<(), GuardianError> {
         match self {
             DeltaCommitStrategy::Candidate => {
@@ -42,13 +42,20 @@ impl DeltaCommitStrategy {
                 // pending-candidate flag: a failure between the two can
                 // otherwise leave a candidate the worker never selects
                 // while new submissions stay rejected. A Conflict is the
-                // race-proof form of the pre-commit pending-candidate
+                // race-proof form of the pre-commit queue-admission
                 // gate: the losing side of two concurrent submissions
                 // gets the same 409 it would have gotten arriving late.
+                let max_pending_candidates =
+                    crate::services::candidate_chain::max_pending_candidates(ctx.state);
                 let outcome = ctx
                     .resolved
                     .storage
-                    .submit_candidate(ctx.state.metadata.as_ref(), delta, &ctx.now)
+                    .submit_candidate(
+                        ctx.state.metadata.as_ref(),
+                        delta,
+                        &ctx.now,
+                        max_pending_candidates,
+                    )
                     .await
                     .map_err(|e| {
                         error!(
@@ -82,8 +89,9 @@ impl DeltaCommitStrategy {
 
                 let new_state = StateObject {
                     account_id: delta.account_id.clone(),
-                    commitment: new_commitment.to_string(),
-                    state_json: new_state_json,
+                    commitment: applied.commitment,
+                    nonce: applied.nonce,
+                    state_json: applied.state_json,
                     created_at: ctx.current_state.created_at.clone(),
                     updated_at: ctx.now.clone(),
                     auth_scheme: String::new(),
@@ -184,7 +192,7 @@ impl DeltaCommitStrategy {
                 crate::services::release_on_switch::release_if_guardian_switched(
                     ctx.state,
                     &ctx.resolved.metadata,
-                    &new_state.state_json,
+                    applied.guardian_commitment.as_deref(),
                     delta.nonce,
                     &new_state.commitment,
                 )
@@ -224,10 +232,21 @@ mod tests {
         StateObject {
             account_id: "0xtest_account_id".to_string(),
             commitment: "old_commitment".to_string(),
+            nonce: Some(1),
             state_json: serde_json::json!({"state": "data"}),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             auth_scheme: String::new(),
+        }
+    }
+
+    fn applied_state() -> AppliedState {
+        AppliedState {
+            state_json: serde_json::json!({"new": "state"}),
+            commitment: "new_commitment".to_string(),
+            nonce: Some(2),
+            cosigner_commitments: Vec::new(),
+            guardian_commitment: None,
         }
     }
 
@@ -265,6 +284,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -277,12 +297,7 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Candidate
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(result.is_err());
@@ -308,6 +323,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: state.storage.clone(),
+            signer_commitment: String::new(),
         };
         let current_state = create_test_state_object();
         let ctx = CommitContext {
@@ -319,12 +335,7 @@ mod tests {
         let mut delta = create_test_delta();
 
         let result = DeltaCommitStrategy::Candidate
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(matches!(
@@ -354,6 +365,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -366,12 +378,7 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Optimistic
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(result.is_err());
@@ -399,6 +406,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -411,12 +419,7 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Optimistic
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(result.is_err());
@@ -447,6 +450,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -459,12 +463,7 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Optimistic
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         // Should succeed even though delete failed
@@ -488,6 +487,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -501,12 +501,7 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Candidate
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(result.is_ok());
@@ -533,6 +528,7 @@ mod tests {
         let resolved = ResolvedAccount {
             metadata: create_test_metadata(),
             storage: storage_backend,
+            signer_commitment: String::new(),
         };
 
         let current_state = create_test_state_object();
@@ -546,17 +542,73 @@ mod tests {
 
         let mut delta = create_test_delta();
         let result = DeltaCommitStrategy::Optimistic
-            .commit(
-                ctx,
-                &mut delta,
-                serde_json::json!({"new": "state"}),
-                "new_commitment",
-            )
+            .commit(ctx, &mut delta, applied_state())
             .await;
 
         assert!(result.is_ok());
         assert!(delta.status.is_canonical());
         assert_eq!(delta.status.timestamp(), &now);
+        // The applied state is stored with its commitment and nonce.
+        let stored = mock_storage.get_submit_state_calls();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].commitment, "new_commitment");
+        assert_eq!(stored[0].nonce, Some(2));
+        assert_eq!(stored[0].state_json, serde_json::json!({"new": "state"}));
+    }
+
+    #[tokio::test]
+    async fn test_optimistic_releases_on_foreign_guardian_binding() {
+        let mock_storage = MockStorageBackend::new()
+            .with_submit_state(Ok(()))
+            .with_submit_delta(Ok(()));
+        let mock_network = MockNetworkClient::new();
+        let mock_metadata = MockMetadataStore::new().with_get(Ok(Some(create_test_metadata())));
+
+        let state = create_test_app_state_with_mocks(
+            Arc::new(mock_storage),
+            Arc::new(mock_network),
+            Arc::new(mock_metadata.clone()),
+        );
+
+        let resolved = ResolvedAccount {
+            metadata: create_test_metadata(),
+            storage: state.storage.clone(),
+            signer_commitment: String::new(),
+        };
+
+        let current_state = create_test_state_object();
+        let ctx = CommitContext {
+            state: &state,
+            resolved: &resolved,
+            current_state: &current_state,
+            now: "2024-01-01T12:00:00Z".to_string(),
+        };
+
+        let applied = AppliedState {
+            guardian_commitment: Some("0xforeign_guardian".to_string()),
+            ..applied_state()
+        };
+
+        let mut delta = create_test_delta();
+        let result = DeltaCommitStrategy::Optimistic
+            .commit(ctx, &mut delta, applied)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            mock_metadata.set_released_calls.lock().unwrap().clone(),
+            vec!["0xtest_account_id".to_string()],
+            "a foreign guardian binding on the applied state must release the account"
+        );
+        assert_eq!(
+            mock_metadata
+                .set_released_expected_states
+                .lock()
+                .unwrap()
+                .clone(),
+            vec!["new_commitment".to_string()],
+            "the release is proved against the state the commit just stored"
+        );
     }
 
     #[tokio::test]

@@ -272,8 +272,13 @@ its own session/auth ([`authz.rs`](../../crates/server/src/dashboard/authz.rs),
 allowlist of operator public keys ([`allowlist.rs`](../../crates/server/src/dashboard/allowlist.rs)),
 permission model ([`permissions.rs`](../../crates/server/src/dashboard/permissions.rs)),
 shared state ([`state.rs`](../../crates/server/src/dashboard/state.rs)),
-and pagination cursor logic
-([`cursor.rs`](../../crates/server/src/dashboard/cursor.rs)).
+pagination cursor logic
+([`cursor.rs`](../../crates/server/src/dashboard/cursor.rs)), and the
+lease-held inventory / vault aggregate behind `GET /dashboard/stats`
+([`stats.rs`](../../crates/server/src/dashboard/stats.rs)), published
+through the shared coordination store
+([`coordination/stats_store.rs`](../../crates/server/src/coordination/stats_store.rs);
+see [DASHBOARD.md — Aggregate stats](../DASHBOARD.md#aggregate-stats)).
 
 It piggybacks on the same Postgres backend as the rest of the server but
 authenticates operators through Falcon-signed challenges rather than the
@@ -351,6 +356,14 @@ Two distinct auth domains:
    credentials from the metadata store and dispatches to the right scheme
    ([`miden_falcon_rpo.rs`](../../crates/server/src/metadata/auth/miden_falcon_rpo.rs),
    [`miden_ecdsa.rs`](../../crates/server/src/metadata/auth/miden_ecdsa.rs)).
+   Session-eligible reads and proposal requests may instead be signed by a
+   delegated P-256 key the wallet authorized with a session grant
+   (`x-auth-format: session`, issue #219). Services opt in through
+   `resolve_account_allowing_session`; every other route uses
+   `resolve_account`, which rejects session credentials. Grants live in
+   [`session.rs`](../../crates/server/src/session.rs) (`MidenSessions`, swept
+   with the other sessions); the wire format is in
+   [`crates/shared/src/session_grant.rs`](../../crates/shared/src/session_grant.rs).
 2. **Operator auth** — dashboard endpoints use Falcon-signed challenges
    against an allowlist of operator public keys, producing session cookies.
    Lives entirely in

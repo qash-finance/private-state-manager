@@ -4,6 +4,28 @@ use guardian_shared::auth_request_payload::AuthRequestPayload;
 
 /// Maximum allowed clock skew in milliseconds between client and server timestamps
 pub const MAX_TIMESTAMP_SKEW_MS: i64 = 300_000; // 5 minutes in milliseconds
+/// [`MAX_TIMESTAMP_SKEW_MS`] in seconds, for values carried in Unix seconds.
+pub const MAX_TIMESTAMP_SKEW_SECS: u64 = MAX_TIMESTAMP_SKEW_MS as u64 / 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAuthFormat {
+    Raw,
+    Eip712,
+    /// Signed by a P-256 session key registered through `POST /session`;
+    /// `x-pubkey` carries the session public key.
+    Session,
+}
+
+impl RequestAuthFormat {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("raw") => Ok(Self::Raw),
+            Some("eip712") => Ok(Self::Eip712),
+            Some("session") => Ok(Self::Session),
+            Some(other) => Err(format!("Unsupported x-auth-format: {other}")),
+        }
+    }
+}
 
 /// Trait for extracting authentication credentials from request metadata
 /// Implemented by HTTP headers and gRPC metadata
@@ -23,6 +45,7 @@ pub enum Credentials {
         pubkey: String,
         signature: String,
         timestamp: i64,
+        auth_format: RequestAuthFormat,
         request_payload: AuthRequestPayload,
         request_payload_bytes: Vec<u8>,
     },
@@ -34,6 +57,7 @@ impl Credentials {
             pubkey,
             signature,
             timestamp,
+            auth_format: RequestAuthFormat::Raw,
             request_payload: AuthRequestPayload::empty(),
             request_payload_bytes: Vec::new(),
         }
@@ -54,6 +78,22 @@ impl Credentials {
         match self {
             Self::Signature { timestamp, .. } => *timestamp,
         }
+    }
+
+    pub fn auth_format(&self) -> RequestAuthFormat {
+        match self {
+            Self::Signature { auth_format, .. } => *auth_format,
+        }
+    }
+
+    pub fn with_auth_format(mut self, auth_format: RequestAuthFormat) -> Self {
+        match &mut self {
+            Self::Signature {
+                auth_format: format,
+                ..
+            } => *format = auth_format,
+        }
+        self
     }
 
     pub fn with_request_payload(mut self, request_payload: AuthRequestPayload) -> Self {
@@ -142,7 +182,13 @@ impl ExtractCredentials for axum::http::HeaderMap {
             .parse::<i64>()
             .map_err(|_| "Invalid x-timestamp value: must be Unix timestamp".to_string())?;
 
-        Ok(Credentials::signature(pubkey, signature, timestamp))
+        let auth_format = RequestAuthFormat::parse(
+            self.get("x-auth-format")
+                .map(|value| value.to_str().map_err(|_| "Invalid x-auth-format header"))
+                .transpose()?,
+        )?;
+
+        Ok(Credentials::signature(pubkey, signature, timestamp).with_auth_format(auth_format))
     }
 }
 
@@ -175,13 +221,31 @@ impl ExtractCredentials for tonic::metadata::MetadataMap {
                 tonic::Status::invalid_argument("Invalid x-timestamp value: must be Unix timestamp")
             })?;
 
-        Ok(Credentials::signature(pubkey, signature, timestamp))
+        let auth_format = RequestAuthFormat::parse(
+            self.get("x-auth-format")
+                .map(|value| value.to_str().map_err(|_| "Invalid x-auth-format metadata"))
+                .transpose()
+                .map_err(tonic::Status::invalid_argument)?,
+        )
+        .map_err(tonic::Status::invalid_argument)?;
+
+        Ok(Credentials::signature(pubkey, signature, timestamp).with_auth_format(auth_format))
     }
 }
 
 #[cfg(all(test, not(any(feature = "integration", feature = "e2e"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_request_auth_format() {
+        assert_eq!(RequestAuthFormat::parse(None), Ok(RequestAuthFormat::Raw));
+        assert_eq!(
+            RequestAuthFormat::parse(Some("eip712")),
+            Ok(RequestAuthFormat::Eip712)
+        );
+        assert!(RequestAuthFormat::parse(Some("unknown")).is_err());
+    }
 
     #[test]
     fn test_credentials_signature_constructor() {
@@ -193,12 +257,14 @@ mod tests {
                 pubkey,
                 signature,
                 timestamp,
+                auth_format,
                 request_payload,
                 request_payload_bytes,
             } => {
                 assert_eq!(pubkey, "pubkey123");
                 assert_eq!(signature, "sig456");
                 assert_eq!(timestamp, 1700000000000);
+                assert_eq!(auth_format, RequestAuthFormat::Raw);
                 assert_eq!(request_payload, AuthRequestPayload::empty());
                 assert!(request_payload_bytes.is_empty());
             }

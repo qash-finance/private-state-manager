@@ -4,6 +4,8 @@
 mod auth_grpc;
 mod auth_http;
 mod body_limit_http;
+mod canonical_nonce_grpc;
+mod canonical_nonce_http;
 mod delta_history_grpc;
 mod delta_history_http;
 mod error_envelope_http;
@@ -16,3 +18,6 @@ mod proposals_grpc;
 mod proposals_http;
 mod rate_limit_grpc;
 mod rate_limit_http;
+mod session_grpc;
+mod session_helpers;
+mod session_http;

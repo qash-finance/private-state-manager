@@ -16,21 +16,33 @@ import type { AuthArgErrorCode } from './index.js';
 describe('package entry point', () => {
   it('exports AuthArgErrorCode, so a caller can branch on the codes exhaustively', () => {
     const codes: AuthArgErrorCode[] = [
-      'proposal_auth_arg_unresolvable',
       'proposal_salt_malformed',
-      'fee_faucet_anchor_mismatch',
+      'multisig_auth_args_missing',
+      'bound_block_not_declared',
+      'transaction_summary_layout_unsupported',
+      'bound_block_mismatch',
     ];
 
-    expect(new api.ProposalAuthArgUnresolvableError({
-      proposalId: '0xaaaa',
-      signedAuthArgHex: '0xf00d',
-      saltHex: '0xbeef',
-      feeFaucetIdHex: '0xcafe',
-    }).code).toBe(codes[0]);
     expect(new api.ProposalSaltMalformedError({
       proposalId: '0xaaaa',
       saltHex: '0xnope',
       reason: 'expected a 32-byte hex word',
-    }).code).toBe(codes[1]);
+    }).code).toBe(codes[0]);
+    expect(new api.MultisigAuthArgsMissingError('0xaaaa').code).toBe(codes[1]);
+    expect(new api.BoundBlockNotDeclaredError(7).code).toBe(codes[2]);
+    expect(new api.TransactionSummaryLayoutError('version 2').code).toBe(codes[3]);
+    expect(new api.BoundBlockMismatchError({
+      proposalId: '0xaaaa',
+      declaredBoundBlockNum: 8,
+      boundBlockNum: 7,
+    }).code).toBe(codes[4]);
+  });
+
+  it('exports the tip-execution helper a multisig proposal is reproduced with', () => {
+    expect(typeof api.executeForSummaryAtTip).toBe('function');
+  });
+
+  it('exports the reader for the block a summary binds', () => {
+    expect(typeof api.summaryBoundBlockNum).toBe('function');
   });
 });

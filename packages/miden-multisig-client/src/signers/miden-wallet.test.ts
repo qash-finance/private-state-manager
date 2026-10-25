@@ -21,8 +21,12 @@ vi.mock('@miden-sdk/miden-sdk', () => ({
       suffix: () => ({ asInt: () => BigInt(2) }),
     })),
   },
-  Felt: vi.fn().mockImplementation((v: bigint) => ({ value: v })),
-  FeltArray: vi.fn().mockImplementation((arr: any[]) => arr),
+  Felt: vi.fn().mockImplementation(function (v: bigint) {
+    return { value: v };
+  }),
+  FeltArray: vi.fn().mockImplementation(function (arr: any[]) {
+    return arr;
+  }),
   Rpo256: {
     hashElements: vi.fn().mockReturnValue({
       toHex: () => '0x' + 'bb'.repeat(32),
@@ -68,6 +72,27 @@ describe('MidenWalletSigner', () => {
     // ECDSA publicKey resolution against a real commitment (explicit key and
     // localAuthSigner, match and mismatch) needs real Poseidon2 and is covered in
     // miden-wallet.ecdsa-recovery.test.ts, which runs the WASM SDK.
+  });
+
+  describe('requestAuthFormat', () => {
+    it('follows the localAuthSigner, which signs request auth', () => {
+      const delegate = (requestAuthFormat?: 'eip712'): Signer => ({
+        commitment: '0xlocal',
+        publicKey: '0xlocal',
+        scheme: 'falcon',
+        requestAuthFormat,
+        signAccountIdWithTimestamp: vi.fn(),
+        signCommitment: vi.fn(),
+      });
+
+      expect(new MidenWalletSigner(mockWallet, '0xc', 'falcon').requestAuthFormat).toBeUndefined();
+      expect(
+        new MidenWalletSigner(mockWallet, '0xc', 'falcon', delegate()).requestAuthFormat,
+      ).toBeUndefined();
+      expect(
+        new MidenWalletSigner(mockWallet, '0xc', 'falcon', delegate('eip712')).requestAuthFormat,
+      ).toBe('eip712');
+    });
   });
 
   describe('signAccountIdWithTimestamp', () => {

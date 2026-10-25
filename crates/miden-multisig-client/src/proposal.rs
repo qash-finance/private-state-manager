@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use guardian_client::DeltaObject;
 use guardian_shared::FromJson;
 use guardian_shared::hex::FromHex;
-use guardian_shared::{ProposalSignature, SignatureScheme};
+use guardian_shared::{EcdsaMessageFormat, ProposalSignature, SignatureScheme};
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::dsa::ecdsa_k256_keccak::{
@@ -309,6 +309,18 @@ impl TransactionType {
     pub fn requires_guardian_ack(&self) -> bool {
         !self.supports_offline_execution()
     }
+
+    /// Returns true when an exported document is enough to execute this type.
+    ///
+    /// Every modeled type is, and `Custom` is not: executing from a document
+    /// rebuilds the transaction from its type, which for a producer's own
+    /// transaction the SDK cannot do. The distinction matters before the
+    /// acknowledgement rather than after it, because obtaining one pushes the
+    /// delta: a `Custom` proposal that got that far would leave a candidate on
+    /// the account and only then fail to build.
+    pub fn executable_from_exported_document(&self) -> bool {
+        !matches!(self, Self::Custom)
+    }
 }
 
 /// Proposal type labels the SDK models natively. The producer (`propose_custom_transaction`)
@@ -370,11 +382,9 @@ pub struct ProposalMetadata {
     pub required_signatures: Option<usize>,
     pub signers: Vec<String>,
 
-    /// Base64-serialized Miden `ChainAnchor` pinning the reference block the
-    /// tx_summary was built at. Required to verify or execute the proposal:
-    /// since protocol 0.16 the signed summary binds the reference block
-    /// commitment, so it only reproduces when re-executed at that block.
-    pub chain_anchor_b64: Option<String>,
+    /// The block the signed summary binds, as the proposer wrote it. Unsigned,
+    /// so verification checks it against the summary.
+    pub bound_block_num: Option<u32>,
 }
 
 impl ProposalMetadata {
@@ -386,33 +396,16 @@ impl ProposalMetadata {
         self.consume_notes_metadata_version == Some(CONSUME_NOTES_METADATA_VERSION_V2)
     }
 
-    /// Decodes the proposal's chain anchor. Errors when absent: a proposal
-    /// without an anchor was created at an unknown reference block, so its
-    /// signed summary cannot be reproduced, verified, or executed.
-    pub fn chain_anchor(&self) -> Result<miden_client::transaction::ChainAnchor> {
-        let anchor_b64 = self.chain_anchor_b64.as_deref().ok_or_else(|| {
-            MultisigError::InvalidConfig(
-                "proposal metadata has no chain_anchor; it was created without \
-                 chain-anchored execution and its signed summary cannot be \
-                 reproduced at the original reference block"
-                    .to_string(),
-            )
-        })?;
-        crate::transaction::chain_anchor_from_base64(anchor_b64)
-    }
-
     /// Converts salt hex to Word.
     ///
-    /// Errors when absent, for the same reason [`Self::chain_anchor`] does. The request
-    /// declares this salt and miden-client commits `hash(CONVERSION_INFO || SALT)` into
-    /// the auth arg from it, so a substituted zero would be committed just as happily as
-    /// the real one and reproduce a summary no cosigner signed.
+    /// Errors when absent: the salt is bound into the auth args and the signed
+    /// summary, so a substituted zero would rebuild a request whose summary no
+    /// cosigner signed.
     pub fn salt(&self) -> Result<Word> {
         let value = self.salt_hex.as_deref().ok_or_else(|| {
             MultisigError::InvalidConfig(
-                "proposal metadata has no salt; its request cannot be rebuilt because \
-                 the auth arg commits hash(CONVERSION_INFO || SALT) and is not \
-                 invertible to the salt"
+                "proposal metadata has no salt; its request cannot be rebuilt without the \
+                 salt the auth args and summary bind"
                     .to_string(),
             )
         })?;
@@ -624,6 +617,7 @@ pub struct ProposalSignatureEntry {
     pub signature_hex: String,
     pub scheme: SignatureScheme,
     pub public_key_hex: Option<String>,
+    pub message_format: EcdsaMessageFormat,
 }
 
 impl ProposalSignatureEntry {
@@ -633,6 +627,11 @@ impl ProposalSignatureEntry {
         let signature_hex = ensure_hex_prefix(&self.signature_hex);
         match self.scheme {
             SignatureScheme::Falcon => {
+                if self.message_format != EcdsaMessageFormat::Raw {
+                    return Err(MultisigError::Signature(
+                        "EIP-712 requires an ECDSA signer".to_string(),
+                    ));
+                }
                 Poseidon2FalconSignature::from_hex(&signature_hex).map_err(|e| {
                     MultisigError::Signature(format!("invalid proposal signature: {}", e))
                 })?;
@@ -681,6 +680,55 @@ pub struct Proposal {
     pub tx_summary: TransactionSummary,
     pub signatures: Vec<ProposalSignatureEntry>,
     pub metadata: ProposalMetadata,
+    /// Result of the last summary-binding check on this value. Only
+    /// `verify_proposal_summary_binding` writes `Verified`; a freshly parsed,
+    /// imported, or built proposal is `Unchecked`. A listing surfaces failed
+    /// proposals instead of failing wholesale (issue #462); signing and
+    /// executing re-verify and refuse them.
+    pub verification: ProposalVerification,
+}
+
+/// Outcome of checking a proposal's metadata against its signed summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalVerification {
+    /// Nobody has run the check on this value yet.
+    Unchecked,
+    /// The metadata reproduced the signed summary commitment.
+    Verified,
+    /// The check failed. `retryable` is true when the failure came from a
+    /// transient node or RPC error, so the same proposal may verify on a
+    /// later attempt; false when the proposal itself cannot be reproduced
+    /// (tampered metadata, for example) and it has to be re-proposed.
+    Failed { retryable: bool, message: String },
+}
+
+impl ProposalVerification {
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
+
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// True for a failure worth retrying as-is (transient node/RPC error).
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
+    /// The failure message, if the check failed.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Failed { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 impl Proposal {
@@ -758,24 +806,30 @@ impl Proposal {
             target_procedure: target_procedure.clone(),
             required_signatures: Some(required_signatures),
             signers: Vec::new(),
-            chain_anchor_b64: metadata_payload.chain_anchor,
+            bound_block_num: metadata_payload.bound_block_num,
         };
         let transaction_type = metadata.to_transaction_type(&proposal_type)?;
 
         let mut seen_signers = HashSet::new();
         let mut signatures = Vec::with_capacity(payload.signatures.len());
         for signature in &payload.signatures {
-            let (scheme, signature_hex, public_key_hex) = match &signature.signature {
-                ProposalSignature::Falcon { signature } => {
-                    (SignatureScheme::Falcon, signature.clone(), None)
-                }
+            let (scheme, signature_hex, public_key_hex, message_format) = match &signature.signature
+            {
+                ProposalSignature::Falcon { signature } => (
+                    SignatureScheme::Falcon,
+                    signature.clone(),
+                    None,
+                    EcdsaMessageFormat::Raw,
+                ),
                 ProposalSignature::Ecdsa {
                     signature,
                     public_key,
+                    message_format,
                 } => (
                     SignatureScheme::Ecdsa,
                     signature.clone(),
                     public_key.clone(),
+                    *message_format,
                 ),
             };
 
@@ -784,6 +838,7 @@ impl Proposal {
                 signature_hex,
                 scheme,
                 public_key_hex,
+                message_format,
             };
             entry.validate()?;
 
@@ -809,12 +864,15 @@ impl Proposal {
             tx_summary,
             signatures,
             metadata,
+            verification: ProposalVerification::Unchecked,
         };
         proposal.refresh_status();
         Ok(proposal)
     }
 
-    /// Creates a new Proposal
+    /// Creates a new Proposal. Its `bound_block_num` is the block `tx_summary`
+    /// binds, whatever `metadata` carries, so a created proposal cannot
+    /// disagree with its own summary.
     pub fn new(
         tx_summary: TransactionSummary,
         nonce: u64,
@@ -823,6 +881,7 @@ impl Proposal {
     ) -> Self {
         let commitment = tx_summary.to_commitment();
         let id = format!("0x{}", hex::encode(word_to_bytes(&commitment)));
+        metadata.bound_block_num = Some(tx_summary.block_number().as_u32());
 
         let signatures_required = metadata
             .required_signatures
@@ -842,9 +901,23 @@ impl Proposal {
             tx_summary,
             signatures: Vec::new(),
             metadata,
+            verification: ProposalVerification::Unchecked,
         };
         proposal.refresh_status();
         proposal
+    }
+
+    /// True when the summary-binding check reproduced this proposal's signed
+    /// summary from its metadata (see [`Proposal::verification`]).
+    pub fn is_verified(&self) -> bool {
+        self.verification.is_verified()
+    }
+
+    /// True when the proposal is both verified and has met its signature
+    /// threshold, i.e. it can be executed. `status` alone keeps meaning
+    /// "threshold met": a fully signed proposal can still be dead.
+    pub fn is_actionable(&self) -> bool {
+        self.is_verified() && self.status.is_ready()
     }
 
     pub fn has_signed(&self, signer_commitment_hex: &str) -> bool {
@@ -913,21 +986,52 @@ fn word_to_bytes(word: &Word) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pairing that made the bug possible: `Custom` needs an
+    /// acknowledgement like any other non-switch type, and getting one pushes
+    /// the delta, so the document guard has to come first.
+    #[test]
+    fn custom_needs_an_acknowledgement_and_cannot_execute_from_a_document() {
+        assert!(TransactionType::Custom.requires_guardian_ack());
+        assert!(!TransactionType::Custom.executable_from_exported_document());
+    }
+
+    #[test]
+    fn every_modeled_type_executes_from_a_document() {
+        for transaction_type in [
+            TransactionType::consume_notes(vec![]),
+            TransactionType::UpdateProcedureThreshold {
+                procedure: crate::procedures::ProcedureName::SendAsset,
+                new_threshold: 2,
+            },
+        ] {
+            assert!(
+                transaction_type.executable_from_exported_document(),
+                "{} should execute from a document",
+                transaction_type.type_name()
+            );
+        }
+    }
     use miden_protocol::Felt;
 
     use super::*;
+    use miden_protocol::account::AccountCodePatch;
     use miden_protocol::account::AccountStoragePatch;
     use miden_protocol::account::delta::{AccountDelta, AccountVaultDelta};
     use miden_protocol::transaction::{InputNotes, RawOutputNotes, TransactionSummaryUserParams};
 
     fn create_test_tx_summary() -> TransactionSummary {
+        tx_summary_binding(0)
+    }
+
+    fn tx_summary_binding(block_num: u32) -> TransactionSummary {
         // Use a minimal valid account ID
         let account_id = AccountId::from_hex("0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b").unwrap();
         let delta = AccountDelta::new(
             account_id,
             AccountStoragePatch::default(),
             AccountVaultDelta::default(),
-            None,
+            AccountCodePatch::default(),
             Felt::ZERO,
         )
         .expect("Valid empty delta");
@@ -936,10 +1040,35 @@ mod tests {
             delta,
             InputNotes::new(Vec::new()).unwrap(),
             RawOutputNotes::new(Vec::new()).unwrap(),
+            miden_protocol::block::BlockNumber::from(block_num),
             Word::default(),
             0,
-            TransactionSummaryUserParams::new([Felt::ZERO; 7]),
+            TransactionSummaryUserParams::new([Felt::ZERO; 6]),
         )
+    }
+
+    /// A created proposal records the block its own summary binds, whatever
+    /// its creator wrote, so an export carries the value TypeScript cosigners
+    /// check against the summary.
+    #[test]
+    fn new_proposal_records_the_block_its_summary_binds() {
+        let account_id = AccountId::from_hex("0x7b7b7b7a7b7b7b017b7b7b7b7b7b7b").unwrap();
+        for written in [None, Some(7)] {
+            let proposal = Proposal::new(
+                tx_summary_binding(42),
+                1,
+                TransactionType::add_cosigner(Word::default()),
+                ProposalMetadata {
+                    bound_block_num: written,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(proposal.metadata.bound_block_num, Some(42));
+
+            let exported =
+                crate::export::ExportedProposal::from_proposal(&proposal, account_id).unwrap();
+            assert_eq!(exported.metadata.bound_block_num, Some(42));
+        }
     }
 
     #[test]
@@ -956,37 +1085,6 @@ mod tests {
         let invalid = format!("0x{}{}", "ff".repeat(8), "00".repeat(24));
         let err = word_from_hex(&invalid).expect_err("non-canonical field element should fail");
         assert!(err.contains("invalid field element"));
-    }
-
-    /// A proposal without an anchor cannot be verified or executed, and a
-    /// present anchor must decode as a structurally valid `ChainAnchor` —
-    /// garbage base64 or well-formed base64 of non-anchor bytes are both
-    /// rejected before anything executes against them.
-    #[test]
-    fn chain_anchor_is_required_and_validated() {
-        let missing = ProposalMetadata::default();
-        let err = missing
-            .chain_anchor()
-            .expect_err("missing anchor must fail");
-        assert!(err.to_string().contains("no chain_anchor"));
-
-        let garbage = ProposalMetadata {
-            chain_anchor_b64: Some("!!!not-base64!!!".to_string()),
-            ..Default::default()
-        };
-        let err = garbage
-            .chain_anchor()
-            .expect_err("garbage base64 must fail");
-        assert!(err.to_string().contains("invalid chain_anchor base64"));
-
-        let non_anchor = ProposalMetadata {
-            chain_anchor_b64: Some(BASE64.encode([0xAAu8; 16])),
-            ..Default::default()
-        };
-        let err = non_anchor
-            .chain_anchor()
-            .expect_err("non-anchor bytes must fail");
-        assert!(err.to_string().contains("invalid chain_anchor"));
     }
 
     #[test]
@@ -1146,6 +1244,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            verification: ProposalVerification::Unchecked,
         };
 
         assert_eq!(proposal.signature_counts(), (1, 3));
@@ -1172,6 +1271,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            verification: ProposalVerification::Unchecked,
         };
 
         let missing = proposal.missing_signers();
@@ -1198,6 +1298,7 @@ mod tests {
                 signers: vec!["0xabc".to_string(), "0xdef".to_string()],
                 ..Default::default()
             },
+            verification: ProposalVerification::Unchecked,
         };
 
         assert_eq!(proposal.signatures_needed(), 0);
