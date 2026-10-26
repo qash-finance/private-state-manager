@@ -115,7 +115,7 @@ jobs:
             --image ${{ steps.img.outputs.uri }} \
             --region ${{ env.REGION }} \
             --platform managed \
-            --update-env-vars GUARDIAN_NETWORK_TYPE=MidenTestnet,GUARDIAN_ACK_SECRET_PROVIDER=file,GUARDIAN_ACK_FALCON_SECRET_PATH=/var/guardian/ack-falcon/falcon,GUARDIAN_ACK_ECDSA_SECRET_PATH=/var/guardian/ack-ecdsa/ecdsa \
+            --update-env-vars GUARDIAN_NETWORK_TYPE=MidenCedar,GUARDIAN_ACK_SECRET_PROVIDER=file,GUARDIAN_ACK_FALCON_SECRET_PATH=/var/guardian/ack-falcon/falcon,GUARDIAN_ACK_ECDSA_SECRET_PATH=/var/guardian/ack-ecdsa/ecdsa \
             $EXTRA_FLAGS
 
       # --- Slack notifications ---
